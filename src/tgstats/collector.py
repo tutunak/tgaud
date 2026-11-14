@@ -23,8 +23,14 @@ MAX_FLOOD_RETRIES = 20
 # random pause before every request, in whole milliseconds, so requests don't come at a fixed rate
 MIN_DELAY_MS = 1000
 MAX_DELAY_MS = 5000
-# --deep searches by single characters: Latin letters, digits, Cyrillic letters
-DEEP_QUERIES = list(string.ascii_lowercase + string.digits + "абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
+# --deep searches by single characters, then by pairs of characters. Two groups, never mixed in a pair:
+# L = Latin letters and digits, C = Cyrillic letters.
+LATIN_CHARS = string.ascii_lowercase + string.digits
+CYRILLIC_CHARS = "абвгдеёжзийклмнопрстуфхцчшщъыьэюя"
+DEEP_GROUPS = (LATIN_CHARS, CYRILLIC_CHARS)
+DEEP_QUERIES = list(LATIN_CHARS + CYRILLIC_CHARS)
+# a single character is expanded into two-character queries when its search returned at least this many members
+DEFAULT_EXPAND_AT = 100
 
 Sleep = Callable[[float], Awaitable[None]]
 Out = Callable[[str], None]
@@ -188,9 +194,13 @@ async def reported_count(
 
 
 async def _search_members(
-    client: Any, entity: Any, query: str, sleep: Sleep, out: Out
+    client: Any, entity: Any, query: str, sleep: Sleep, out: Out, into: dict[int, UserRow]
 ) -> dict[int, UserRow]:
-    """Page through one channel participant listing until Telegram returns no more."""
+    """Page through one channel participant listing until Telegram returns no more.
+
+    Every page is merged into `into` as it arrives, so an interrupt keeps what was found; the
+    return value is what this one query alone returned.
+    """
     members: dict[int, UserRow] = {}
     offset = 0
     while True:
@@ -205,7 +215,9 @@ async def _search_members(
         participants = getattr(result, "participants", None)
         if not participants:
             break
-        members.update(_rows_from(participants, result.users))
+        rows = _rows_from(participants, result.users)
+        members.update(rows)
+        into.update(rows)
         offset += len(participants)
     return members
 
@@ -220,6 +232,70 @@ async def _basic_group_members(
     return _rows_from(participants, full.users)
 
 
+def pair_queries(first: str) -> list[str]:
+    """The two-character queries for one first character: it paired with each character of its group."""
+    for group in DEEP_GROUPS:
+        if first in group:
+            return [first + second for second in group]
+    raise ValueError(f"{first!r} is in no deep-search group")
+
+
+async def _deep_search(
+    client: Any,
+    entity: Any,
+    members: dict[int, UserRow],
+    reported: int | None,
+    expand_at: int,
+    sleep: Sleep,
+    out: Out,
+) -> None:
+    """Search by single characters, then, while still short, by character pairs; merge into `members`."""
+
+    def short() -> bool:
+        return db.is_incomplete(len(members), reported)
+
+    out(f"  listing is short ({len(members)} of {reported}); searching by single characters")
+    returned: dict[str, int] = {}
+    for query in DEEP_QUERIES:
+        if not short():
+            return
+        before = len(members)
+        try:
+            found = await _search_members(client, entity, query, sleep, out, members)
+        except Exception as exc:  # keep what we already have
+            out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
+            return
+        returned[query] = len(found)
+        out(f"  deep {query!r}: +{len(members) - before} new, {len(members)} total")
+    if not short():
+        return
+
+    # Anyone matched by "cx" is also matched by "c", so a single-character search that returned fewer
+    # members than any search cap cannot be hiding anyone its two-character queries would find.
+    # Only characters whose search returned at least `expand_at` members are expanded.
+    expanded = [c for c in DEEP_QUERIES if returned[c] >= expand_at]
+    total = sum(len(pair_queries(c)) for c in expanded)
+    out(
+        f"  still short ({len(members)} of {reported}); searching by two characters: {total} queries "
+        f"for {len(expanded)} first characters, {len(DEEP_QUERIES) - len(expanded)} skipped "
+        f"(their single search returned fewer than {expand_at})"
+    )
+    for first in expanded:
+        before, ran = len(members), 0
+        for query in pair_queries(first):
+            if not short():
+                break
+            try:
+                await _search_members(client, entity, query, sleep, out, members)
+            except Exception as exc:  # keep what we already have
+                out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
+                return
+            ran += 1
+        out(f"  deep '{first}?': {ran} queries, +{len(members) - before} new, {len(members)} total")
+        if not short():
+            return
+
+
 async def fetch_members(
     client: Any,
     chat: AdminChat,
@@ -227,25 +303,37 @@ async def fetch_members(
     deep: bool = False,
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
+    expand_at: int = DEFAULT_EXPAND_AT,
+    into: dict[int, UserRow] | None = None,
 ) -> dict[int, UserRow]:
+    """The members of a chat. With `into`, members are added to that dict as they are found."""
+    members = {} if into is None else into
     if not isinstance(chat.entity, types.Channel):
-        return await _basic_group_members(client, chat.entity, sleep, out)
+        members.update(await _basic_group_members(client, chat.entity, sleep, out))
+        return members
 
-    members = await _search_members(client, chat.entity, "", sleep, out)
+    await _search_members(client, chat.entity, "", sleep, out, members)
     if deep and db.is_incomplete(len(members), reported):
-        out(f"  listing is short ({len(members)} of {reported}); searching by single characters")
-        for query in DEEP_QUERIES:
-            if not db.is_incomplete(len(members), reported):
-                break
-            try:
-                found = await _search_members(client, chat.entity, query, sleep, out)
-            except Exception as exc:  # keep what the listing already gave us
-                out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
-                break
-            before = len(members)
-            members.update(found)
-            out(f"  deep {query!r}: +{len(members) - before} new, {len(members)} total")
+        await _deep_search(client, chat.entity, members, reported, expand_at, sleep, out)
     return members
+
+
+def _keep_partial(
+    conn: sqlite3.Connection, chat: AdminChat, members: dict[int, UserRow], reported: int | None, out: Out
+) -> None:
+    """After an interrupt: store the members found so far as an incomplete snapshot, if it beats the latest."""
+    latest = db.latest_snapshot(conn, chat.id)
+    found = len(members)
+    if latest is not None and found <= latest.fetched:
+        why = f"{found} members found, not more than the {latest.fetched} in the latest snapshot"
+    elif found == 0:
+        why = "no members found yet"
+    else:
+        snapshot = db.add_snapshot(conn, chat.row, members.values(), reported, complete=False)
+        shown = "?" if reported is None else reported
+        out(f"{chat.title}: interrupted; saved a partial snapshot, fetched {snapshot.fetched} of {shown} reported, INCOMPLETE")
+        return
+    out(f"{chat.title}: interrupted; partial result discarded: {why}")
 
 
 async def collect_chat(
@@ -255,13 +343,25 @@ async def collect_chat(
     deep: bool = False,
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
+    expand_at: int = DEFAULT_EXPAND_AT,
 ) -> CollectResult:
-    """Collect one chat and store a snapshot. Never raises for a per-chat failure."""
+    """Collect one chat and store a snapshot. Never raises for a per-chat failure.
+
+    An interrupt (Ctrl-C cancels the task) keeps the members found so far, then propagates.
+    """
     result = CollectResult(chat)
+    members: dict[int, UserRow] = {}
+    reported: int | None = None
     try:
         reported = await reported_count(client, chat, sleep, out)
-        members = await fetch_members(client, chat, reported, deep, sleep, out)
+        await fetch_members(client, chat, reported, deep, sleep, out, expand_at, members)
         snapshot = db.add_snapshot(conn, chat.row, members.values(), reported)
+    except asyncio.CancelledError:
+        try:
+            _keep_partial(conn, chat, members, reported, out)
+        except Exception as exc:  # the interrupt still wins
+            out(f"{chat.title}: interrupted; could not store the partial result: {type(exc).__name__}: {exc}")
+        raise
     except Exception as exc:
         result.error = f"{type(exc).__name__}: {exc}"
         out(f"{chat.title}: FAILED, {result.error}")
@@ -281,6 +381,7 @@ async def collect(
     deep: bool = False,
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
+    expand_at: int = DEFAULT_EXPAND_AT,
 ) -> list[CollectResult]:
     """Collect every admin chat, or only the ones named by refs, one chat at a time."""
     admin_chats = await list_admin_chats(client, sleep, out)
@@ -297,5 +398,5 @@ async def collect(
     results = []
     for chat in chosen:
         out(f"collecting {chat.title} ({chat.type}, id {chat.id})")
-        results.append(await collect_chat(client, conn, chat, deep, sleep, out))
+        results.append(await collect_chat(client, conn, chat, deep, sleep, out, expand_at))
     return results
