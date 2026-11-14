@@ -85,6 +85,14 @@ It prints fetched vs reported per chat and marks a snapshot **INCOMPLETE** when 
 reported (more than 2% short). FloodWait errors are slept through (it prints the wait). If one chat fails
 (no rights, private, an RPC error) the error is printed, the run continues, and the exit code is non-zero.
 
+Before each request to Telegram, `collect` and `chats` pause for a random time between 1000 and 5000 ms
+(picked to the millisecond), so requests don't arrive at a fixed rate. Change the range with
+`--min-delay-ms` and `--max-delay-ms`, for example `tgstats collect --min-delay-ms 2000 --max-delay-ms 8000`.
+Every request is paced, including the chat discovery and the login check at the start. Not paced: the handshake
+Telethon sends when it connects (the first request, so there is nothing before it), and Telethon's own retries of a
+request after a Telegram server error, which wait a fixed 2 s each, at most 5 times. A big chat takes longer:
+200 members per request, so 10,000 members is 50 requests, about 2.5 minutes of pauses on average.
+
 `--deep`: when the plain listing comes back short, it also runs member searches for each Latin letter,
 digit and Cyrillic letter and merges the results, stopping once the reported count is reached. This can get
 past the cap on big supergroups but is slow and still may not reach everyone.

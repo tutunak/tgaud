@@ -86,17 +86,28 @@ def _prepare_session(session_path: str) -> None:
         raise CliError(f"cannot secure the session file {path}: {exc}") from exc
 
 
-def make_client(cfg: Config) -> Any:
-    from telethon import TelegramClient
-
+def make_client(cfg: Config, delay: tuple[int, int] | None = None) -> Any:
+    """A Telegram client; with a delay range, every request it sends waits a random time in it first."""
     _prepare_session(cfg.session_path)
     # flood_sleep_threshold=0: every FloodWaitError reaches the collector, which prints it
-    return TelegramClient(cfg.session_path, cfg.api_id, cfg.api_hash, flood_sleep_threshold=0)
+    client = collector.PacedTelegramClient(cfg.session_path, cfg.api_id, cfg.api_hash, flood_sleep_threshold=0)
+    if delay is not None:
+        client.pacer = collector.Pacer(*delay)
+    return client
+
+
+def delay_range(args: argparse.Namespace) -> tuple[int, int]:
+    low, high = args.min_delay_ms, args.max_delay_ms
+    if not 0 <= low <= high:
+        raise ConfigError(f"need 0 <= --min-delay-ms <= --max-delay-ms, got {low} and {high}")
+    return low, high
 
 
 @contextlib.asynccontextmanager
-async def connected_client(cfg: Config) -> AsyncIterator[Any]:
-    client = make_client(cfg)
+async def connected_client(cfg: Config, delay: tuple[int, int]) -> AsyncIterator[Any]:
+    """A logged-in client whose requests are paced by a random delay in the given ms range."""
+    print(f"Pausing {delay[0]}-{delay[1]} ms at random before each Telegram request.", file=sys.stderr)
+    client = make_client(cfg, delay)
     await client.connect()
     try:
         if not await client.is_user_authorized():
@@ -133,10 +144,11 @@ def cmd_login(args: argparse.Namespace) -> int:
 
 
 def cmd_chats(args: argparse.Namespace) -> int:
+    delay = delay_range(args)
     cfg = load_config(args.session, args.db)
 
     async def run() -> list[tuple[collector.AdminChat, int | None]]:
-        async with connected_client(cfg) as client:
+        async with connected_client(cfg, delay) as client:
             chats = await collector.list_admin_chats(client)
             out = []
             for chat in chats:
@@ -165,11 +177,12 @@ def cmd_chats(args: argparse.Namespace) -> int:
 
 
 def cmd_collect(args: argparse.Namespace) -> int:
+    delay = delay_range(args)
     cfg = load_config(args.session, args.db)
     conn = db.connect(cfg.db_path)
 
     async def run() -> list[collector.CollectResult]:
-        async with connected_client(cfg) as client:
+        async with connected_client(cfg, delay) as client:
             return await collector.collect(client, conn, args.chats or None, deep=args.deep)
 
     try:
@@ -291,6 +304,15 @@ def build_parser() -> argparse.ArgumentParser:
     out_flags = argparse.ArgumentParser(add_help=False)
     out_flags.add_argument("--list", action="store_true", help="print the users (id, @username, name)")
     out_flags.add_argument("--csv", metavar="FILE", help="write the users to a CSV file")
+    pace = argparse.ArgumentParser(add_help=False)
+    pace.add_argument(
+        "--min-delay-ms", type=int, default=collector.MIN_DELAY_MS, metavar="MS",
+        help=f"shortest random pause before each Telegram request (default {collector.MIN_DELAY_MS})",
+    )
+    pace.add_argument(
+        "--max-delay-ms", type=int, default=collector.MAX_DELAY_MS, metavar="MS",
+        help=f"longest random pause before each Telegram request (default {collector.MAX_DELAY_MS})",
+    )
 
     parser = argparse.ArgumentParser(
         prog="tgstats",
@@ -303,10 +325,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("login", parents=[tg_flags], help="log in to Telegram (phone, code, 2FA password)")
     p.set_defaults(func=cmd_login)
 
-    p = sub.add_parser("chats", parents=[tg_flags], help="list chats where you are creator or admin")
+    p = sub.add_parser("chats", parents=[tg_flags, pace], help="list chats where you are creator or admin")
     p.set_defaults(func=cmd_chats)
 
-    p = sub.add_parser("collect", parents=[tg_flags], help="fetch member lists and store a new snapshot")
+    p = sub.add_parser("collect", parents=[tg_flags, pace], help="fetch member lists and store a new snapshot")
     p.add_argument("chats", nargs="*", metavar="CHAT", help="numeric id, @username or exact title (default: all admin chats)")
     p.add_argument(
         "--deep",

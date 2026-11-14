@@ -2,6 +2,8 @@ import asyncio
 
 import pytest
 from telethon import errors
+from telethon.tl import types
+from telethon.tl.functions.messages import GetFullChatRequest
 
 from fakes import FakeClient, basic_group, channel, tg_user
 from tgstats import collector, db
@@ -186,3 +188,66 @@ def test_flood_wait_during_chat_discovery_is_slept_through_without_duplicates(co
     assert [r.chat.title for r in results] == ["One", "Two"]
     assert all(r.error is None for r in results)
     assert set(db.latest_snapshots(conn)) == {-1000000000001, -1000000000002}
+
+
+
+def test_pacer_waits_a_random_whole_ms_in_range():
+    rec = Recorder()
+    pacer = collector.Pacer(1000, 5000, sleep=rec.sleep)
+    for _ in range(200):
+        run(pacer.wait())
+    assert len(rec.sleeps) == 200
+    assert all(1.0 <= s <= 5.0 for s in rec.sleeps)
+    assert all(abs(s * 1000 - round(s * 1000)) < 1e-6 for s in rec.sleeps)  # whole milliseconds
+    assert len(set(rec.sleeps)) > 100  # random, not a fixed rate
+
+
+def test_pacer_with_a_fixed_range_and_a_bad_range():
+    rec = Recorder()
+    run(collector.Pacer(1500, 1500, sleep=rec.sleep).wait())
+    assert rec.sleeps == [1.5]
+    with pytest.raises(ValueError):
+        collector.Pacer(5000, 1000)
+    with pytest.raises(ValueError):
+        collector.Pacer(-1, 1000)
+
+
+def test_paced_telegram_client_paces_requests_telethon_sends_itself(monkeypatch):
+    """iter_dialogs and explicit requests both go through the pacer (real Telethon code, no network)."""
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+    from telethon.tl.functions.messages import GetDialogsRequest
+
+    sent = []
+
+    async def fake_call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+        sent.append(type(request).__name__)
+        if isinstance(request, GetDialogsRequest):
+            return types.messages.Dialogs(dialogs=[], messages=[], chats=[], users=[])
+        return types.messages.ChatFull(full_chat=None, chats=[], users=[])
+
+    monkeypatch.setattr(TelegramClient, "_call", fake_call)
+    rec = Recorder()
+
+    async def scenario():
+        client = collector.PacedTelegramClient(MemorySession(), 1, "hash")
+        client.pacer = collector.Pacer(1000, 5000, sleep=rec.sleep)
+        chats = await collector.list_admin_chats(client, sleep=rec.sleep, out=rec.out)
+        await collector.call(client, GetFullChatRequest(1), sleep=rec.sleep, out=rec.out)
+        return chats
+
+    assert run(scenario()) == []
+    assert sent == ["GetDialogsRequest", "GetFullChatRequest"]
+    assert len(rec.sleeps) == 2 and all(1.0 <= s <= 5.0 for s in rec.sleeps)
+
+
+def test_unpaced_client_does_not_wait(monkeypatch):
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+
+    async def fake_call(self, sender, request, ordered=False, flood_sleep_threshold=None):
+        return "ok"
+
+    monkeypatch.setattr(TelegramClient, "_call", fake_call)
+    client = collector.PacedTelegramClient(MemorySession(), 1, "hash")
+    assert run(client(GetFullChatRequest(1))) == "ok"

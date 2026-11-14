@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import sqlite3
 import string
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable
 
-from telethon import errors, utils
+from telethon import TelegramClient, errors, utils
 from telethon.tl import types
 from telethon.tl.functions.channels import GetFullChannelRequest, GetParticipantsRequest
 from telethon.tl.functions.messages import GetFullChatRequest
@@ -19,6 +20,9 @@ from .db import ChatRow, UserRow
 
 PAGE_SIZE = 200
 MAX_FLOOD_RETRIES = 20
+# random pause before every request, in whole milliseconds, so requests don't come at a fixed rate
+MIN_DELAY_MS = 1000
+MAX_DELAY_MS = 5000
 # --deep searches by single characters: Latin letters, digits, Cyrillic letters
 DEEP_QUERIES = list(string.ascii_lowercase + string.digits + "абвгдеёжзийклмнопрстуфхцчшщъыьэюя")
 
@@ -48,6 +52,43 @@ class CollectResult:
     reported: int | None = None
     complete: bool = True
     error: str | None = None
+
+
+class Pacer:
+    """Waits a random MIN..MAX whole milliseconds; run before every Telegram request."""
+
+    def __init__(
+        self,
+        min_ms: int = MIN_DELAY_MS,
+        max_ms: int = MAX_DELAY_MS,
+        sleep: Sleep = asyncio.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
+        if not 0 <= min_ms <= max_ms:
+            raise ValueError(f"need 0 <= min delay <= max delay, got {min_ms}..{max_ms} ms")
+        self.min_ms, self.max_ms = min_ms, max_ms
+        self._sleep = sleep
+        self._rng = rng or random.Random()
+
+    async def wait(self) -> None:
+        await self._sleep(self._rng.randint(self.min_ms, self.max_ms) / 1000)
+
+
+class PacedTelegramClient(TelegramClient):
+    """A TelegramClient that runs its pacer before every request it sends.
+
+    It hooks `_call`, where every request ends up: explicit `client(request)` calls
+    and the ones Telethon sends itself (iter_dialogs, the authorization check).
+    Not paced: the connection handshake, and Telethon's own retries inside `_call`
+    after a server error (it waits a fixed 2 s between those).
+    """
+
+    pacer: Pacer | None = None
+
+    async def _call(self, sender: Any, request: Any, ordered: bool = False, flood_sleep_threshold: Any = None) -> Any:
+        if self.pacer is not None:
+            await self.pacer.wait()
+        return await super()._call(sender, request, ordered=ordered, flood_sleep_threshold=flood_sleep_threshold)
 
 
 def chat_type(entity: Any) -> str | None:

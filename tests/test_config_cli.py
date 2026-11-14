@@ -148,3 +148,16 @@ def test_session_protection_failure_is_reported_not_ignored(tmp_path, monkeypatc
     (tmp_path / "dir.session").mkdir()  # not a file: cannot be secured
     assert cli.main(["login", "--session", str(tmp_path / "dir.session")]) == 1
     assert "cannot secure the session file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("command", ["chats", "collect"])
+def test_bad_delay_range_is_a_one_line_error(tmp_path, monkeypatch, capsys, command):
+    monkeypatch.chdir(tmp_path)
+    assert cli.main([command, "--min-delay-ms", "5000", "--max-delay-ms", "1000"]) == 2
+    err = capsys.readouterr().err
+    assert "--min-delay-ms" in err and err.count("\n") == 1
+
+
+def test_delay_defaults_are_1_to_5_seconds():
+    args = cli.build_parser().parse_args(["collect"])
+    assert cli.delay_range(args) == (1000, 5000)
