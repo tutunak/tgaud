@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import stat
 
 import pytest
 
@@ -94,3 +96,55 @@ def test_overlap_cli_and_errors(populated, tmp_path, capsys):
     assert cli.main(["unique", "--db", populated, "--among", "Nope"]) == 2
     assert cli.main(["unique", "--db", str(tmp_path / "missing.db")]) == 2
     assert not (tmp_path / "missing.db").exists()
+
+
+def _mode(path):
+    return stat.S_IMODE(os.stat(path).st_mode)
+
+
+def test_new_session_file_is_owner_only_from_creation(tmp_path):
+    old = os.umask(0o022)
+    try:
+        cfg = load_config(str(tmp_path / "s.session"), None, environ={"TG_API_ID": "1", "TG_API_HASH": "h"}, cwd=tmp_path)
+        client = cli.make_client(cfg)  # Telethon opens/creates the session here, before any login
+    finally:
+        os.umask(old)
+    assert _mode(tmp_path / "s.session") == 0o600
+    client.session.close()
+
+
+def test_existing_world_readable_session_is_tightened_before_telethon_opens_it(tmp_path):
+    path = tmp_path / "old.session"
+    path.write_text("")
+    path.chmod(0o644)
+    cfg = load_config(str(path), None, environ={"TG_API_ID": "1", "TG_API_HASH": "h"}, cwd=tmp_path)
+    cli.make_client(cfg).session.close()
+    assert _mode(path) == 0o600
+
+
+def test_failed_login_leaves_session_owner_only(tmp_path, monkeypatch):
+    from telethon import TelegramClient
+
+    async def boom(self, *a, **k):
+        raise RuntimeError("code entry interrupted")
+
+    monkeypatch.setattr(TelegramClient, "start", boom)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_API_ID", "1")
+    monkeypatch.setenv("TG_API_HASH", "h")
+    old = os.umask(0o022)
+    try:
+        with pytest.raises(RuntimeError):
+            cli.main(["login", "--session", str(tmp_path / "x.session")])
+    finally:
+        os.umask(old)
+    assert _mode(tmp_path / "x.session") == 0o600
+
+
+def test_session_protection_failure_is_reported_not_ignored(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TG_API_ID", "1")
+    monkeypatch.setenv("TG_API_HASH", "h")
+    (tmp_path / "dir.session").mkdir()  # not a file: cannot be secured
+    assert cli.main(["login", "--session", str(tmp_path / "dir.session")]) == 1
+    assert "cannot secure the session file" in capsys.readouterr().err

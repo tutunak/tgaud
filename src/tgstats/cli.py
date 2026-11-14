@@ -72,16 +72,24 @@ def bots_note(include_bots: bool) -> None:
 # ---------------------------------------------------------------- telegram plumbing
 
 
-def _protect_session(session_path: str) -> None:
-    """The session file is a login for the account: owner read/write only."""
+def _prepare_session(session_path: str) -> None:
+    """Make the session file owner-only before Telethon opens it.
+
+    The session is a login for the account. Create it empty with mode 0600 (SQLite
+    accepts an empty file) or tighten an existing one; failures are raised, not hidden.
+    """
     path = session_path if session_path.endswith(".session") else session_path + ".session"
-    with contextlib.suppress(OSError):
+    try:
+        os.close(os.open(path, os.O_RDWR | os.O_CREAT, 0o600))
         os.chmod(path, 0o600)
+    except OSError as exc:
+        raise CliError(f"cannot secure the session file {path}: {exc}") from exc
 
 
 def make_client(cfg: Config) -> Any:
     from telethon import TelegramClient
 
+    _prepare_session(cfg.session_path)
     # flood_sleep_threshold=0: every FloodWaitError reaches the collector, which prints it
     return TelegramClient(cfg.session_path, cfg.api_id, cfg.api_hash, flood_sleep_threshold=0)
 
@@ -91,7 +99,6 @@ async def connected_client(cfg: Config) -> AsyncIterator[Any]:
     client = make_client(cfg)
     await client.connect()
     try:
-        _protect_session(cfg.session_path)
         if not await client.is_user_authorized():
             raise CliError("not logged in: run `tgstats login` first")
         yield client
@@ -115,7 +122,6 @@ def cmd_login(args: argparse.Namespace) -> int:
         client = make_client(cfg)
         try:
             await client.start()  # asks for phone, code and 2FA password when needed
-            _protect_session(cfg.session_path)
             me = await client.get_me()
             print(f"Logged in as {describe_user(me)}")
             print(f"Session saved to {cfg.session_path}: it grants full access to this account, keep it private.")

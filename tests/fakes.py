@@ -40,17 +40,21 @@ class FakeClient:
     to raise on GetFullChannel/GetParticipants).
     """
 
-    def __init__(self, dialogs, members, opts=None, flood_on=()):
+    def __init__(self, dialogs, members, opts=None, flood_on=(), dialog_floods=0):
         self.dialogs = dialogs
         self.members = members
         self.opts = opts or {}
         self.flood_on = set(flood_on)  # 1-based GetParticipants call numbers that hit a flood wait
+        self.dialog_floods = dialog_floods  # GetDialogs flood waits, each hit after the first dialog
         self.participant_calls = 0
         self.requests = []
 
     def iter_dialogs(self):
         async def gen():
-            for entity in self.dialogs:
+            for i, entity in enumerate(self.dialogs):
+                if i == 1 and self.dialog_floods:
+                    self.dialog_floods -= 1
+                    raise errors.FloodWaitError(None, capture=12)
                 yield SimpleNamespace(entity=entity)
 
         return gen()

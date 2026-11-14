@@ -62,17 +62,34 @@ def _is_admin(entity: Any) -> bool:
     return bool(getattr(entity, "creator", False) or getattr(entity, "admin_rights", None))
 
 
-async def list_admin_chats(client: Any) -> list[AdminChat]:
-    chats = []
-    async for dialog in client.iter_dialogs():
-        entity = dialog.entity
-        kind = chat_type(entity)
-        if kind is None or not _is_admin(entity):
-            continue
-        chats.append(
-            AdminChat(utils.get_peer_id(entity), kind, entity.title, getattr(entity, "username", None), entity)
-        )
-    return chats
+async def _flood_wait(exc: errors.FloodWaitError, attempt: int, sleep: Sleep, out: Out) -> None:
+    if attempt == MAX_FLOOD_RETRIES:
+        raise exc
+    out(f"  Telegram asks to wait {exc.seconds}s (flood wait); sleeping, then continuing")
+    await sleep(exc.seconds + 1)
+
+
+async def list_admin_chats(
+    client: Any, sleep: Sleep = asyncio.sleep, out: Out = print
+) -> list[AdminChat]:
+    """Admin chats from the dialog list; a flood wait restarts the listing, without duplicates."""
+    found: dict[int, AdminChat] = {}
+    for attempt in range(MAX_FLOOD_RETRIES + 1):
+        try:
+            async for dialog in client.iter_dialogs():
+                entity = dialog.entity
+                kind = chat_type(entity)
+                if kind is None or not _is_admin(entity):
+                    continue
+                chat_id = utils.get_peer_id(entity)
+                found.setdefault(
+                    chat_id,
+                    AdminChat(chat_id, kind, entity.title, getattr(entity, "username", None), entity),
+                )
+            break
+        except errors.FloodWaitError as exc:
+            await _flood_wait(exc, attempt, sleep, out)
+    return list(found.values())
 
 
 async def call(
@@ -83,10 +100,7 @@ async def call(
         try:
             return await client(request)
         except errors.FloodWaitError as exc:
-            if attempt == MAX_FLOOD_RETRIES:
-                raise
-            out(f"  Telegram asks to wait {exc.seconds}s (flood wait); sleeping, then continuing")
-            await sleep(exc.seconds + 1)
+            await _flood_wait(exc, attempt, sleep, out)
     raise AssertionError("unreachable")
 
 
@@ -228,7 +242,7 @@ async def collect(
     out: Out = print,
 ) -> list[CollectResult]:
     """Collect every admin chat, or only the ones named by refs, one chat at a time."""
-    admin_chats = await list_admin_chats(client)
+    admin_chats = await list_admin_chats(client, sleep, out)
     if refs:
         chosen: list[AdminChat] = []
         for ref in refs:

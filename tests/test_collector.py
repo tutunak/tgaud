@@ -172,3 +172,17 @@ def test_deep_is_skipped_when_listing_is_complete(conn):
     client = FakeClient([channel(1, "C")], {1: [tg_user(1)]})
     collect(client, conn, deep=True)
     assert client.participant_calls == 2  # one page, one empty page; no searches
+
+
+def test_flood_wait_during_chat_discovery_is_slept_through_without_duplicates(conn):
+    client = FakeClient(
+        [channel(1, "One"), channel(2, "Two")],
+        {1: [tg_user(1)], 2: [tg_user(2)]},
+        dialog_floods=2,
+    )
+    results, rec = collect(client, conn)
+    assert rec.sleeps == [13, 13]
+    assert "12s" in rec.text and "wait" in rec.text
+    assert [r.chat.title for r in results] == ["One", "Two"]
+    assert all(r.error is None for r in results)
+    assert set(db.latest_snapshots(conn)) == {-1000000000001, -1000000000002}
