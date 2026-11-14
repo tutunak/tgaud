@@ -1,0 +1,24 @@
+[project]
+name = "tgstats"
+version = "0.1.0"
+description = "Telegram userbot that collects the members of your admin chats and compares their audiences"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon>=1.45.0",
+]
+
+[project.scripts]
+tgstats = "tgstats.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
