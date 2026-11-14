@@ -1,5 +1,7 @@
 """A fake Telethon client: answers the few requests the collector sends, offline."""
 
+import asyncio
+import signal
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -36,18 +38,39 @@ class FakeClient:
     """members: {entity.id: [User]}; per-chat options live in `opts`.
 
     opts[id]: page (max participants per response), cap (max returned by the
-    empty-query listing), reported (what GetFullChannel says), error (exception
-    to raise on GetFullChannel/GetParticipants).
+    empty-query listing), search_cap (max returned by a non-empty query), reported
+    (what GetFullChannel says), error (exception to raise on GetFullChannel/GetParticipants).
+
+    Interrupts (Ctrl-C) happen instead of answering a request: on GetFullChannel
+    (interrupt_on_full), on given 1-based GetParticipants call numbers
+    (interrupt_on_calls) or on given search queries (interrupt_on_queries). The
+    interrupt cancels the running task, or with sigint=True sends a real SIGINT,
+    which under asyncio.run cancels the task and then raises KeyboardInterrupt.
     """
 
-    def __init__(self, dialogs, members, opts=None, flood_on=(), dialog_floods=0):
+    def __init__(
+        self, dialogs, members, opts=None, flood_on=(), dialog_floods=0,
+        interrupt_on_full=False, interrupt_on_calls=(), interrupt_on_queries=(), sigint=False, fail_on_queries=None,
+    ):
         self.dialogs = dialogs
         self.members = members
         self.opts = opts or {}
         self.flood_on = set(flood_on)  # 1-based GetParticipants call numbers that hit a flood wait
         self.dialog_floods = dialog_floods  # GetDialogs flood waits, each hit after the first dialog
+        self.interrupt_on_full = interrupt_on_full
+        self.interrupt_on_calls = set(interrupt_on_calls)
+        self.interrupt_on_queries = set(interrupt_on_queries)
+        self.sigint = sigint
+        self.fail_on_queries = fail_on_queries or {}  # search query -> exception to raise
         self.participant_calls = 0
         self.requests = []
+
+    async def _interrupt(self):
+        if self.sigint:
+            signal.raise_signal(signal.SIGINT)
+        else:
+            asyncio.current_task().cancel()
+        await asyncio.sleep(3600)  # the cancellation arrives here
 
     def iter_dialogs(self):
         async def gen():
@@ -73,6 +96,8 @@ class FakeClient:
             raise opt["error"]
         users = self.members[cid]
         if isinstance(request, GetFullChannelRequest):
+            if self.interrupt_on_full:
+                await self._interrupt()
             return SimpleNamespace(
                 full_chat=SimpleNamespace(participants_count=opt.get("reported", len(users)))
             )
@@ -81,8 +106,13 @@ class FakeClient:
         if self.participant_calls in self.flood_on:
             raise errors.FloodWaitError(request, capture=30)
         query = request.filter.q.lower()
+        if query in self.fail_on_queries:
+            raise self.fail_on_queries[query]
+        if self.participant_calls in self.interrupt_on_calls or query in self.interrupt_on_queries:
+            await self._interrupt()
         if query:
             hits = [u for u in users if u.first_name.lower().startswith(query)]
+            hits = hits[: opt.get("search_cap", len(hits))]
         else:
             hits = users[: opt.get("cap", len(users))]
         page = hits[request.offset : request.offset + min(request.limit, opt.get("page", 200))]

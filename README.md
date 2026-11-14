@@ -78,7 +78,8 @@ snapshot**. Old snapshots are kept; every analysis uses the latest snapshot of e
 ```sh
 tgstats collect                       # all admin chats
 tgstats collect @mychannel "My Group" # only these
-tgstats collect --deep                # also search by single characters when the listing is short
+tgstats collect --deep                # also search by one, then two characters when the listing is short
+tgstats collect --deep --expand-at 0  # ... and run every two-character query (slow)
 ```
 
 It prints fetched vs reported per chat and marks a snapshot **INCOMPLETE** when fetched is clearly below
@@ -93,9 +94,35 @@ Telethon sends when it connects (the first request, so there is nothing before i
 request after a Telegram server error, which wait a fixed 2 s each, at most 5 times. A big chat takes longer:
 200 members per request, so 10,000 members is 50 requests, about 2.5 minutes of pauses on average.
 
-`--deep`: when the plain listing comes back short, it also runs member searches for each Latin letter,
-digit and Cyrillic letter and merges the results, stopping once the reported count is reached. This can get
-past the cap on big supergroups but is slow and still may not reach everyone.
+`--deep`: when the plain listing comes back short, it runs member searches and merges what they find. It
+stops as soon as the snapshot is no longer incomplete. Two passes:
+
+1. **Single characters**: 69 queries, one per Latin letter, digit (`a`..`z`, `0`..`9`) and Cyrillic letter.
+2. **Two characters**, only if the snapshot is still incomplete after pass 1: `aa`, `ab`, ..., `a0`, ..., `99`,
+   then `аа`, `аб`, ... A pair uses two characters of the same group (Latin letters and digits: 36 characters,
+   36 x 36 = 1296 pairs; Cyrillic: 33 characters, 33 x 33 = 1089 pairs), never one of each. That is up to
+   2385 pair queries, 2454 searches with pass 1, at most.
+
+Pruning: a first character is expanded into its pair queries only when its single-character search returned at
+least `--expand-at N` members (default 100). Anyone matched by `cx` is also matched by `c`, so a
+single-character search that returned fewer results than any search cap cannot be hiding anyone its pairs
+would find. Before pass 2 it prints how many queries will run and how many first characters were skipped,
+then one line per expanded first character (`deep 'a?': 36 queries, +123 new, 5012 total`). `--expand-at 0`
+expands every character: the full grid of 2385 queries. A negative value is an error.
+
+Time: every request waits 1 to 5 s (about 3 s on average at the default pauses), so the full grid is about
+2 hours per chat, more when a search needs several pages (200 members each). A flood wait adds its own sleep.
+Pruning usually makes it much shorter. A failed query (other than a flood wait) prints the error and stops
+the deep search; what was found so far is kept.
+
+**Ctrl-C keeps a partial snapshot.** If you interrupt a collection, the members found so far for that chat are
+stored as an **incomplete** snapshot, but only if they number more than the chat's latest snapshot (or the chat
+has none yet); otherwise nothing is stored, so an early Ctrl-C never replaces a better snapshot. It prints which
+happened. Chats after the interrupted one are not collected; the exit code is 130.
+
+Limit: the searches match the characters above, so members whose names and usernames use none of these scripts
+(for example Arabic or Chinese) are not found this way, and the snapshot can stay incomplete. Without `--deep`,
+a run that ends with an incomplete snapshot tells you to try `tgstats collect --deep CHAT`.
 
 ### `tgstats unique [--among CHAT ...] [--chat CHAT] [--list] [--csv FILE]`
 

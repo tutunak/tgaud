@@ -117,11 +117,16 @@ def add_snapshot(
     users: Iterable[UserRow],
     reported: int | None,
     taken_at: str | None = None,
+    complete: bool | None = None,
 ) -> SnapshotRow:
-    """Store one full snapshot of a chat atomically and return it."""
+    """Store one full snapshot of a chat atomically and return it.
+
+    `complete` overrides the verdict from the counts (an interrupted run is always incomplete).
+    """
     users = list(users)
     fetched = len({u.id for u in users})
-    complete = not is_incomplete(fetched, reported)
+    if complete is None:
+        complete = not is_incomplete(fetched, reported)
     taken_at = taken_at or utcnow()
     with conn:
         upsert_chat(conn, chat)
@@ -162,6 +167,11 @@ def latest_snapshots(conn: sqlite3.Connection) -> dict[int, SnapshotRow]:
         "(SELECT chat_id, MAX(id) AS id FROM snapshots GROUP BY chat_id) m ON s.id = m.id"
     )
     return {r["chat_id"]: _snapshot(r) for r in rows}
+
+
+def latest_snapshot(conn: sqlite3.Connection, chat_id: int) -> SnapshotRow | None:
+    row = conn.execute("SELECT * FROM snapshots WHERE chat_id = ? ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+    return _snapshot(row) if row else None
 
 
 def snapshot_members(

@@ -178,12 +178,16 @@ def cmd_chats(args: argparse.Namespace) -> int:
 
 def cmd_collect(args: argparse.Namespace) -> int:
     delay = delay_range(args)
+    if args.expand_at < 0:
+        raise ConfigError(f"--expand-at must be 0 or more, got {args.expand_at}")
     cfg = load_config(args.session, args.db)
     conn = db.connect(cfg.db_path)
 
     async def run() -> list[collector.CollectResult]:
         async with connected_client(cfg, delay) as client:
-            return await collector.collect(client, conn, args.chats or None, deep=args.deep)
+            return await collector.collect(
+                client, conn, args.chats or None, deep=args.deep, expand_at=args.expand_at
+            )
 
     try:
         results = asyncio.run(run())
@@ -198,6 +202,8 @@ def cmd_collect(args: argparse.Namespace) -> int:
             + ", ".join(r.chat.title for r in short)
             + ". Telegram returned fewer members than reported; see the README caveat."
         )
+        if not args.deep:
+            print("To search for more members, run `tgstats collect --deep CHAT`; it is slow (hours for a big chat).")
     return 1 if failed else 0
 
 
@@ -333,7 +339,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--deep",
         action="store_true",
-        help="when the listing is short, also search members by single characters (Latin, digits, Cyrillic) and merge",
+        help="when the listing is short, also search members by one character, then by two (Latin, digits, Cyrillic), and merge",
+    )
+    p.add_argument(
+        "--expand-at",
+        type=int,
+        default=collector.DEFAULT_EXPAND_AT,
+        metavar="N",
+        help="with --deep: search two-character queries only for first characters whose single search "
+        f"returned at least N members (default {collector.DEFAULT_EXPAND_AT}; 0 searches them all)",
     )
     p.set_defaults(func=cmd_collect)
 
