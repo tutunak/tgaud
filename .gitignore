@@ -1,0 +1,18 @@
+# Telegram credentials and login sessions: never commit
+.env
+*.session
+*.session-journal
+
+# collected data
+*.db
+*.sqlite
+*.csv
+
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+build/
+*.egg-info/
