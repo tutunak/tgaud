@@ -405,11 +405,11 @@ def test_concurrent_writer_waits_and_the_result_equals_a_fresh_replay(migrated_d
     paused, resume = threading.Event(), threading.Event()
     real = history.build_spells
 
-    def slow(ev):
+    def slow(ev, *rest):
         if threading.current_thread().name == "A":
             paused.set()
             assert resume.wait(30)
-        return real(ev)
+        return real(ev, *rest)
 
     monkeypatch.setattr(history, "build_spells", slow)
     errors: list[BaseException] = []
@@ -493,7 +493,7 @@ def test_zone_is_restored_after_a_python_error_and_by_rollback_after_a_database_
         w.join(32, FALL_JOIN)
         c.commit()
 
-        def boom(ev):
+        def boom(ev, *rest):
             raise RuntimeError("injected in the replay")
 
         monkeypatch.setattr(history, "build_spells", boom)

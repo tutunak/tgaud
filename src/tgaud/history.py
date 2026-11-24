@@ -20,6 +20,11 @@ before the service message. Aliases with this chat as chat_id (M1, history moved
 Snapshot evidence comes only from tg.sighting and tg.snapshot, never tg.snapshot_member, so pruning (R3) can
 never change a replay. A snapshot is evidence for a user once it is graded good or partial (never rejected) and
 applied to that user (reconciled_at set, or user_id <= applied_through_user_id), for every point of every run.
+Runs are numbered over the chat's graded snapshots that are not late (migration 004): an ungraded snapshot has no
+points yet, and a late one (graded after a later snapshot of its source) only has one-point runs of its own, read
+by snapshot id, and gives no absences, so neither shifts the points of the runs around it.
+
+Every rebuild records the E4, E10 and S3 cases its replay produced (tg.record_contradictions, migration 004).
 
 Every time is compared as a UTC instant. Python orders, subtracts and compares datetimes that share a tzinfo by
 wall time, so a zone with daylight saving (the session's, which psycopg loads timestamptz into) would misorder the
@@ -103,6 +108,7 @@ class SightingPoint(NamedTuple):
     joined_date: datetime | None = None
     first_snapshot_id: int = 0  # the run's key; with index only a tiebreak between identical points
     index: int = 0
+    snapshot_id: int = 0  # the snapshot that listed this point (the source of an S3 case)
 
 
 class ProbeAnswer(NamedTuple):
@@ -252,6 +258,7 @@ def _in_utc(ev: Evidence) -> Evidence:
         [_utc(t) for t in ev.gaps], [_utc(t) for t in ev.migrations], [_utc(t) for t in ev.echo_from])
 
 Trace = list[tuple[str, datetime | None]]
+Cases = list[tuple[str, datetime, int]]  # (E4 | E10 | S3, evidence time, event_id or snapshot_id)
 
 
 def _probe_is_late(p: ProbeAnswer, event_times: Sequence[datetime]) -> bool:
@@ -261,8 +268,9 @@ def _probe_is_late(p: ProbeAnswer, event_times: Sequence[datetime]) -> bool:
     return i < len(event_times) and event_times[i] <= p.answered_at
 
 
-def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
-    """The state table of design.md 4 for one (chat, user); appends (rule, time) of every branch to `trace`.
+def replay(ev: Evidence, trace: Trace | None = None, cases: Cases | None = None) -> list[Spell]:
+    """The state table of design.md 4 for one (chat, user); appends (rule, time) of every branch to `trace`, and
+    (rule, time, source id) of every E4, E10 and S3 to `cases`.
 
     Times may be in any zone (aware); they are compared, and the spells returned, in UTC.
     """
@@ -316,6 +324,8 @@ def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
                     stays.append(_open_exact(e))
                     if note:
                         note(("E4", t))
+                    if cases is not None:
+                        cases.append(("E4", t, e.event_id))
                 else:
                     stays.append(_open_exact(e))  # E1 (none) / E2 (closed: a rejoin)
                     if note:
@@ -346,6 +356,8 @@ def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
                     last.close("inferred", "gone", t)  # E10: the old status says out
                     if note:
                         note(("E10", t))
+                    if cases is not None:
+                        cases.append(("E10", t, e.event_id))
                 elif note:
                     note(("E11", t))  # E11: ban from out, unban: moderation only
 
@@ -366,6 +378,8 @@ def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
             elif t < last.left_before + GRACE:
                 if note:
                     note(("S3", t))  # S3: stale listing within G after the end: ignored (conflict probe)
+                if cases is not None:
+                    cases.append(("S3", t, s.snapshot_id))
             else:
                 stays.append(_Stay("snapshot", t, t, joined_hint=s.joined_date))  # S4: missed rejoin
                 if note:
@@ -422,9 +436,10 @@ def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
             for s in stays]
 
 
-def build_spells(evidence: Evidence) -> list[Spell]:
-    """The spells of one (chat, user) from all its evidence, in time order (pure; no database)."""
-    return replay(evidence)
+def build_spells(evidence: Evidence, cases: Cases | None = None) -> list[Spell]:
+    """The spells of one (chat, user) from all its evidence, in time order (pure; no database); appends the E4,
+    E10 and S3 cases to `cases`."""
+    return replay(evidence, cases=cases)
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -434,14 +449,19 @@ def build_spells(evidence: Evidence) -> list[Spell]:
 
 @dataclass(frozen=True)
 class RebuildResult:
-    """What a rebuild changed: spells opened, closed and otherwise changed, over all pairs given."""
+    """What a rebuild changed: spells opened, closed and otherwise changed, over all pairs given; besides (not
+    compared) the E4/E10/S3 cases the replay produced, as (chat_id, user_id, rule, time, source id), and the conflict
+    probes their recording queued or raised."""
 
     opened: int = 0
     closed: int = 0
     changed: int = 0
+    cases: tuple[tuple[int, int, str, datetime, int], ...] = field(default=(), compare=False)
+    conflict_probes: int = field(default=0, compare=False)
 
     def __add__(self, other: "RebuildResult") -> "RebuildResult":
-        return RebuildResult(self.opened + other.opened, self.closed + other.closed, self.changed + other.changed)
+        return RebuildResult(self.opened + other.opened, self.closed + other.closed, self.changed + other.changed,
+                             self.cases + other.cases, self.conflict_probes + other.conflict_probes)
 
 
 _PAIRS = "unnest(%(chats)s::bigint[], %(users)s::bigint[]) AS p(chat_id, user_id)"
@@ -470,7 +490,8 @@ FROM {_PAIRS} JOIN tg.membership m ON m.chat_id = p.chat_id AND m.user_id = p.us
 # finished snapshots of the chats (the sources of run points; the good ones also give absences); whether one counts
 # for a user is decided per user (the reconciler's cursor)
 _Q_SNAPSHOTS = """
-SELECT s.chat_id, s.started_at, s.snapshot_id, s.quality, s.applied_through_user_id, s.reconciled_at IS NOT NULL
+SELECT s.chat_id, s.started_at, s.snapshot_id, s.quality, s.applied_through_user_id, s.reconciled_at IS NOT NULL,
+       s.late
 FROM tg.snapshot s WHERE s.chat_id = ANY(%(cs)s) AND s.finished_at IS NOT NULL"""
 
 _Q_GAPS = """
@@ -488,8 +509,10 @@ _COPY = f"COPY tg.membership ({', '.join(SPELL_COLUMNS)}) FROM STDIN"
 
 @dataclass
 class _ChatContext:
-    fin_index: dict[int, int] = field(default_factory=dict)  # snapshot_id -> position among finished, by key
+    fin_index: dict[int, int] = field(default_factory=dict)  # snapshot_id -> position among numbered, by key
     fin_meta: list[tuple[str | None, int | None, bool]] = field(default_factory=list)  # (quality, through, reconciled)
+    fin_ids: list[int] = field(default_factory=list)  # snapshot_id by position
+    late: dict[int, tuple[str | None, int | None, bool]] = field(default_factory=dict)  # late snapshot_id -> meta
     snap_keys: list[tuple[datetime, int]] = field(default_factory=list)  # good snapshots, sorted
     snap_starts: list[datetime] = field(default_factory=list)  # their started_at, for bisect
     snap_meta: list[tuple[int | None, bool]] = field(default_factory=list)  # (applied_through, reconciled)
@@ -529,17 +552,22 @@ def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event]
     covered: list[tuple[tuple[datetime, int], tuple[datetime, int]]] = []
     for (first_id, first_started, last_id, last_started, first_seen, interior, last_seen, times_seen,
          joined_date) in runs:
+        if first_id in ctx.late:
+            # a late listing's run is one point, read by its snapshot id (the reconciler never extends it)
+            if _counts_for(ctx.late[first_id], user_id):
+                points.append(SightingPoint(first_seen, joined_date, first_id, 0, first_id))
+            continue
         times = [first_seen] if times_seen == 1 else [first_seen, *interior, last_seen]
         lo, hi = ctx.fin_index.get(first_id), ctx.fin_index.get(last_id)
         if lo is not None and hi is not None and hi - lo + 1 == len(times):
             sources: Sequence[int | None] = range(lo, hi + 1)  # the 003 contract: every snapshot of the range
         else:
-            # the run does not match the chat's finished snapshots (a writer broke the 003 contract): only its ends
+            # the run does not match the chat's numbered snapshots (a writer broke the 003 contract): only its ends
             # can be attributed, so its interior points are not evidence
             times = times[:1] if times_seen == 1 else [first_seen, last_seen]
             sources = [lo] if times_seen == 1 else [lo, hi]
-        kept = [t for t, k in zip(times, sources) if k is not None and _counts_for(ctx.fin_meta[k], user_id)]
-        points.extend(SightingPoint(t, joined_date, first_id, i) for i, t in enumerate(kept))
+        kept = [(t, k) for t, k in zip(times, sources) if k is not None and _counts_for(ctx.fin_meta[k], user_id)]
+        points.extend(SightingPoint(t, joined_date, first_id, i, ctx.fin_ids[k]) for i, (t, k) in enumerate(kept))
         covered.append(((first_started, first_id), (last_started, last_id)))
     ev = Evidence(chat_id, user_id, events, points, probes, migrations=ctx.migrations, echo_from=ctx.echo_from)
     opening = [e.event_at for e in events] + [p.seen_at for p in points] + [p.answered_at for p in probes]
@@ -587,11 +615,17 @@ def _load_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]
 
     ctxs: dict[int, _ChatContext] = defaultdict(_ChatContext)
     global_gaps: list[datetime] = []
-    for chat_id, started_at, snapshot_id, quality, through, reconciled in sorted(
+    for chat_id, started_at, snapshot_id, quality, through, reconciled, late in sorted(
             snap_rows, key=lambda r: (r[0], r[1], r[2])):
         ctx = ctxs[chat_id]
+        if quality is None:
+            continue  # not graded yet: no points, no absences, and no place in the numbering
+        if late:
+            ctx.late[snapshot_id] = (quality, through, reconciled)
+            continue
         ctx.fin_index[snapshot_id] = len(ctx.fin_meta)
         ctx.fin_meta.append((quality, through, reconciled))
+        ctx.fin_ids.append(snapshot_id)
         if quality == "good":
             ctx.snap_keys.append((started_at, snapshot_id))
             ctx.snap_starts.append(started_at)
@@ -665,9 +699,12 @@ def _rebuild_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]) -> Re
     inserts: list[Spell] = []
     dirty: dict[int, datetime] = {}
     opened = closed = changed = 0
+    found: list[tuple[int, int, str, datetime, int]] = []
     for pair in pairs:
         chat_id = pair[0]
-        new = build_spells(evidence[pair])
+        pair_cases: Cases = []
+        new = build_spells(evidence[pair], pair_cases)
+        found.extend((chat_id, pair[1], rule, t, source) for rule, t, source in pair_cases)
         old = stored.get(pair, [])
         if len(new) == len(old) and Counter(new) == Counter(sp for _, sp in old):
             continue
@@ -716,7 +753,12 @@ def _rebuild_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]) -> Re
             chats = sorted(dirty)
             days: list[date] = [dirty[c].astimezone(timezone.utc).date() for c in chats]
             cur.execute("SELECT tg.mark_dirty(c, d) FROM unnest(%s::bigint[], %s::date[]) AS x(c, d)", (chats, days))
-    return RebuildResult(opened, closed, changed)
+        probes = 0
+        if found:
+            # E4/E10/S3 once per source evidence: new S3 queue conflict probes, the chat's windows are checked
+            probes = cur.execute("SELECT tg.record_contradictions(%s::bigint[], %s::bigint[], %s::text[], "
+                                 "%s::timestamptz[], %s::bigint[])", [list(col) for col in zip(*found)]).fetchone()[0]
+    return RebuildResult(opened, closed, changed, tuple(found), probes)
 
 
 def rebuild_pairs(conn: psycopg.Connection, pairs: Iterable[tuple[int, int]]) -> RebuildResult:
@@ -731,6 +773,9 @@ def rebuild_pairs(conn: psycopg.Connection, pairs: Iterable[tuple[int, int]]) ->
       chunks), then tg.mark_dirty per chat with the UTC day of the earliest known_from, left_after, left_before
       or suspect_since of every deleted or inserted spell. A pair whose spells are unchanged is not written and
       marks nothing, so a second call changes nothing.
+    - Records the E4, E10 and S3 cases the replay produced, of every pair, changed or not (an S3 never changes a
+      spell), with tg.record_contradictions: each case once per source evidence, a conflict probe for a new S3,
+      and a contradiction gap where a chat passes 10 cases within 60 minutes. They are in the result's `cases`.
     - On any exception the caller must roll back (or let the exception reach code that does): a Python error in
       a later chunk leaves the earlier chunks written in a transaction that could still commit.
     - Returns the counts: `opened` = new spells with no stored spell of the same start (start_source,
