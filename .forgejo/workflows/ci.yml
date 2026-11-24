@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# No `uses:` actions: the runner copies an action into the job container under /var/run, and
+# Podman's copy API refuses that path when /var/run is an absolute symlink, as in Debian images
+# ("statat var/run/act/actions/...: path escapes from parent"). Plain git avoids it and node.
+env:
+  TOKEN: ${{ github.token }}
+
+jobs:
+  test:
+    runs-on: docker
+    container: python:3.13
+    services:
+      postgres:
+        image: docker.io/library/postgres:18.6-alpine3.24
+        env:
+          POSTGRES_PASSWORD: tgaud-ci-pg
+        options: --health-cmd "pg_isready -U postgres" --health-interval 2s --health-retries 30
+    env:
+      # The .python-version file asks for 3.15; the job runs the container's 3.13.
+      UV_PYTHON: "3.13"
+      UV_PYTHON_DOWNLOADS: never
+      TGAUD_TEST_ADMIN_URL: postgresql://postgres:tgaud-ci-pg@postgres:5432/postgres
+    steps:
+      - name: checkout
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: Basic $(printf 'x:%s' "$TOKEN" | base64 -w0)" \
+            fetch -q --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - name: psql
+        # The database fixture runs psql; the python image has none.
+        run: apt-get update -q && apt-get install -y -q --no-install-recommends postgresql-client
+      - name: uv
+        run: pip install -q --root-user-action=ignore uv==0.11.16
+      - name: tests
+        run: uv sync --locked && uv run pytest
+
+  image:
+    needs: test
+    runs-on: docker
+    # The job container is unprivileged (rootless Podman on the host), so buildah can't mount
+    # overlay or create namespaces for RUN steps: vfs storage and chroot isolation avoid both.
+    container: quay.io/buildah/stable
+    env:
+      STORAGE_DRIVER: vfs
+      BUILDAH_ISOLATION: chroot
+      IMAGE: git.firr.co/company/tgaud
+    steps:
+      - name: checkout
+        run: |
+          git init -q .
+          git -c http.extraHeader="Authorization: Basic $(printf 'x:%s' "$TOKEN" | base64 -w0)" \
+            fetch -q --depth 1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout -q FETCH_HEAD
+      - run: buildah build -f Containerfile -t "$IMAGE:$GITHUB_SHA" -t "$IMAGE:latest" .
+      - name: selfcheck
+        # The contract's offline check, `tgaud --selfcheck`. The read-only, no-network run is `mise run image-test`.
+        run: |
+          ctr=$(buildah from "$IMAGE:$GITHUB_SHA")
+          out=$(buildah run "$ctr" -- tgaud --selfcheck) || { buildah rm "$ctr"; exit 1; }
+          buildah rm "$ctr"
+          echo "$out"
+          case $out in
+            "selfcheck ok:"*) ;;
+            *) echo "selfcheck did not print 'selfcheck ok:'" >&2; exit 1 ;;
+          esac
+      - name: push
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        # The automatic token was refused for package writes; this one has write:package.
+        env:
+          REGISTRY_TOKEN: ${{ secrets.REGISTRY_TOKEN }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" \
+            | buildah login -u "${{ vars.REGISTRY_USER }}" --password-stdin git.firr.co
+          buildah push "$IMAGE:$GITHUB_SHA"
+          buildah push "$IMAGE:latest"

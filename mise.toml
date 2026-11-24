@@ -3,5 +3,41 @@ python = "3.15"
 uv = "0.11.16"
 
 [tasks.ci]
-description = "The whole local test suite (tgstats and tgaud). Set TGAUD_TEST_ADMIN_URL to use a running PostgreSQL 18.6; without it the tests start one with podman."
+description = "The whole local test suite (tgstats and tgaud) and the container check. Set TGAUD_TEST_ADMIN_URL to use a running PostgreSQL 18.6; without it the tests start one with podman."
+depends = ["image-test"]
 run = "uv run pytest"
+
+[tasks.image-test]
+description = "Build the image and run it as the deploy role will: --selfcheck offline, migrate fails cleanly without a database."
+shell = "bash -eu -o pipefail -c"
+run = '''
+image=localhost/tgaud:image-test
+podman build -t "$image" .
+
+run() {
+    podman run --rm --network=none --read-only --tmpfs /tmp --cap-drop=all --security-opt=no-new-privileges "$@"
+}
+
+out=$(run "$image" --selfcheck)
+echo "$out"
+case $out in
+    "selfcheck ok:"*) ;;
+    *) echo "image-test: --selfcheck did not print 'selfcheck ok:'" >&2; exit 1 ;;
+esac
+
+# No database: migrate exits 1 with one line of reason, not a traceback.
+rc=0
+err=$(run -e TGAUD_DATABASE_URL="postgresql://tgaud@127.0.0.1:5432/tgaud?sslmode=disable" "$image" migrate 2>&1) || rc=$?
+echo "$err"
+[ "$rc" -eq 1 ] || { echo "image-test: migrate exited $rc, want 1" >&2; exit 1; }
+[ "$(printf '%s\n' "$err" | wc -l)" -eq 1 ] || { echo "image-test: migrate printed more than one line" >&2; exit 1; }
+case $err in
+    *Traceback*) echo "image-test: migrate printed a traceback" >&2; exit 1 ;;
+esac
+
+# No session, env or database file reaches the image (the root file system is searched; dependencies' own
+# test directories are not the repo's).
+leaks=$(run --entrypoint sh "$image" -c 'find / -xdev -not -path "/proc/*" \( -name .env -o -name "*.session" -o -name "*.session-journal" -o -name "*.db" \) 2>/dev/null; true')
+[ -z "$leaks" ] || { echo "image-test: state or secret files in the image:" >&2; echo "$leaks" >&2; exit 1; }
+echo "image-test: ok"
+'''

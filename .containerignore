@@ -1,0 +1,22 @@
+# The Containerfile copies only pyproject.toml, uv.lock, README.md and src/. These patterns keep secrets, session
+# and database files, tests and docs out of the build context even if a COPY grows.
+.git
+**/.venv
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+**/.pytest_cache
+**/.ruff_cache
+build
+dist
+docs
+tests
+**/.env
+**/.env.*
+**/*.session
+**/*.session-journal
+**/*.db
+**/*.db-wal
+**/*.db-shm
+**/*.sqlite
+**/*.csv
