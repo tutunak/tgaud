@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tgaud import selfcheck
+from tgaud import db, selfcheck
 
 SQL = Path(__file__).resolve().parents[2] / "src" / "tgaud" / "sql"
 
@@ -18,7 +18,8 @@ def test_selfcheck_offline_with_no_environment(monkeypatch):
     monkeypatch.setattr(socket.socket, "__init__", no_socket)
     line = selfcheck.run(env={})
     assert line.startswith("selfcheck ok: config ok (dummy TGAUD_DATABASE_URL")
-    assert "2 migrations (latest 002), 37 query blocks" in line
+    versions = [m.version for m in db.load_migrations()]
+    assert f"{len(versions)} migrations (latest {versions[-1]:03d}), 37 query blocks" in line
 
 
 def test_selfcheck_uses_real_values_when_present():
