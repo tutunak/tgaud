@@ -50,9 +50,10 @@ not_admin gap (confirmed false) until a check or a newer event resolves it.
 
 Privacy (design.md 11): never bio, user_chat_id or message text; a full invite link made by this bot is stored
 only as HMAC-SHA256 with TGAUD_LINK_HMAC_KEY (tg.invite_link.link_digest, and a digest marker in raw payloads);
-names are dropped when TGAUD_STORE_NAMES is off. Updates about an erased person (tg.is_erased) dated before
-the erasure are committed as a receipt only; an erased actor, inviter or resolver is stored as NULL (with
-member_event.actor_is_other kept) and replaced in raw payloads.
+names are dropped when TGAUD_STORE_NAMES is off; a language_code that is not an IETF language tag is never
+stored. Updates about an erased person (tg.is_erased) dated before the erasure are committed as a receipt only;
+an erased actor, inviter or resolver is stored as NULL (with member_event.actor_is_other kept) and replaced in raw
+payloads, as is every other person a raw payload holds; a person without a usable id is left out of it.
 
 Chats: only channels, groups and supergroups carry audience data; any other chat (a private chat, e.g. a user
 blocking the bot) commits the receipt (without the chat id) and the offset only. Every chat id is routed through
@@ -122,12 +123,11 @@ DIGEST_MARK = "hmac-sha256:"
 USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
 MEMBER_KEYS = ("new_chat_member", "old_chat_member")  # a ChatMember: holds the person at `user`
 NAME_KEYS = ("first_name", "last_name", "username")
-# User (Bot API 10.5): a person in a raw payload keeps only these fields, each only with its type, plus the
-# NAME_KEYS as strings when store_names is on; anything else (an unknown or future field) is dropped
+# User (Bot API 10.5): a person in a raw payload keeps only these fields, each only with its type (language_code
+# only as a language tag), plus the NAME_KEYS as strings when store_names is on; anything else (an unknown or
+# future field, or a capability flag 10.5 moved to BotFullInfo) is dropped
 PERSON_FIELDS = {
     "id": int, "is_bot": bool, "is_premium": bool, "language_code": str, "added_to_attachment_menu": bool,
-    "can_join_groups": bool, "can_read_all_group_messages": bool, "supports_inline_queries": bool,
-    "can_connect_to_business": bool, "has_main_web_app": bool,
 }
 # ChatInviteLink (Bot API 10.5): a link in a raw payload keeps only these fields, each only with its type
 LINK_FIELDS = {
@@ -199,6 +199,15 @@ def _opt_str(v: Any) -> str | None:
 
 def _opt_bool(v: Any) -> bool | None:
     return v if isinstance(v, bool) else None
+
+
+LANGUAGE_TAG = re.compile(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*")
+
+
+def _language_tag(v: Any) -> str | None:
+    """User.language_code when it is an IETF language tag (letters, then letter or digit subtags), else None: a
+    name sent in it is never stored. tg.tg_user (parse_user) and raw redaction both read it through this."""
+    return v if isinstance(v, str) and LANGUAGE_TAG.fullmatch(v) else None
 
 
 def _ts(v: Any, what: str) -> dt.datetime:
@@ -300,7 +309,7 @@ def parse_user(v: Any, what: str = "user") -> User:
     d = _dict(v, what)
     return User(id=_int(d.get("id"), f"{what}.id"), is_bot=d.get("is_bot") is True,
                 is_premium=True if d.get("is_premium") is True else None,
-                language_code=_opt_str(d.get("language_code")), username=_opt_str(d.get("username")),
+                language_code=_language_tag(d.get("language_code")), username=_opt_str(d.get("username")),
                 first_name=_opt_str(d.get("first_name")), last_name=_opt_str(d.get("last_name")))
 
 
@@ -420,6 +429,8 @@ def _person_field(key: Any, value: Any, store_names: bool) -> bool:
     stored. An allowlist, so a field Telegram adds later (or a malformed one) never carries a name through."""
     if key in NAME_KEYS:
         return store_names and isinstance(value, str)
+    if key == "language_code":
+        return _language_tag(value) is not None
     kind = PERSON_FIELDS.get(key)
     return kind is not None and isinstance(value, kind) and not (kind is int and isinstance(value, bool))
 
@@ -840,16 +851,15 @@ class Ingest:
                     dated = _ts(inner.get("date"), "date")
                 except Malformed:
                     dated = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
-                erased = self._erased(_payload_user_ids(inner), dated)
-                if subject not in erased:
-                    try:
-                        payload = self.redact(inner, erased)
-                    except Exception as e:  # a shape the redactor cannot read: the receipt alone is kept
-                        log.error("ingest: malformed update %s cannot be redacted (%s); raw payload not kept",
-                                  update_id, type(e).__name__)
-                    else:
-                        self._raw_update(update_id, received, kind, chat_id, subject, inner, received, erased,
-                                         payload=payload)
+                try:
+                    people = self._person_ids(inner)
+                except Exception as e:  # a shape the redactor cannot read: the receipt alone is kept
+                    log.error("ingest: malformed update %s cannot be redacted (%s); raw payload not kept",
+                              update_id, type(e).__name__)
+                else:
+                    erased = self._erased([subject, *people], dated)
+                    if subject not in erased:
+                        self._raw_update(update_id, received, kind, chat_id, subject, inner, received, erased)
             self._advance(fx, received, update_id=update_id, update_date=received, caught_up=caught_up)
             fx.add(lambda: metrics.INGEST_FAILURES.labels("parse").inc())
             fx.add(lambda: metrics.UPDATES.labels("malformed").inc())
@@ -953,6 +963,8 @@ class Ingest:
         assert p.chat is not None and p.inner is not None
         subject = self._subject(p)
         secondary = [p.sender.id if p.sender else None, p.link.creator.id if p.link and p.link.creator else None]
+        if p.type in MEMBERSHIP_TYPES:  # and every person its raw payload keeps
+            secondary += self._person_ids(p.inner)
         erased = self._erased([subject, *secondary], p.date)
         if subject is not None and subject in erased:
             return  # evidence from before the person's erasure: the receipt only
@@ -1379,11 +1391,10 @@ class Ingest:
     # -- raw membership updates --------------------------------------------------------------------------
 
     def _raw_update(self, update_id: int, update_date: dt.datetime, kind: str, chat_id: int, user_id: int | None,
-                    inner: dict | None, received: dt.datetime, erased: set[int], payload: dict | None = None) -> None:
+                    inner: dict | None, received: dt.datetime, erased: set[int]) -> None:
         if kind not in MEMBERSHIP_TYPES or inner is None:
             return
-        if payload is None:
-            payload = self.redact(inner, erased)
+        payload = self.redact(inner, erased)
         self._ensure_partitions("raw_update", "day", update_date)
         self.conn.execute(
             """INSERT INTO tg.raw_update (update_id, update_date, update_type, chat_id, user_id, received_at, payload)
@@ -1391,30 +1402,44 @@ class Ingest:
             (update_id, update_date, kind, chat_id, user_id if user_id not in erased else None, received,
              Jsonb(payload)))
 
-    def redact(self, inner: dict, erased: set[int] = frozenset()) -> dict:  # type: ignore[assignment]
+    def _person_ids(self, inner: dict) -> list[int]:
+        """The id of every person raw redaction recognises in a membership payload. Both write paths look these
+        up in tg.is_erased, so no person the raw payload keeps is an erased one, wherever it sits."""
+        people: list[int] = []
+        self.redact(inner, people=people)
+        return people
+
+    def redact(self, inner: dict, erased: set[int] = frozenset(),  # type: ignore[assignment]
+               people: list[int] | None = None) -> dict:
         """The payload as stored in tg.raw_update: no bio or user_chat_id anywhere, a full invite link (one
         this bot made, or any link Telegram did not mask) replaced by its digest marker, erased people replaced,
-        names and usernames of people dropped when store_names is off, a value of another shape at a sensitive
-        position (a person, a member, invite_link, a name) dropped, a link object keeping only the ChatInviteLink
-        fields, and NaN or Infinity stored as null."""
+        a person without a usable id left out, names and usernames of people dropped when store_names is off, a
+        language_code that is not a language tag dropped, a value of another shape at a sensitive position (a
+        person, a member, invite_link, a name) dropped, a link object keeping only the ChatInviteLink fields, and
+        NaN or Infinity stored as null. The id of each person it recognises is appended to `people`."""
         bot_id = self._bot_id()
         digest = self.ctx.config.link_digest
+        omit = object()
 
         def walk(v: Any, key: str | None = None) -> Any:
             if isinstance(v, list):
-                return [walk(x) for x in v]
+                return [w for w in map(walk, v) if w is not omit]
             if isinstance(v, float) and not math.isfinite(v):
                 return None  # NaN and Infinity: Python's JSON decoder accepts them, jsonb does not
             if not isinstance(v, dict):
                 return v
-            # a person: by its position in the payload (even when the object is incomplete) or by its shape
-            person = key in USER_KEYS or _is_user_dict(v)
-            uid = v.get("id")
-            if person and isinstance(uid, int) and uid in erased:
-                return {"erased": True}
-            # the link position wins over a user-like shape: a link keeps only its typed fields
-            holder = "link" if key == "invite_link" else "person" if person else "member" if key in MEMBER_KEYS \
-                else None
+            # the link position wins over a user-like shape: a link keeps only its typed fields; a person is
+            # found by its position in the payload (even when the object is incomplete) or by its shape
+            holder = "link" if key == "invite_link" else "person" if key in USER_KEYS or _is_user_dict(v) \
+                else "member" if key in MEMBER_KEYS else None
+            if holder == "person":
+                uid = _id_at(v, "id")
+                if uid is None:
+                    return omit  # no erasure can be checked for it: left out whole
+                if people is not None:
+                    people.append(uid)
+                if uid in erased:
+                    return {"erased": True}
             out: dict[str, Any] = {}
             for k, x in v.items():
                 if k in ("bio", "user_chat_id"):
@@ -1432,10 +1457,13 @@ class Ingest:
                     by_bot = isinstance(creator, dict) and creator.get("id") == bot_id
                     out[k] = DIGEST_MARK + digest(x).hex() if by_bot or not is_masked(x) else x
                     continue
-                out[k] = walk(x, k)
+                w = walk(x, k)
+                if w is not omit:
+                    out[k] = w
             return out
 
-        return walk(copy.deepcopy(inner))
+        payload = walk(copy.deepcopy(inner))
+        return {} if payload is omit else payload
 
     # -- getChat metadata --------------------------------------------------------------------------------
 
@@ -1500,13 +1528,4 @@ def _subject_id(kind: str, inner: dict) -> int | None:
     if kind in ("chat_join_request", "my_chat_member"):
         return _id_at(inner, "from", "id")
     return _id_at(inner, "new_chat_member", "user", "id")
-
-
-USER_POSITIONS = (("from",), ("new_chat_member", "user"), ("old_chat_member", "user"), ("invite_link", "creator"))
-
-
-def _payload_user_ids(inner: dict) -> list[int]:
-    """Every person's id at the user positions of a membership payload, read even when it is malformed."""
-    ids = [_id_at(inner, *path, "id") for path in USER_POSITIONS]
-    return [i for i in ids if i is not None]
 

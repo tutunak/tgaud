@@ -1280,16 +1280,18 @@ def test_a_person_keeps_only_user_fields_in_raw_payloads(make):
     only_name["chat_join_request"]["from"] = {"name": "Name44 Surname44"}
     creator_named = chat_member(11, 45, T0, link=dict(masked_link(), creator=dict(user(ADMIN), name="Name45")))
     sender_named = chat_member(12, 46, T0)
-    sender_named["chat_member"]["from"] = dict(user(46), name="Name46", nickname="Nick46", is_premium="yes")
+    # the capability flags Bot API 10.5 moved to BotFullInfo are not User fields any more
+    sender_named["chat_member"]["from"] = dict(user(46), name="Name46", nickname="Nick46", is_premium="yes",
+                                               added_to_attachment_menu=True, can_join_groups=True,
+                                               can_read_all_group_messages=True, supports_inline_queries=True,
+                                               can_connect_to_business=True, has_main_web_app=True)
     h.poll(only_name, creator_named, sender_named)
     raw = [p for (p,) in h.q("SELECT payload::text FROM tg.raw_update WHERE update_id >= 10")]
     assert len(raw) == 3
     for leaked in ("Name44", "Name45", "Name46", "Nick46", '"is_premium": "yes"'):
         assert not any(leaked in p for p in raw), leaked
     sender = h.one("SELECT payload->'from' FROM tg.raw_update WHERE update_id = 12")
-    assert set(sender) <= {"id", "is_bot", "is_premium", "language_code", "added_to_attachment_menu",
-                           "can_join_groups", "can_read_all_group_messages", "supports_inline_queries",
-                           "can_connect_to_business", "has_main_web_app"} and sender["id"] == 46
+    assert sender == {"id": 46, "is_bot": False, "language_code": "en", "added_to_attachment_menu": True}
 
 
 def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_payloads(make):
@@ -1458,3 +1460,100 @@ def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trig
         for table in ("tg.member_event", "tg.tg_user"):
             assert h.q(f"SELECT count(*) FROM {table} WHERE user_id = 43") == [(0,)], table
         assert h.q("SELECT count(*) FROM tg.raw_update WHERE update_id = 4") == [(0,)]
+
+
+# ------------------------------------------------------------------------------------------------------------
+# raw payload privacy regressions
+# ------------------------------------------------------------------------------------------------------------
+
+
+def stored(h: Harness, secrets: list[str]) -> list[tuple[str, str]]:
+    """(table, secret) for every secret found in a row of any tg or stats table."""
+    tables = h.q("""SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname IN ('tg', 'stats') AND c.relkind IN ('r', 'p', 'm') AND NOT c.relispartition
+                      AND (c.relkind <> 'm' OR c.relispopulated)""")
+    found = []
+    for (table,) in tables:
+        for (row,) in h.q(f"SELECT t::text FROM {table} t"):
+            found += [(table, s) for s in secrets if s in row]
+    return found
+
+
+def test_a_person_without_a_usable_id_is_left_out_of_raw_payloads(h):
+    """The reviewer's cases, with names stored and an erasure on file: a pre-erasure join request whose sender
+    has no id and a pre-erasure member update whose link creator's id is a string (both malformed), and a valid
+    update with a user-shaped object whose id is out of range. Each person is left out whole; a valid update
+    after them commits once."""
+    tracked_channel(h)
+    erase(h, 42, 49)
+    before = T0 - dt.timedelta(minutes=10)
+    no_id = join_request(10, 42, before)
+    del no_id["chat_join_request"]["from"]["id"]
+    string_id = chat_member(11, 43, before, link=dict(masked_link(), creator=user(49, id="49")))
+    out_of_range = chat_member(12, 44, T0, extra=[user(46, id=2 ** 64)])
+    h.poll(no_id, string_id, out_of_range, chat_member(13, 45, T0))
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "malformed"), (12, "chat_member"), (13, "chat_member")]
+    raw = {u: (user_id, p) for u, user_id, p in h.q("SELECT update_id, user_id, payload FROM tg.raw_update "
+                                                     "WHERE update_id >= 10")}
+    assert set(raw) == {10, 11, 12, 13}
+    assert raw[10][0] is None and "from" not in raw[10][1]
+    assert raw[11][1]["invite_link"] == {k: v for k, v in masked_link().items() if k != "creator"}
+    assert raw[12][1]["extra"] == []
+    assert stored(h, ["Name42", "Surname42", "handle42", "Name49", "Surname49", "handle49", "Name46",
+                      "handle46"]) == []
+    assert h.q("SELECT update_id, user_id FROM tg.member_event ORDER BY 1") == [(12, 44), (13, 45)]
+    assert h.one("SELECT next_offset FROM tg.bot_state") == 14
+
+
+def test_erasure_replaces_every_person_the_redactor_recognises(h):
+    """An otherwise valid pre-erasure member update carrying the erased user in a nested person object (one raw
+    redaction recognises by its shape): that object is replaced too, on the valid and on the malformed path."""
+    tracked_channel(h)
+    erase(h, 47)
+    before = T0 - dt.timedelta(minutes=10)
+    valid = chat_member(10, 42, before, extra={"people": [user(47)]})
+    bad = chat_member(11, 43, before, extra={"people": [user(47)]})
+    bad["chat_member"]["new_chat_member"]["status"] = "banned"
+    h.poll(valid, bad)
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "chat_member"), (11, "malformed")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
+    assert raw[10]["extra"] == raw[11]["extra"] == {"people": [{"erased": True}]}
+    assert raw[10]["new_chat_member"]["user"]["first_name"] == "Name42"  # only the erased person is replaced
+    assert stored(h, ["Name47", "Surname47", "handle47"]) == []
+    assert h.q("SELECT update_id, user_id FROM tg.member_event") == [(10, 42)]
+
+
+def test_a_language_code_that_is_not_a_language_tag_is_never_stored(make):
+    """A full name in a person's language_code, with names off: it is not an IETF language tag, so it reaches
+    neither tg.tg_user nor tg.raw_update; a tag with subtags is kept."""
+    h = make(store_names=False).start()
+    tracked_channel(h)
+    named = chat_member(10, 42, T0, actor=ADMIN)
+    for side in ("old_chat_member", "new_chat_member"):
+        named["chat_member"][side]["user"]["language_code"] = "Ivan Petrov"
+    named["chat_member"]["from"]["language_code"] = "en\nPetrov"
+    tagged = join_request(11, 43, T0)
+    tagged["chat_join_request"]["from"]["language_code"] = "zh-Hant-TW"
+    h.poll(named, tagged)
+    assert h.q("SELECT user_id, language_code FROM tg.tg_user ORDER BY 1") == [(42, None), (43, "zh-Hant-TW")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
+    assert raw[10]["new_chat_member"]["user"] == raw[10]["old_chat_member"]["user"] == {"id": 42, "is_bot": False}
+    assert raw[10]["from"] == {"id": ADMIN, "is_bot": False}
+    assert raw[11]["from"]["language_code"] == "zh-Hant-TW"
+    assert stored(h, ["Ivan", "Petrov"]) == []
+
+
+def test_a_link_with_a_users_fields_is_never_replaced_by_the_erasure_marker(h):
+    """A link object with stray `id` and `is_bot` fields whose id is an erased person's: the link position wins,
+    so it stays a link with its typed fields (only its creator is replaced)."""
+    tracked_channel(h)
+    erase(h, ADMIN)
+    before = T0 - dt.timedelta(minutes=10)
+    h.poll(chat_member(10, 43, before, link=dict(masked_link(), id=ADMIN, is_bot=False)))
+    raw = h.one("SELECT payload FROM tg.raw_update WHERE update_id = 10")
+    assert raw["invite_link"] == {k: v for k, v in masked_link().items() if k != "creator"} | {
+        "creator": {"erased": True}}
+    assert h.one("SELECT creator_id, masked_link FROM tg.invite_link") == (None, MASKED_LINK)
+    assert h.q("SELECT update_id, user_id FROM tg.member_event") == [(10, 43)]
