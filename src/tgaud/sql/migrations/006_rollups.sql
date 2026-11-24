@@ -17,8 +17,9 @@ COMMENT ON COLUMN stats.chat_day.sample_at IS
 ALTER TABLE stats.chat_day ADD COLUMN sample_net integer;
 COMMENT ON COLUMN stats.chat_day.sample_net IS
   'exact joins minus exact exits by event time in (previous day''s sample_at, sample_at]: the events the two '
-  'samples can tell apart. NULL unless both days have a sample. The residual is reported_change - sample_net; '
-  'net stays the calendar-day movement.';
+  'samples can tell apart. NULL unless both days have a finalized sample, and when either sample''s count call '
+  'straddled an exact transition (count_sample.straddled, as stats.v_drift). The residual is reported_change - '
+  'sample_net; net stays the calendar-day movement.';
 
 ------------------------------------------------------------------------------------------------------------
 -- Members at the end of a day, exact to 16a at the next midnight

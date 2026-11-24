@@ -280,6 +280,10 @@ def _parse_database_url(raw: str, problems: list[str]) -> tuple[dict[str, str], 
         elif value is not None and not check(str(value)):
             problems.append(f"TGAUD_DATABASE_URL has an invalid value for {key}")
     clean = {k: str(v) for k, v in info.items() if v is not None}
+    # a pair libpq refuses at connect time; its sslmode defaults to PGSSLMODE, else prefer
+    if clean.get("sslnegotiation") == "direct" and clean.get(
+            "sslmode", os.environ.get("PGSSLMODE") or "prefer") not in ("require", "verify-ca", "verify-full"):
+        problems.append("TGAUD_DATABASE_URL: sslnegotiation=direct needs sslmode require, verify-ca or verify-full")
     return clean, (str(url_password) if url_password else None), _display_url(clean)
 
 

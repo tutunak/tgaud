@@ -7,6 +7,7 @@ Tests that must commit (two sessions, psql) work on a clone of the fixture datab
 import datetime as dt
 import json
 import pathlib
+import random
 import threading
 import time
 
@@ -16,7 +17,7 @@ import psycopg.sql
 import pytest
 from psycopg.rows import dict_row
 
-from tgaud import config, db, metrics, rollups, sql
+from tgaud import config, db, history, metrics, rollups, sql
 from tgaud.jobs import JobContext, Scheduler, audience, chat_day, partitions
 
 UTC = dt.timezone.utc
@@ -374,6 +375,107 @@ def test_a_rejoin_in_the_second_of_an_inferred_start_is_counted(migrated_dsn, mo
         assert [(r["rejoins"], r["observed"], r["possible"]) for r in res] == [(1, 1, 0)]
 
 
+SPELL_COLS = list(history.SPELL_COLUMNS)
+
+
+def _rebuilt_spells(c, chat: int, user: int) -> list[tuple]:
+    return c.execute(f"SELECT {', '.join(SPELL_COLS)} FROM tg.membership WHERE chat_id = %s AND user_id = %s "
+                     "ORDER BY known_from, tg.spell_order(membership_id)", (chat, user)).fetchall()
+
+
+def _store_reversed(c, chat: int, user: int) -> None:
+    """The same spells stored again in the reverse order of their ids: the ids must not decide the order."""
+    rows = c.execute(f"SELECT {', '.join(SPELL_COLS)} FROM tg.membership WHERE chat_id = %s AND user_id = %s "
+                     "ORDER BY membership_id DESC", (chat, user)).fetchall()
+    c.execute("DELETE FROM tg.membership WHERE chat_id = %s AND user_id = %s", (chat, user))
+    for r in rows:
+        c.execute(f"INSERT INTO tg.membership ({', '.join(SPELL_COLS)}) "
+                  f"VALUES ({', '.join(['%s'] * len(SPELL_COLS))})", r)
+
+
+@pytest.mark.parametrize("stored", ["as-rebuilt", "reversed"])
+@pytest.mark.parametrize("unban", [True, False], ids=["unban-first", "no-unban"])
+@pytest.mark.parametrize("mode", ["full", "chat"])
+def test_an_inferred_start_after_an_exact_join_of_the_same_second_is_no_observed_rejoin(migrated_dsn, mode, unban,
+                                                                                         stored):
+    """rollups review-3: updates 100 unban, 101 join, 102 leave, 103 member -> administrator in one second. The
+    rebuild opens the exact spell (101), closes it (102), then a missed join opens an inferred one (103, E9): the
+    exact join is the first stay, the inferred start the rejoin. R1: one join, no rejoin; 10a: one possible rejoin,
+    none observed. The out -> out unban opens nothing, and the order does not come from the spells' ids."""
+    t = "2026-11-20 10:00:00+00"
+    chat = -100777
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c)
+        if unban:
+            _event(c, chat, 1, t, 100, "kicked", "left")
+        _event(c, chat, 1, t, 101, "left", "member")
+        _event(c, chat, 1, t, 102, "member", "left")
+        _event(c, chat, 1, t, 103, "member", "administrator")
+        history.rebuild_pairs(c, [(chat, 1)])
+        if stored == "reversed":
+            _store_reversed(c, chat, 1)
+        assert [(r[2], r[13] is not None) for r in _rebuilt_spells(c, chat, 1)] == [("event", True),
+                                                                                    ("inferred", False)]
+        c.commit()
+        rollups.refresh_chat_days(c, [chat], NOW, mode=mode)
+        row = c.execute("SELECT joins, rejoins FROM stats.chat_day WHERE chat_id = %s AND day = '2026-11-20'",
+                        (chat,)).fetchone()
+        assert row == (1, 0)
+        res = sql.run(c, "10a", as_of="2026-11-23 12:00+00", since="2026-11-01", scope=[chat]).dicts()
+        assert [(r["rejoins"], r["observed"], r["found_later"], r["possible"]) for r in res] == [(1, 0, 0, 1)]
+
+
+def test_tied_spell_starts_are_ordered_as_the_rebuild_replays_them(migrated_dsn):
+    """Random same-second event sequences (any statuses, update ids in any order, some after an earlier stay): the
+    order tg.spell_order gives the stored spells (R1, 10a, the campaign entrants) is the rebuild's replay order,
+    whatever the ids of the stored spells; R1's and 10a's rejoin counts follow from that order."""
+    rnd = random.Random(20261124)
+    chat = -100777
+    t = ts("2026-11-20 10:00")
+    statuses = ["creator", "administrator", "member", "restricted", "left", "kicked"]
+    want_r1 = want_observed = want_found = want_possible = 0
+    users = list(range(1, 161))
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c, users=users)
+        for u in users:
+            if u % 4 == 0:  # an earlier stay still open at the second
+                _event(c, chat, u, "2026-11-20 09:00+00", 1_000_000 + u, "left", "member")
+            n = rnd.randint(2, 5)
+            ids = rnd.sample(range(1, 50), n)
+            for upd in ids:
+                old, new = rnd.choice(statuses), rnd.choice(statuses)
+                old_m = rnd.choice([None, True, False]) if old == "restricted" else None
+                new_m = rnd.choice([None, True, False]) if new == "restricted" else None
+                c.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, "
+                          "old_is_member, new_status, new_is_member) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                          (chat, u, t, u * 100 + upd, old, old_m, new, new_m))
+        history.rebuild_pairs(c, [(chat, u) for u in users])
+        evidence = history.load_evidence(c, [(chat, u) for u in users])
+        for u in users:
+            replayed = [tuple(sp) for sp in history.build_spells(evidence[(chat, u)])]
+            if u % 3 == 0:
+                _store_reversed(c, chat, u)
+            stored = [tuple(v.astimezone(UTC) if isinstance(v, dt.datetime) else v for v in r)
+                      for r in _rebuilt_spells(c, chat, u)]
+            assert stored == replayed, (u, c.execute("SELECT update_id, kind FROM tg.member_event WHERE user_id = %s "
+                                                     "ORDER BY update_id", (u,)).fetchall())
+            for i, sp in enumerate(replayed):
+                if i == 0 or sp[6] != t:  # only stays of the second, with an earlier stay, are rejoins of the day
+                    continue
+                want_r1 += sp[3] is not None
+                want_observed += sp[2] == "event"
+                want_found += sp[2] in ("snapshot", "probe")
+                want_possible += sp[2] == "inferred"
+        c.commit()
+        for mode in ("full", "chat"):
+            rollups.refresh_chat_days(c, [chat], NOW, mode=mode)
+            assert c.execute("SELECT rejoins FROM stats.chat_day WHERE chat_id = %s AND day = '2026-11-20'",
+                             (chat,)).fetchone()[0] == want_r1, mode
+        (r,) = sql.run(c, "10a", as_of="2026-11-23 12:00+00", since="2026-11-20 09:30+00", scope=[chat]).dicts()
+        assert (r["observed"], r["found_later"], r["possible"]) == (want_observed, want_found, want_possible)
+        assert want_possible > 10 and want_observed > 10  # the sequences exercise both kinds of tie
+
+
 def test_r1_does_not_wait_for_a_marker_a_live_migration_holds(clone):
     """The foreign key makes R1 hold KEY SHARE on the chat after its first rows; M1 deletes the marker, then waits
     for the chat row. R1 must not wait for that marker (a deadlock): it skips it and commits, M1 goes on."""
@@ -495,6 +597,53 @@ def test_the_residual_compares_the_count_with_the_events_between_the_same_sample
         sample_at = c.execute("SELECT sample_at FROM stats.chat_day WHERE chat_id = %s AND day = '2026-11-22'",
                               (chat,)).fetchone()[0]
         assert sample_at == ts("2026-11-22 23:50")
+
+
+@pytest.mark.parametrize("mode", ["full", "chat"])
+def test_a_straddled_or_pending_day_end_count_gives_no_false_residual(migrated_dsn, mode):
+    """A join at 11-19 23:50:00 falls into that day's last count call (straddled: the count of 10 does not include it),
+    and a later count of the same day is still pending (net_events NULL). R1 reads finalized samples only and
+    withholds sample_net, and so the residual, on both sides of the straddled one, as stats.v_drift does: no -1 on
+    11-19 and no +1 on 11-20; the next clean pair of days compares again, in both views alike."""
+    chat = -100777
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c)
+        _stay(c, chat, 1, (_event(c, chat, 1, "2026-11-19 23:50+00", 301, "left", "member"), "2026-11-19 23:50+00"))
+        _stay(c, chat, 2, (_event(c, chat, 2, "2026-11-21 12:00+00", 302, "left", "member"), "2026-11-21 12:00+00"))
+        with c.cursor() as cur:
+            cur.executemany("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events, "
+                            "request_ms, straddled) VALUES (%s, %s, %s, 0, %s, 2000, %s)",
+                            [(chat, "2026-11-18 23:50+00", 10, 0, False),
+                             (chat, "2026-11-19 23:50+00", 10, 1, True),     # the join is inside the call
+                             (chat, "2026-11-19 23:55+00", 99, None, False),  # pending: ingest not caught up yet
+                             (chat, "2026-11-20 23:50+00", 11, 0, False),
+                             (chat, "2026-11-21 23:50+00", 12, 1, False)])
+        c.commit()
+        rollups.refresh_chat_days(c, [chat], NOW, mode=mode)
+        days = {r[0].isoformat(): r[1:] for r in c.execute(
+            "SELECT day, sample_at, reported_eod, sample_net, residual FROM stats.v_chat_day "
+            "WHERE chat_id = %s AND day BETWEEN '2026-11-19' AND '2026-11-21' ORDER BY day", (chat,))}
+        assert days == {"2026-11-19": (ts("2026-11-19 23:50"), 10, None, None),
+                        "2026-11-20": (ts("2026-11-20 23:50"), 11, None, None),
+                        "2026-11-21": (ts("2026-11-21 23:50"), 12, 1, 0)}
+        drift = dict(c.execute("SELECT sampled_at, residual FROM stats.v_drift WHERE chat_id = %s", (chat,)).fetchall())
+        for sample_at, _, _, residual in days.values():
+            assert drift[sample_at] == residual  # the day-end samples are consecutive finalized samples here
+
+
+def test_m1_moves_count_samples_with_their_straddled_flag(migrated_dsn):
+    old, new = -100778, -1001000000778
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c, old, users=())
+        _tiny_chat(c, new, users=())
+        c.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events, request_ms, "
+                  "straddled) VALUES (%s, '2026-11-19 23:50+00', 10, 0, 1, 2000, true), "
+                  "(%s, '2026-11-20 23:50+00', 11, 0, 0, 900, false)", (old, old))
+        c.execute("SELECT tg.move_chat_history(%s, %s, '2026-11-21 00:00+00')", (old, new))
+        assert c.execute("SELECT sampled_at, net_events, request_ms, straddled FROM tg.count_sample WHERE chat_id = %s "
+                         "ORDER BY sampled_at", (new,)).fetchall() == [
+            (ts("2026-11-19 23:50"), 1, 2000, True), (ts("2026-11-20 23:50"), 0, 900, False)]
+        c.rollback()
 
 
 @pytest.mark.parametrize("mode", ["full", "chat"])
@@ -712,6 +861,53 @@ def drain(s: Scheduler, job, limit: int = 60) -> int:
         s.run_once()
         steps += 1
     return steps
+
+
+def test_growth_as_of_noon_counts_nothing_after_noon_during_and_after_the_cycle(migrated_dsn):
+    """cli review-3: the noon cycle of the real job plans two chats; exits at 12:01 commit before the first chat's
+    step. Block 9a as of noon, while the cycle runs and after it published: the day of as_of (it holds the 12:01
+    exits) is left out, and the short stay of the day before (joined 23:00, left at 12:01) is withheld as immature;
+    the day before's own movement is shown."""
+    a, b = -100777, -100778
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c, a)
+        _tiny_chat(c, b, users=())
+        for u, joined, upd in ((1, "2026-11-22 23:00+00", 401), (2, "2026-11-23 10:00+00", 403)):
+            _stay(c, a, u, (_event(c, a, u, joined, upd, "left", "member"), joined))
+        c.commit()
+        rollups.refresh_chat_days(c, [a, b], NOW - dt.timedelta(minutes=5))  # the cold build: the noon cycle is routine
+        c.commit()
+    clock = FakeClock(NOW)  # 11-23 12:00
+    ctx = job_ctx(migrated_dsn, clock)
+    job = chat_day.make(ctx)
+    s = Scheduler("batch", [job], lambda: psycopg.connect(migrated_dsn), ctx)
+    s.conn = s.connect()
+    try:
+        s.run_once()  # the plan of the noon cycle
+        assert job.pending == 2
+        with psycopg.connect(migrated_dsn) as c:  # ingest commits the 12:01 exits before the chats' steps
+            for u, upd in ((1, 402), (2, 404)):
+                _event(c, a, u, "2026-11-23 12:01+00", upd, "member", "left")
+            history.rebuild_pairs(c, [(a, 1), (a, 2)])
+            c.commit()
+
+        def growth() -> dict:
+            with psycopg.connect(migrated_dsn) as c:
+                return {(r["chat_id"], r["day"].isoformat()): r for r in
+                        sql.run(c, "9a", as_of=NOW, since="2026-11-20", scope=[a, b]).dicts()}
+        while job.pending:
+            s.run_once()
+            rows = growth()
+            assert not [k for k in rows if k[1] == "2026-11-23"], rows  # its 12:01 exits are after as_of
+            day = rows[(a, "2026-11-22")]
+            assert (day["joins"], day["exits"], day["short_stays"], day["withheld"]) == (1, 0, None, "short_stays")
+        with psycopg.connect(migrated_dsn) as c:  # the job published the noon cycle; a later report sees the day
+            assert c.execute("SELECT max(as_of) FROM stats.rollup_run WHERE rollup = 'chat_day'").fetchone()[0] == NOW
+            rows = {r["day"].isoformat(): r for r in sql.run(c, "9a", as_of="2026-11-26 00:00+00", since="2026-11-20",
+                                                              scope=[a]).dicts()}
+        assert (rows["2026-11-23"]["exits"], rows["2026-11-22"]["short_stays"]) == (2, 1)
+    finally:
+        s._discard()
 
 
 def test_chat_day_job_runs_a_cycle_per_interval_and_publishes_it(sched):

@@ -11,7 +11,9 @@ Evidence and its time order (design.md 4 and the plan reviews):
                             listed by the run's i-th finished snapshot and counts only if that snapshot counts
   rank 2  probe answers     tg.probe in/out at answered_at; ignored when an event of the pair has
                             sent_at <= event_at <= answered_at (the answer may describe either side)
-  rank 3  absences          good, applied snapshots of the chat that no run of the user covers, at started_at
+  rank 3  absences          good, applied snapshots of the chat that no run of the user from the same source
+                            covers, at started_at; never a retired one (taken under an old chat id at or after its
+                            migration)
   rank 4  gap starts        tg.gap of the chat or of every chat, at lower(period)
   rank 5  migration (M2)    an alias of this chat as old_chat_id with moved_at NULL, at migrated_at
 Ranks 3-5 are this module's choice where design.md is silent: an absence or a gap start after positive evidence of
@@ -20,9 +22,14 @@ before the service message. Aliases with this chat as chat_id (M1, history moved
 Snapshot evidence comes only from tg.sighting and tg.snapshot, never tg.snapshot_member, so pruning (R3) can
 never change a replay. A snapshot is evidence for a user once it is graded good or partial (never rejected) and
 applied to that user (reconciled_at set, or user_id <= applied_through_user_id), for every point of every run.
-Runs are numbered over the chat's graded snapshots that are not late (migration 004): an ungraded snapshot has no
-points yet, and a late one (graded after a later snapshot of its source) only has one-point runs of its own, read
-by snapshot id, and gives no absences, so neither shifts the points of the runs around it.
+A run belongs to one source, the chat id its snapshots were taken under (coalesce(source_chat_id, chat_id),
+migration 004; M1 moves the old id's snapshots into the new chat), and its points are numbered over that source's
+graded snapshots that are not late, in (started_at, snapshot_id) order: the reconciler extends a run from the
+previous such snapshot of the source only, and applies a chat's snapshots in that order, so on every state it
+writes this equals the numbering over the snapshots applied to the user (a point of a snapshot not yet applied to
+the user is numbered but does not count). An ungraded snapshot has no points yet, and a late one (graded after a
+later snapshot of its source) only has one-point runs of its own, read by snapshot id, and gives no absences, so
+neither shifts the points of the runs around it; nor does a snapshot of another source in the same chat.
 
 Every rebuild records the E4, E10 and S3 cases its replay produced (tg.record_contradictions, migration 004).
 
@@ -487,11 +494,11 @@ _Q_SPELLS = f"""
 SELECT m.membership_id, {", ".join("m." + c for c in SPELL_COLUMNS)}
 FROM {_PAIRS} JOIN tg.membership m ON m.chat_id = p.chat_id AND m.user_id = p.user_id"""
 
-# finished snapshots of the chats (the sources of run points; the good ones also give absences); whether one counts
-# for a user is decided per user (the reconciler's cursor)
+# finished snapshots of the chats with their source (the snapshots of run points; the good ones also give absences);
+# whether one counts for a user is decided per user (the reconciler's cursor)
 _Q_SNAPSHOTS = """
 SELECT s.chat_id, s.started_at, s.snapshot_id, s.quality, s.applied_through_user_id, s.reconciled_at IS NOT NULL,
-       s.late
+       s.late, coalesce(s.source_chat_id, s.chat_id)
 FROM tg.snapshot s WHERE s.chat_id = ANY(%(cs)s) AND s.finished_at IS NOT NULL"""
 
 _Q_GAPS = """
@@ -507,18 +514,40 @@ _INSERT = (f"INSERT INTO tg.membership ({', '.join(SPELL_COLUMNS)}) "
 _COPY = f"COPY tg.membership ({', '.join(SPELL_COLUMNS)}) FROM STDIN"
 
 
+Meta = tuple[str | None, int | None, bool]  # (quality, applied_through_user_id, reconciled)
+
+
+def _counts_for(meta: Meta, user_id: int) -> bool:
+    """A snapshot is evidence for a user once graded good or partial (never rejected) and applied to that user."""
+    quality, through, reconciled = meta
+    return quality in ("good", "partial") and (reconciled or (through is not None and user_id <= through))
+
+
+@dataclass
+class _Source:
+    """The numbered snapshots of one source of a chat (graded, not late), in (started_at, snapshot_id) order."""
+
+    source_id: int  # the chat id they were taken under
+    ids: list[int] = field(default_factory=list)  # snapshot_id by position
+    meta: list[Meta] = field(default_factory=list)
+
+
 @dataclass
 class _ChatContext:
-    fin_index: dict[int, int] = field(default_factory=dict)  # snapshot_id -> position among numbered, by key
-    fin_meta: list[tuple[str | None, int | None, bool]] = field(default_factory=list)  # (quality, through, reconciled)
-    fin_ids: list[int] = field(default_factory=list)  # snapshot_id by position
-    late: dict[int, tuple[str | None, int | None, bool]] = field(default_factory=dict)  # late snapshot_id -> meta
-    snap_keys: list[tuple[datetime, int]] = field(default_factory=list)  # good snapshots, sorted
+    numbered: dict[int, tuple[_Source, int]] = field(default_factory=dict)  # snapshot_id -> (its source, position)
+    sources: dict[int, _Source] = field(default_factory=dict)  # source chat id -> its numbered snapshots
+    late: dict[int, Meta] = field(default_factory=dict)  # late snapshot_id -> meta
+    snap_keys: list[tuple[datetime, int]] = field(default_factory=list)  # good snapshots giving absences, sorted
     snap_starts: list[datetime] = field(default_factory=list)  # their started_at, for bisect
     snap_meta: list[tuple[int | None, bool]] = field(default_factory=list)  # (applied_through, reconciled)
+    snap_source: list[int] = field(default_factory=list)  # their source chat id
     gaps: list[datetime] = field(default_factory=list)  # sorted gap starts (this chat and every chat)
     migrations: list[datetime] = field(default_factory=list)  # M2
     echo_from: list[datetime] = field(default_factory=list)  # M1
+
+    def meta(self, snapshot_id: int) -> Meta | None:
+        hit = self.numbered.get(snapshot_id)
+        return hit[0].meta[hit[1]] if hit is not None else None
 
 
 def _window(times: list[datetime], lo: datetime, hi: datetime, keep: Callable[[int], bool]) -> Iterable[int]:
@@ -540,16 +569,25 @@ def _window(times: list[datetime], lo: datetime, hi: datetime, keep: Callable[[i
         i += 1
 
 
-def _counts_for(meta: tuple[str | None, int | None, bool], user_id: int) -> bool:
-    """A snapshot is evidence for a user once graded good or partial (never rejected) and applied to that user."""
-    quality, through, reconciled = meta
-    return quality in ("good", "partial") and (reconciled or (through is not None and user_id <= through))
+def _run_points(ctx: _ChatContext, user_id: int, first_id: int, last_id: int, times: list[datetime]
+                ) -> tuple[list[tuple[datetime, int]], int | None]:
+    """(page time, snapshot_id) of each point of a run that counts for the user, and the run's source (None when its
+    ends are not numbered in one source)."""
+    first, last = ctx.numbered.get(first_id), ctx.numbered.get(last_id)
+    if first is not None and last is not None and first[0] is last[0] and last[1] - first[1] + 1 == len(times):
+        src = first[0]  # the 003 contract: every snapshot of the source from the first to the last, one per point
+        return [(t, src.ids[k]) for t, k in zip(times, range(first[1], last[1] + 1))
+                if _counts_for(src.meta[k], user_id)], src.source_id
+    # the run does not match its source's numbered snapshots (a writer broke the 003 contract): only its ends can be
+    # attributed, so its interior points are not evidence
+    ends = [(times[0], first_id)] if len(times) == 1 else [(times[0], first_id), (times[-1], last_id)]
+    return [(t, s) for t, s in ends if (m := ctx.meta(s)) is not None and _counts_for(m, user_id)], None
 
 
 def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event], runs: list[tuple],
               probes: list[ProbeAnswer]) -> Evidence:
     points: list[SightingPoint] = []
-    covered: list[tuple[tuple[datetime, int], tuple[datetime, int]]] = []
+    covered: list[tuple[int | None, tuple[datetime, int], tuple[datetime, int]]] = []  # (source, first key, last)
     for (first_id, first_started, last_id, last_started, first_seen, interior, last_seen, times_seen,
          joined_date) in runs:
         if first_id in ctx.late:
@@ -558,17 +596,9 @@ def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event]
                 points.append(SightingPoint(first_seen, joined_date, first_id, 0, first_id))
             continue
         times = [first_seen] if times_seen == 1 else [first_seen, *interior, last_seen]
-        lo, hi = ctx.fin_index.get(first_id), ctx.fin_index.get(last_id)
-        if lo is not None and hi is not None and hi - lo + 1 == len(times):
-            sources: Sequence[int | None] = range(lo, hi + 1)  # the 003 contract: every snapshot of the range
-        else:
-            # the run does not match the chat's numbered snapshots (a writer broke the 003 contract): only its ends
-            # can be attributed, so its interior points are not evidence
-            times = times[:1] if times_seen == 1 else [first_seen, last_seen]
-            sources = [lo] if times_seen == 1 else [lo, hi]
-        kept = [(t, k) for t, k in zip(times, sources) if k is not None and _counts_for(ctx.fin_meta[k], user_id)]
-        points.extend(SightingPoint(t, joined_date, first_id, i, ctx.fin_ids[k]) for i, (t, k) in enumerate(kept))
-        covered.append(((first_started, first_id), (last_started, last_id)))
+        kept, source = _run_points(ctx, user_id, first_id, last_id, times)
+        points.extend(SightingPoint(t, joined_date, first_id, i, s) for i, (t, s) in enumerate(kept))
+        covered.append((source, (first_started, first_id), (last_started, last_id)))
     ev = Evidence(chat_id, user_id, events, points, probes, migrations=ctx.migrations, echo_from=ctx.echo_from)
     opening = [e.event_at for e in events] + [p.seen_at for p in points] + [p.answered_at for p in probes]
     if not opening:
@@ -580,8 +610,9 @@ def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event]
         through, reconciled = ctx.snap_meta[i]
         if not reconciled and (through is None or user_id > through):
             return False  # not applied to this user yet (mid-reconcile): never an absence
-        key = ctx.snap_keys[i]
-        return not any(a <= key <= b for a, b in covered)
+        key, source = ctx.snap_keys[i], ctx.snap_source[i]
+        # a run lists the user in every snapshot of its own source between its ends (a broken run: of any source)
+        return not any(a <= key <= b and s in (None, source) for s, a, b in covered)
 
     ev.absences = [Absence(*ctx.snap_keys[i]) for i in _window(ctx.snap_starts, lo, hi, applied_and_absent)]
     ev.gaps = [ctx.gaps[i] for i in _window(ctx.gaps, lo, hi, lambda i: True)]
@@ -615,7 +646,13 @@ def _load_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]
 
     ctxs: dict[int, _ChatContext] = defaultdict(_ChatContext)
     global_gaps: list[datetime] = []
-    for chat_id, started_at, snapshot_id, quality, through, reconciled, late in sorted(
+    retired_from: dict[int, datetime] = {}  # an old chat id -> its migration: its later listings give no absences
+    for old_chat_id, chat_id, migrated_at, not_moved in alias_rows:
+        ctxs[chat_id].echo_from.append(migrated_at)  # M1: history moved (or to be moved) into chat_id
+        retired_from[old_chat_id] = migrated_at
+        if not_moved:
+            ctxs[old_chat_id].migrations.append(migrated_at)  # M2: the old id keeps its history, closed
+    for chat_id, started_at, snapshot_id, quality, through, reconciled, late, source in sorted(
             snap_rows, key=lambda r: (r[0], r[1], r[2])):
         ctx = ctxs[chat_id]
         if quality is None:
@@ -623,20 +660,20 @@ def _load_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]
         if late:
             ctx.late[snapshot_id] = (quality, through, reconciled)
             continue
-        ctx.fin_index[snapshot_id] = len(ctx.fin_meta)
-        ctx.fin_meta.append((quality, through, reconciled))
-        ctx.fin_ids.append(snapshot_id)
-        if quality == "good":
+        src = ctx.sources.get(source)
+        if src is None:
+            src = ctx.sources[source] = _Source(source)
+        ctx.numbered[snapshot_id] = (src, len(src.ids))
+        src.ids.append(snapshot_id)
+        src.meta.append((quality, through, reconciled))
+        if quality == "good" and not (source in retired_from and retired_from[source] <= started_at):
             ctx.snap_keys.append((started_at, snapshot_id))
             ctx.snap_starts.append(started_at)
             ctx.snap_meta.append((through, reconciled))
+            ctx.snap_source.append(source)
     per_chat_gaps: dict[int, list[datetime]] = defaultdict(list)
     for chat_id, start in gap_rows:
         (global_gaps if chat_id is None else per_chat_gaps[chat_id]).append(start)
-    for old_chat_id, chat_id, migrated_at, not_moved in alias_rows:
-        ctxs[chat_id].echo_from.append(migrated_at)  # M1: history moved (or to be moved) into chat_id
-        if not_moved:
-            ctxs[old_chat_id].migrations.append(migrated_at)  # M2: the old id keeps its history, closed
     for chat_id in {c for c, _ in pairs}:
         ctx = ctxs[chat_id]
         ctx.gaps = sorted(per_chat_gaps.get(chat_id, []) + global_gaps)

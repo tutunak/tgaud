@@ -205,7 +205,8 @@ def build_person(dsn):
         c.execute("INSERT INTO tg.invite_link (chat_id, masked_link, creator_id, name) VALUES (%s, 'https://t.me/+Oo…', %s, 'only mine')", (A, U))
         mine = c.execute("SELECT invite_link_id FROM tg.invite_link WHERE name = 'mine'").fetchone()[0]
         c.execute("UPDATE tg.member_event SET invite_link_id = %s WHERE user_id = %s", (mine, V))
-        c.execute("UPDATE tg.membership SET invite_link_id = %s WHERE user_id = %s", (mine, V))
+        # the spell a rebuild makes of that join: route link (a later rebuild must find the same spell)
+        c.execute("UPDATE tg.membership SET invite_link_id = %s, join_route = 'link' WHERE user_id = %s", (mine, V))
         # evidence of U
         snap = c.execute("INSERT INTO tg.snapshot (chat_id, started_at, method) VALUES (%s, '2026-11-20 00:00+00', 'listing') "
                          "RETURNING snapshot_id", (B,)).fetchone()[0]

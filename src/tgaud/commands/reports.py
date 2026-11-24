@@ -105,8 +105,10 @@ def _scope_ids(text: str) -> list[int]:
 def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, chats: list[common.Chat], *,
                scope: list[int] | None, params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
                rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
-               header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None) -> sql.Result:
-    """Header, then the block: both in the caller's transaction, with one as-of time and one scope."""
+               header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None,
+               as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None) -> sql.Result:
+    """Header, then the block: both in the caller's transaction, with one as-of time and one scope; `as_of_notes`
+    adds header lines that depend on the frozen as-of time."""
     params = dict(params)
     if getattr(args, "as_of", None):
         params["as_of"] = common.parse_time(args.as_of, "--as-of").isoformat()
@@ -120,6 +122,8 @@ def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, c
     if header_scope is not None:  # the chats the table reads beyond the scope (a channel's discussion group)
         in_scope = header_scope(conn, in_scope)
     ra = common.rollup_as_of(conn) if rollup else None
+    if as_of_notes is not None:
+        notes = (*notes, *as_of_notes(as_of))
     common.print_header(common.header_stream(args), conn, title=title or sql.title(block), as_of=as_of, scope=in_scope,
                         window=window(as_of, since), rollup_as_of=ra, rollup=rollup, notes=notes)
     result = sql.run(conn, block, **params)
@@ -133,6 +137,23 @@ def _supplied(args: argparse.Namespace, names: tuple[str, ...]) -> dict[str, Any
 
 def _since_window(as_of: dt.datetime, since: dt.datetime) -> Window:
     return Window(since, as_of)
+
+
+def _day_start(t: dt.datetime) -> dt.datetime:
+    return dt.datetime.combine(t.astimezone(UTC).date(), dt.time(), UTC)
+
+
+def _finished_days_window(as_of: dt.datetime, since: dt.datetime) -> Window:
+    """Block 9a reads only UTC days that ended by as_of: the window ends at the start of the day of as_of (a since
+    after as_of stays an inverted window, refused)."""
+    return Window(since, as_of if since > as_of else max(since, _day_start(as_of)))
+
+
+def _finished_days_notes(as_of: dt.datetime) -> tuple[str, ...]:
+    today = as_of.astimezone(UTC).date()
+    return (f"days that ended by as_of only: through {today - dt.timedelta(days=1)}; {today}, the day of as_of, "
+            "is not over and is left out",
+            f"short stays from {today - dt.timedelta(days=2)} on are withheld: their 48 h are not over at as_of")
 
 
 def _activity_window(conn: psycopg.Connection, as_of: dt.datetime, days: int) -> Window:
@@ -175,7 +196,11 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
             if "since" in params:
                 params["since"] = common.parse_time(params["since"], "--since").isoformat()
             header_scope = None
-            if spec.block == "11":  # the table also reads each channel's discussion group and its activity
+            as_of_notes = None
+            if spec.block == "9a":  # finished days only (the rows of the day of as_of may hold later data)
+                window = _finished_days_window
+                as_of_notes = _finished_days_notes
+            elif spec.block == "11":  # the table also reads each channel's discussion group and its activity
                 header_scope = _with_discussion_groups
                 days = params.get("active_days", 30)
                 window = lambda as_of, _since: _activity_window(conn, as_of, days)  # noqa: E731
@@ -189,7 +214,7 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
             else:
                 window = _since_window
             run_report(conn, args, spec.block, chats, scope=scope, params=params, window=window, rollup=spec.rollup,
-                       header_scope=header_scope)
+                       header_scope=header_scope, as_of_notes=as_of_notes)
         return 0
 
     return add, run
@@ -241,16 +266,20 @@ def _run_asof(args: argparse.Namespace) -> int:
         params: dict[str, Any] = {"day": day.isoformat()}
         scope: list[int] | None = [chat.id]
         window: Callable[[dt.datetime, dt.datetime], Window | None] = lambda as_of, since: Window(day, day, point=True)  # noqa: E731
+        as_of_notes = None
         if args.matrix:
             block, scope = "16c", common.resolve_scope(args.among, chats)
         elif args.eod:
             block = "16d"
-            start = day.replace(hour=0, minute=0, second=0, microsecond=0)
-            window = lambda as_of, since: Window(start, start + dt.timedelta(days=1))  # noqa: E731
+            start = _day_start(day)
+            end = start + dt.timedelta(days=1)
+            window = lambda as_of, since: Window(start, end)  # noqa: E731
+            as_of_notes = lambda as_of: () if end <= as_of else (  # noqa: E731
+                f"{start.date()} has not ended at as_of: no end-of-day count (the day of as_of is left out)",)
         else:
             block = "16b" if args.list else "16a"
             params["chat"] = chat.id
-        run_report(conn, args, block, chats, scope=scope, params=params, window=window)
+        run_report(conn, args, block, chats, scope=scope, params=params, window=window, as_of_notes=as_of_notes)
     return 0
 
 

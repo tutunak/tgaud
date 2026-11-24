@@ -1119,14 +1119,17 @@ class Ingest:
             fx.add(lambda: metrics.LAST_TRANSITION.labels(chat).set(at))
             # An approved request: a direct one (via_join_request, no link) or one through a link that needs
             # approval (the join carries that link, still with creates_join_request). A pending request for
-            # another link, or a self-join after the link stopped asking for approval, stays pending.
+            # another link, or a self-join after the link stopped asking for approval, stays pending. A request
+            # the sampler aged to 'unknown' (no answer seen within 7 days; resolved_at stays NULL) is still
+            # waiting for its answer: a later approval supersedes it with the real outcome.
             linked_approval = link_id is not None and p.link is not None and p.link.creates_join_request is True
             if kind == "join" and (p.via_join_request or linked_approval):
                 resolver = p.sender.id if actor_is_other and p.sender.id not in erased else None
                 hit = conn.execute(
                     """UPDATE tg.join_request SET outcome = 'approved', resolved_at = %s, resolved_by = %s
                        WHERE join_request_id = (SELECT join_request_id FROM tg.join_request
-                                                WHERE chat_id = %s AND user_id = %s AND outcome IS NULL
+                                                WHERE chat_id = %s AND user_id = %s
+                                                  AND (outcome IS NULL OR (outcome = 'unknown' AND resolved_at IS NULL))
                                                   AND requested_at <= %s
                                                   AND invite_link_id IS NOT DISTINCT FROM %s
                                                 ORDER BY requested_at DESC LIMIT 1)

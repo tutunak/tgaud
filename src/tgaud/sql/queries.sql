@@ -376,39 +376,23 @@ SELECT :'only' IN ('all', '9', '9a') AS run \gset
 -- corrections by reconciliation, Telegram's count at the end of the day (the day's last count sample), and the
 -- residual (change of Telegram's count - net of the events between the same two day-end samples, not the
 -- calendar day's net): a non-zero residual means events we did not see.
--- The rollup is kept up to date, so it can say nothing exact about a time before the data it holds. It was last
--- computed as of the as_of of its latest run (stats.rollup_run, 'chat_day'); when the report's as_of is earlier,
--- the day of as_of is only partly over and its values are withheld (NULL, withheld = 'day'), and so are the
--- short stays of a join day whose 48 h are not over at as_of (withheld = 'short_stays'): a later exit must not
--- be counted. The sample columns (reported_eod, known_eod, reported_change, residual) are also withheld
--- (withheld = 'samples') when the day's count sample is later than as_of. At as_of >= the rollup's every value
--- is shown.
+-- Only days that ended at or before as_of (UTC): the rows are kept up to date chat by chat, so a row of the day
+-- of as_of may already count what happened after as_of, and nothing in it says where its data stops. Of those
+-- days, the short stays of a join day whose 48 h are not over at as_of (day + 3 > as_of) are withheld (NULL,
+-- withheld = 'short_stays'): an exit after as_of must not be counted. Every other value of a finished day
+-- describes that day only.
 :explain
-WITH ctx AS (
-  SELECT :'as_of_ts'::timestamptz AS as_of,
-         :'as_of_ts'::timestamptz >= coalesce((SELECT max(r.as_of) FROM stats.rollup_run r WHERE r.rollup = 'chat_day'),
-                                              '-infinity'::timestamptz) AS is_current
-)
-SELECT d.chat_id, d.day,
-       CASE WHEN x.day_ok THEN d.joins END AS joins, CASE WHEN x.day_ok THEN d.rejoins END AS rejoins,
-       CASE WHEN x.day_ok THEN d.exits END AS exits, CASE WHEN x.day_ok THEN d.kicks END AS kicks,
-       CASE WHEN x.day_ok THEN d.bans_from_out END AS bans_from_out, CASE WHEN x.day_ok THEN d.net END AS net,
-       CASE WHEN x.short_ok THEN d.short_stays END AS short_stays,
-       CASE WHEN x.day_ok THEN d.corrections_in END AS corrections_in,
-       CASE WHEN x.day_ok THEN d.corrections_out END AS corrections_out,
-       CASE WHEN x.sample_ok THEN d.reported_eod END AS reported_eod, CASE WHEN x.sample_ok THEN d.known_eod END AS known_eod,
-       CASE WHEN x.sample_ok THEN d.reported_change END AS reported_change, CASE WHEN x.sample_ok THEN d.residual END AS residual,
-       CASE WHEN x.day_ok THEN d.messages END AS messages, CASE WHEN x.day_ok THEN d.active_users END AS active_users,
-       CASE WHEN NOT x.day_ok THEN 'day' WHEN NOT x.sample_ok THEN 'samples' WHEN NOT x.short_ok THEN 'short_stays' END AS withheld,
+SELECT d.chat_id, d.day, d.joins, d.rejoins, d.exits, d.kicks, d.bans_from_out, d.net,
+       CASE WHEN x.short_ok THEN d.short_stays END AS short_stays, d.corrections_in, d.corrections_out,
+       d.reported_eod, d.known_eod, d.reported_change, d.residual, d.messages, d.active_users,
+       CASE WHEN NOT x.short_ok THEN 'short_stays' END AS withheld,
        tg.window_flags(d.chat_id, tstzrange(d.day::timestamp AT TIME ZONE 'UTC', (d.day + 1)::timestamp AT TIME ZONE 'UTC')) AS flags
-FROM stats.v_chat_day d CROSS JOIN ctx
-CROSS JOIN LATERAL (SELECT ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS day_ok,
-                           (ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of)
-                             AND (d.sample_at IS NULL OR d.sample_at <= ctx.as_of) AS sample_ok,
-                           ctx.is_current OR (d.day + 3)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS short_ok) x
+FROM stats.v_chat_day d
+CROSS JOIN LATERAL (SELECT (d.day + 3)::timestamp AT TIME ZONE 'UTC' <= :'as_of_ts'::timestamptz AS short_ok) x
 WHERE d.chat_id = ANY (:'scope_ids'::bigint[])
-  AND d.day >= (:'since_ts'::timestamptz AT TIME ZONE 'UTC')::date AND d.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
-  AND (NOT x.day_ok OR d.joins + d.exits + d.bans_from_out + d.corrections_in + d.corrections_out + d.messages > 0
+  AND d.day >= (:'since_ts'::timestamptz AT TIME ZONE 'UTC')::date
+  AND (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= :'as_of_ts'::timestamptz
+  AND (d.joins + d.exits + d.bans_from_out + d.corrections_in + d.corrections_out + d.messages > 0
        OR d.reported_eod IS NOT NULL)
 ORDER BY d.chat_id, d.day;
 \endif
@@ -533,8 +517,9 @@ SELECT :'only' IN ('all', '12') AS run \gset
 \echo == 12. join-request funnel per chat and week
 -- Q: how many asked to join, how many were approved, how fast, and did the approved stay 30 days?
 -- unknown = no answer seen within 7 days (declines by other admins send no update, F§3); pending = younger.
--- Outcomes are read as of as_of: an answer after as_of leaves the request pending, 'unknown' only once 7 days
--- have passed, and the approved join must be before as_of.
+-- Outcomes are read as of as_of: an answer after as_of leaves the request pending until its 7 days have passed
+-- and unknown after that (an answer the sampler had not seen within 7 days), 'unknown' only once 7 days have
+-- passed, and the approved join must be before as_of.
 :explain
 SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS week, count(*) AS requests,
        count(*) FILTER (WHERE o.outcome = 'approved') AS approved,
@@ -549,9 +534,8 @@ SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS
                                           j.joined_at + interval '30 days') = 'in') AS approved_retained_30d
 FROM tg.join_request r
 JOIN tg.chat c ON c.chat_id = r.chat_id AND c.tracked
-CROSS JOIN LATERAL (SELECT CASE WHEN r.outcome = 'unknown'
+CROSS JOIN LATERAL (SELECT CASE WHEN r.outcome = 'unknown' OR r.resolved_at > :'as_of_ts'::timestamptz
                                 THEN CASE WHEN r.requested_at + interval '7 days' <= :'as_of_ts'::timestamptz THEN 'unknown' END
-                                WHEN r.resolved_at > :'as_of_ts'::timestamptz THEN NULL
                                 ELSE r.outcome END AS outcome) o
 LEFT JOIN LATERAL (
   SELECT m.joined_at, m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since
@@ -754,11 +738,13 @@ SELECT :'only' IN ('all', '16', '16d') AS run \gset
 -- Q: how many people were in chat X at the end of day D (UTC)? members_eod = stays holding the end of the day
 -- (the running sum of the daily deltas in stats.chat_day), unsure_eod = of those, between the last sighting
 -- and a confirmed exit; known = the difference. Same numbers as 16a at D + 1 day 00:00, without the scan.
+-- Only once D has ended at as_of (as block 9a): before that the end of D is not known, and no row is returned.
 :explain
 SELECT d.chat_id, d.day, d.members_eod, d.unsure_eod, d.members_eod - d.unsure_eod AS known_eod, d.reported_eod,
        tg.window_flags(d.chat_id, tstzrange(d.day::timestamp AT TIME ZONE 'UTC', (d.day + 1)::timestamp AT TIME ZONE 'UTC')) AS flags
 FROM stats.v_chat_day d
 WHERE d.chat_id = ANY (:'scope_ids'::bigint[]) AND d.day = (:'day_ts'::timestamptz AT TIME ZONE 'UTC')::date
+  AND (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= :'as_of_ts'::timestamptz
 ORDER BY d.chat_id;
 \endif
 
@@ -784,9 +770,11 @@ SELECT :'only' IN ('R1') AS run \gset
 --    (event_at, update_id) decides, so join, leave, join in one second counts one rejoin, whatever the
 --    spells' ids. A spell with an inferred start (E6, E9) has no opening event of its own: tg.spell_order
 --    replays the events of that instant and orders it by the event that opened it (the same order as 10a).
---  * reported_eod, known_eod, sample_at: the day's last count sample at or before as_of. sample_net: exact joins
---    minus exact exits in (previous day's sample, this day's sample], so the residual (v_chat_day) compares
---    Telegram's count with the events between the same two samples, not with the calendar day.
+--  * reported_eod, known_eod, sample_at: the day's last finalized count sample (net_events set: ingest had caught
+--    up past it) at or before as_of. sample_net: exact joins minus exact exits in (previous day's sample, this
+--    day's sample], so the residual (v_chat_day) compares Telegram's count with the events between the same two
+--    samples, not with the calendar day; NULL (and so the residual) when either sample's count call straddled an
+--    exact transition (count_sample.straddled), as stats.v_drift withholds it.
 --  * members_started/ended, unsure_started/ended: daily deltas of human stays (known_from, left_before; bounded
 --    exits at left_after and left_before; open stays at suspect_since, which are unsure from then on).
 --    members_midnight and unsure_midnight hold the part at exactly 00:00 UTC, which v_chat_day counts into the
@@ -886,10 +874,12 @@ WITH grid AS (
   GROUP BY 1, 2
 ), s0 AS (           -- the last finalized count sample of each day, from the day before the range (for its interval)
   SELECT DISTINCT ON (cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date)
-         cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported, cs.known_open
+         cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported,
+         cs.known_open, cs.straddled
   FROM chat_day_target t JOIN tg.count_sample cs ON cs.chat_id = t.chat_id
                                                 AND cs.sampled_at >= t.from_ts - interval '1 day'
                                                 AND cs.sampled_at <= :'as_of_ts'::timestamptz
+                                                AND cs.net_events IS NOT NULL
   ORDER BY cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date, cs.sampled_at DESC
 ), s AS (            -- plus the events after that sample until the end of its day: the part of the day's net that
                      -- belongs to the interval of the next sample
@@ -918,7 +908,7 @@ SELECT g.chat_id, g.day, coalesce(j.joins, 0), coalesce(j.rejoins, 0), coalesce(
        coalesce(j.mid_started, 0) + coalesce(f.mid_started, 0) - coalesce(x.mid_ended, 0),
        coalesce(x.mid_unsure_started, 0) + coalesce(sp.mid_started, 0) - coalesce(x.mid_unsure_ended, 0),
        s.sample_at,
-       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL
+       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL AND NOT s.straddled AND NOT p.straddled
             THEN coalesce(j.joins, 0) - coalesce(x.exits, 0) - s.tail_net + p.tail_net END,
        now()
 FROM grid g
@@ -998,9 +988,10 @@ WITH grid AS (
 ), s0 AS (           -- the last finalized count sample of each day, from the day before the range (for its interval)
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT DISTINCT ON ((cs.sampled_at AT TIME ZONE 'UTC')::date)
-           (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported, cs.known_open
+           (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported, cs.known_open,
+           cs.straddled
     FROM tg.count_sample cs WHERE cs.chat_id = t.chat_id AND cs.sampled_at >= t.from_ts - interval '1 day'
-                              AND cs.sampled_at <= :'as_of_ts'::timestamptz
+                              AND cs.sampled_at <= :'as_of_ts'::timestamptz AND cs.net_events IS NOT NULL
     ORDER BY (cs.sampled_at AT TIME ZONE 'UTC')::date, cs.sampled_at DESC) z
 ), s AS (            -- plus the events after that sample until the end of its day: the part of the day's net that
                      -- belongs to the interval of the next sample
@@ -1029,7 +1020,7 @@ SELECT g.chat_id, g.day, coalesce(j.joins, 0), coalesce(j.rejoins, 0), coalesce(
        coalesce(j.mid_started, 0) + coalesce(f.mid_started, 0) - coalesce(x.mid_ended, 0),
        coalesce(x.mid_unsure_started, 0) + coalesce(sp.mid_started, 0) - coalesce(x.mid_unsure_ended, 0),
        s.sample_at,
-       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL
+       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL AND NOT s.straddled AND NOT p.straddled
             THEN coalesce(j.joins, 0) - coalesce(x.exits, 0) - s.tail_net + p.tail_net END,
        now()
 FROM grid g

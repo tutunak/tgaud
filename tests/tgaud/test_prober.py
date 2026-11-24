@@ -579,6 +579,35 @@ def test_a_new_outage_probe_of_a_newer_spell_goes_before_cached_older_ones(env):
     assert asked(e)[n] == (CHAT, 500)
 
 
+def test_a_reconcile_batch_of_outage_probes_is_asked_by_spell_not_by_queue_order(env):
+    """probe-sample review-3: 200 outage probes are cached; reconcile's tg.queue_probes then queues six more in one
+    batch (one queued_at, ids in user order): the first queued user has the newest spell of all, the other five the
+    oldest. The newest spell is the next call; the five oldest wait behind every cached probe."""
+    e = env
+    w = e.w
+    for u in range(1, 201):
+        w.join(u, at(100 + u))  # cached: spells from minute 101 to 300
+    w.join(301, at(1000))  # the newest spell
+    for u in range(302, 307):
+        w.join(u, at(u - 301))  # the oldest: minutes 1-5
+    w.rebuild()
+    for u in range(1, 201):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+    w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    assert [u for _, u in asked(e)][:3] == [200, 199, 198]
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')",
+                         ([CHAT] * 6, list(range(301, 307)))).fetchone()[0] == 6
+    e.run(p, 20.0)
+    later = [u for _, u in asked(e)[n:]]
+    assert later[0] == 301 and len(later) > 90
+    assert later[1:] == sorted(later[1:], reverse=True) and not set(later) & set(range(302, 307))
+
+
 def test_a_conflict_of_another_chat_queued_during_a_backlog_is_asked_next(env):
     e = env
     e.w.add_chat(OTHER)

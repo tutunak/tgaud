@@ -3,10 +3,15 @@
 Queue order: `manual` (the CLI) first, then `conflict`, `outage` (the newest open spell first), `snapshot_absent`,
 `sample`; ties by queued_at. Only probes that are ready are taken: never tried, or past the backoff of their
 last failure. The candidates are cached: a full read every FULL_REFRESH seconds or when the cache runs out. Between
-full reads, every step first reads the heads of the queue (per chat and reason the oldest ready probes, and for
-outage the newest queued ones, by the index probe_pending_reason) into the cache at their place in the same order:
-a conflict or manual probe queued or raised in place meanwhile, a new outage probe of a newer spell, or a chat that
-starts waiting, is seen before the next tokens are spent.
+full reads, every step first reads the heads of the queue (by the index probe_pending_reason) into the cache at
+their place in the same order: per chat and first-come reason the oldest ready probes (a conflict or manual probe
+queued or raised in place meanwhile, or a chat that starts waiting), and per chat the outage probes queued since the
+full read (queued_at from ARRIVAL_MARGIN before it: a queuing transaction that began before the read and committed
+after it), ranked by their spells, newest first, before the limit: a reconciliation batch of any size that queues
+the newest spell last is still asked newest spell first. The limit is PER_STEP, all a step can take ahead of the
+cached ones. A head candidate the full read would have left out (after the last cached candidate of a chat whose
+read was cut at PER_CHAT) stays out. An outage probe raised in place from a lower reason keeps its older queued_at
+and waits for the next full read.
 
 Budget: one global token bucket at `config.probe_rate` calls/s (TGAUD_PROBE_RATE, default 5; burst one second's
 worth). While other chats have ready probes, one chat gets at most half of the rate (its own bucket at rate/2);
@@ -56,8 +61,9 @@ FULL_REFRESH = 120.0  # seconds between full candidate reads while the cache has
 # again at once. The full read orders every pending probe (1-3 s at 100 000 outage probes), so it is not repeated often.
 IDLE_REFRESH = 5.0  # seconds between reads of an empty queue
 PER_CHAT = 600  # candidates read per chat: two minutes of the whole default budget
-PER_HEAD = 5  # ready probes read per chat and reason by each step's head read
-PER_STEP = 20  # probes per step
+PER_HEAD = 5  # ready probes read per chat and first-come reason by each step's head read
+PER_STEP = 20  # probes per step; also the outage arrivals per chat each head read ranks in
+ARRIVAL_MARGIN = 60.0  # seconds before the full read from which an outage probe counts as queued after it
 STEP_SECONDS = 3.0  # and at most this long (wall time) per step
 STATUSES = frozenset({"creator", "administrator", "member", "restricted", "left", "kicked"})
 
@@ -90,8 +96,9 @@ _READY = """
             <= %(now)s)"""
 
 # The heads, per chat and reason (short index ranges of probe_pending_reason): the oldest ready probes (first-come
-# reasons, so also a row whose reason was raised in place), and for outage the newest queued ones (a probe queued
-# after the full read, for a spell newer than the cached ones). Same columns and order key as _CANDIDATES.
+# reasons, so also a row whose reason was raised in place), and for outage the ready ones queued since the full read
+# (%(since)s), every one ranked by its pair's newest spell before the limit: their number is what was queued since,
+# not the queue's. Same columns and order key as _CANDIDATES.
 _HEADS = f"""
 SELECT r.prio::int, extract(epoch FROM h.spell_from)::float8, extract(epoch FROM h.queued_at)::float8, h.probe_id,
        h.chat_id, h.user_id, r.reason
@@ -102,11 +109,14 @@ CROSS JOIN LATERAL (
    WHERE r.reason <> 'outage' AND p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending' {_READY}
    ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s)
   UNION ALL
-  (SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at,
-          (SELECT max(m.known_from) FROM tg.membership m WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id)
-   FROM tg.probe p
-   WHERE r.reason = 'outage' AND p.chat_id = c.chat_id AND p.reason = 'outage' AND p.outcome = 'pending' {_READY}
-   ORDER BY p.queued_at DESC, p.probe_id DESC LIMIT %(per_head)s)) h"""
+  (SELECT a.probe_id, a.chat_id, a.user_id, a.queued_at, a.spell_from FROM (
+     SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at,
+            (SELECT max(m.known_from) FROM tg.membership m WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id)
+              AS spell_from
+     FROM tg.probe p
+     WHERE r.reason = 'outage' AND p.chat_id = c.chat_id AND p.reason = 'outage' AND p.outcome = 'pending'
+       AND p.queued_at >= %(since)s {_READY}) a
+   ORDER BY a.spell_from DESC NULLS LAST, a.queued_at, a.probe_id LIMIT %(per_arrivals)s)) h"""
 
 
 class TokenBucket:
@@ -180,6 +190,8 @@ class Prober:
         self.chat_buckets: dict[int, TokenBucket] = {}
         self.queue: list[Candidate] = []
         self.next_read = now  # the full read
+        self.read_at: float | None = None  # when the last full read ran
+        self.horizon: dict[int, tuple[int, float, float, int]] = {}  # chat -> its last candidate's key, if cut
 
     # --- scheduling --------------------------------------------------------------------------------------------
 
@@ -241,6 +253,11 @@ class Prober:
                                           "steps": len(BACKOFF), "now": _utc(now), "per_chat": PER_CHAT}).fetchall()
         self.queue = [_candidate(*r) for r in rows]
         self.next_read = now + (FULL_REFRESH if self.queue else IDLE_REFRESH)
+        self.read_at = now
+        per_chat: dict[int, list[Candidate]] = {}
+        for c in self.queue:
+            per_chat.setdefault(c.chat_id, []).append(c)
+        self.horizon = {chat: cands[-1].key for chat, cands in per_chat.items() if len(cands) >= PER_CHAT}
         known = {c.chat_id for c in self.queue}
         for chat_id in [c for c in self.chat_buckets if c not in known]:
             del self.chat_buckets[chat_id]  # idle chats start again with a full share
@@ -249,9 +266,14 @@ class Prober:
         """Ready probes queued since the full read (and chats that started waiting) into the cache at their place in
         the queue order; a cached probe whose reason was raised in place moves to its new place."""
         cached = {c.probe_id: c for c in self.queue}
+        since = _utc(self.read_at - ARRIVAL_MARGIN if self.read_at is not None else 0.0)
         for row in conn.execute(_HEADS, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
-                                         "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD}):
+                                         "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD,
+                                         "since": since, "per_arrivals": PER_STEP}):
             cand = _candidate(*row)
+            cut = self.horizon.get(cand.chat_id)
+            if cut is not None and cand.key > cut:
+                continue  # beyond what the full read kept of this chat: it comes with a later full read
             old = cached.get(cand.probe_id)
             if old is not None and old.key[0] <= cand.key[0]:
                 continue  # cached at its place (or higher: the full read's spell order stays)

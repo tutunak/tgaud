@@ -1044,7 +1044,10 @@ BEGIN
   UPDATE tg.campaign_chat SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id
      AND NOT EXISTS (SELECT 1 FROM tg.campaign_chat x WHERE x.campaign_id = campaign_chat.campaign_id
                                                          AND x.chat_id = p_new_chat_id);
-  INSERT INTO tg.count_sample SELECT p_new_chat_id, sampled_at, reported, known_open, suspect_open, net_events, request_ms
+  -- by name: later migrations add columns (005: straddled), which a moved sample keeps
+  INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, suspect_open, net_events, request_ms,
+                               straddled)
+    SELECT p_new_chat_id, sampled_at, reported, known_open, suspect_open, net_events, request_ms, straddled
     FROM tg.count_sample WHERE chat_id = p_old_chat_id ON CONFLICT DO NOTHING;
   INSERT INTO tg.activity_daily AS a SELECT p_new_chat_id, user_id, day, messages
     FROM tg.activity_daily WHERE chat_id = p_old_chat_id

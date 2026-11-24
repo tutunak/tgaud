@@ -326,6 +326,45 @@ def test_join_requests_are_approved_by_the_matching_join(h):
         (42, True, True), (43, False, True), (44, False, True)]
 
 
+def test_a_request_aged_to_unknown_takes_the_outcome_of_a_later_approval(h):
+    """The sampler marks a request without an answer after 7 days 'unknown' (resolved_at stays NULL); an approval
+    that comes later is still its answer. The funnel (block 12) and tgaud_chat_join_requests_pending agree before
+    and after, also as of a time between the two."""
+    from tgaud.jobs import sampler
+    tracked_channel(h, at=T0 - dt.timedelta(days=10))
+    chat = str(CHANNEL["id"])
+    h.poll(join_request(10, 42, T0 - dt.timedelta(days=9)))
+    job = sampler.make(h.ctx)
+
+    def refresh() -> None:
+        with psycopg.connect(h.dsn) as c:
+            snap = job.collect(c, h.clock())
+            c.commit()
+        job.publish(snap)
+
+    def funnel(as_of: dt.datetime) -> tuple:
+        with psycopg.connect(h.dsn) as c:
+            (r,) = sql.run(c, "12", as_of=as_of, since=T0 - dt.timedelta(days=30), scope=[CHANNEL["id"]]).dicts()
+        return r["requests"], r["approved"], r["unknown"], r["pending"]
+
+    unknown0, approved0 = (sample("tgaud_chat_join_requests_total", chat=chat, outcome=o)
+                           for o in ("unknown", "approved"))
+    refresh()
+    assert h.one("SELECT outcome, resolved_at FROM tg.join_request") == ("unknown", None)
+    assert sample("tgaud_chat_join_requests_pending", chat=chat) == 0 and funnel(h.clock.now) == (1, 0, 1, 0)
+    assert sample("tgaud_chat_join_requests_total", chat=chat, outcome="unknown") == unknown0 + 1
+    aged_at = h.clock.now
+    h.clock.advance(hours=2)
+    approved = T0 + dt.timedelta(hours=1)
+    h.poll(chat_member(11, 42, approved, actor=ADMIN, via_join_request=True))
+    assert h.one("SELECT outcome, resolved_at, resolved_by FROM tg.join_request") == ("approved", approved, ADMIN)
+    assert sample("tgaud_chat_join_requests_total", chat=chat, outcome="approved") == approved0 + 1
+    refresh()
+    assert sample("tgaud_chat_join_requests_pending", chat=chat) == 0 and funnel(h.clock.now) == (1, 1, 0, 0)
+    assert funnel(aged_at) == (1, 0, 1, 0)  # as of the aging, before the answer: unknown, as the gauge said then
+    assert sample("tgaud_chat_join_requests_total", chat=chat, outcome="unknown") == unknown0 + 1  # not aged again
+
+
 # ------------------------------------------------------------------------------------------------------------
 # my_chat_member: tracking, coverage and gaps
 # ------------------------------------------------------------------------------------------------------------

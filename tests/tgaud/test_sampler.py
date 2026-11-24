@@ -401,9 +401,10 @@ def test_join_requests_without_an_outcome_become_unknown_after_7_days(env):
     assert value("tgaud_chat_join_requests_pending", CHAT) == 1
     assert value("tgaud_chat_join_requests_total", CHAT, outcome="unknown") - unknown0 == 2
 
-    def report():
+    def report():  # block 12 as of the job's clock: the funnel the gauge describes
+        now = datetime.fromtimestamp(e.clock(), timezone.utc)
         with psycopg.connect(e.dsn) as c:
-            (r,) = sql.run(c, "12", as_of=START, since=START - timedelta(days=30)).dicts()
+            (r,) = sql.run(c, "12", as_of=now, since=START - timedelta(days=30)).dicts()
             return r["requests"], r["approved"], r["unknown"], r["pending"]
     assert report() == (3, 0, 2, 1)
     # a delayed approval (ingest supersedes the unknown outcome) and the next refresh agree with the report

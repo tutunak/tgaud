@@ -345,6 +345,87 @@ def reconciler_far():
     return datetime(2100, 1, 1, tzinfo=UTC)
 
 
+def _pending_alias(lab, old: int, new: int, migrated_at: datetime) -> None:
+    """The migration is known, the history not moved yet (M2: ingest saw it before the supergroup was tracked)."""
+    lab.c.execute("INSERT INTO tg.chat_alias (old_chat_id, chat_id, migrated_at, moved_at) VALUES (%s, %s, %s, NULL)",
+                  (old, new, migrated_at))
+
+
+def _m1(lab, old: int, new: int, migrated_at: datetime) -> history.RebuildResult:
+    """M1 as ingest runs it (jobs.ingest._move): tg.move_chat_history, then every pair of both chats rebuilt."""
+    users = [r[0] for r in lab.c.execute("""
+        SELECT user_id FROM tg.member_event WHERE chat_id = ANY(%(c)s) UNION SELECT user_id FROM tg.sighting
+        WHERE chat_id = ANY(%(c)s) UNION SELECT user_id FROM tg.membership WHERE chat_id = ANY(%(c)s) ORDER BY 1""",
+                                         {"c": [old, new]})]
+    lab.c.execute("SELECT tg.move_chat_history(%s, %s, %s)", (old, new, migrated_at))
+    return history.rebuild_pairs(lab.c, [(new, u) for u in users])
+
+
+@pytest.mark.parametrize("pruned", [False, True], ids=["member-rows-kept", "pruned"])
+def test_m1_keeps_the_interior_point_of_a_supergroup_run_when_old_id_listings_move_in_between(lab, pruned):
+    """history review-3, first major: the supergroup's listings at 10, 11 and 12 o'clock make one three-point run of
+    user 7 (10:01, 11:01, 12:01); an exact exit at 10:30 is ingested later, so the rejoin is the 11:01 point. The old
+    group's empty listing at 11:30 (under the old id after the migration, rejected by the owner) lies inside that run
+    once M1 moves it into the supergroup: the run is numbered in its own source, so the 11:01 rejoin survives M1, the
+    user's promotion and another rebuild."""
+    old, new = CHAT, CHAT - 9
+    lab.add_chat(new)
+    m = at(-H)  # 09:00
+    _pending_alias(lab, old, new, m)
+    lab.chat_id = new
+    for h in (0, 1, 2):
+        lab.collect(at(h * H), {7: at(h * H + 1)}, chat=new)
+        lab.run()
+    o = lab.collect(at(90), {}, chat=old, reported=0, fetched=0)
+    lab.run()
+    lab.reject(o)
+    assert [(r[1], r[6]) for r in lab.sightings(7)] == [(7, 3)]  # one run, three points
+    lab.leave(7, at(30), chat=new)
+    lab.rebuild([7])
+
+    def stays() -> list[tuple]:
+        return [(s.start_source, s.known_from, s.end_source, s.left_at, s.last_confirmed_at) for s in lab.spells(7)]
+    expected = [("snapshot", at(1), "event", at(30), at(1)), ("snapshot", at(61), None, None, at(121))]
+    assert stays() == expected
+    if pruned:
+        lab.prune()
+    _m1(lab, old, new, m)
+    assert (lab.snapshot(o)["chat_id"], lab.snapshot(o)["source_chat_id"]) == (new, old)  # 004's trigger in effect
+    assert stays() == expected
+    lab.event(7, at(150), "member", "administrator", chat=new)  # promoted: ingest rebuilds the pair
+    lab.rebuild([7])
+    assert stays() == expected[:1] + [("snapshot", at(61), None, None, at(150))]
+    assert lab.rebuild([7]) == history.RebuildResult()
+
+
+@pytest.mark.parametrize("start", [0, 2 * H], ids=["exactly-at-the-migration", "after-the-migration"])
+def test_m1_an_old_id_listing_taken_after_the_migration_gives_no_absences(lab, start):
+    """history review-3, second major: user 8 is in the supergroup (from the group before the migration, and confirmed
+    under the new id when the listing starts later); the old id's good listing taken at or after migrated_at lists
+    only user 9. After M1 user 8 stays confirmed (no suspicion from that listing) and user 9's sighting counts."""
+    old, new = CHAT, CHAT - 9
+    lab.add_chat(new)
+    m = at(0)
+    lab.join(8, at(-24 * H), chat=old)
+    lab.rebuild([8])
+    _pending_alias(lab, old, new, m)
+    if start > 30:
+        lab.event(8, m + timedelta(minutes=30), "member", "administrator", chat=new)
+    listed = m + timedelta(minutes=start)
+    o = lab.collect(listed, {9: listed + timedelta(minutes=1)}, chat=old, reported=1, fetched=1)
+    lab.run()
+    assert lab.snapshot(o)["quality"] == "good" and lab.totals(o)["absent_candidates"] == 0
+    _m1(lab, old, new, m)
+    assert lab.snapshot(o)["source_chat_id"] == old
+    lab.chat_id = new
+    [sp8] = lab.spells(8)
+    assert (sp8.end_source, sp8.suspect_since) == (None, None)
+    assert sp8.last_confirmed_at == (m + timedelta(minutes=30) if start > 30 else at(-24 * H))
+    [sp9] = lab.spells(9)
+    assert (sp9.start_source, sp9.known_from, sp9.end_source) == ("snapshot", listed + timedelta(minutes=1), None)
+    assert lab.rebuild([8, 9]) == history.RebuildResult()
+
+
 # --- tg_user: is_deleted follows the newest snapshot observation -------------------------------------------------
 
 @pytest.mark.parametrize("first", ["monday", "tuesday"])
@@ -853,16 +934,26 @@ def test_a_claimed_expiry_goes_on_after_the_collector_finishes_and_a_restart(mig
         assert lab.snapshot(sid) == {}
 
 
-def test_an_erased_page_never_reaches_the_cursor_or_the_run_rows(lab):
-    lab.c.execute("INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(20), %s)", (at(H),))
+@pytest.mark.parametrize("erased", ["before-the-page", "after-the-page"])
+def test_an_erased_page_never_reaches_the_cursor_or_the_run_rows(lab, erased):
+    """Erased before the page is inserted: migration 008's trigger skips the row, so the reconciler never meets it.
+    Erased after (the row is in the table): the reconciler drops it in its chunk."""
+    def erase() -> None:
+        lab.c.execute("INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(20), %s)", (at(H),))
+    if erased == "before-the-page":
+        erase()
     sid = lab.collect(at(0), {20: at(5), 21: at(6)})
+    if erased == "after-the-page":
+        erase()
     lab.fixed_chunk(1)
     cursors = []
     while lab.job.run_unit(lab.c) is not None:
         cursors.append(lab.snapshot(sid).get("applied_through_user_id"))
     assert 20 not in cursors and 21 in cursors
+    runs = ([(1, None, None), (2, 21, 21), (3, None, None)] if erased == "after-the-page"
+            else [(1, 21, 21), (2, None, None)])
     assert lab.c.execute("SELECT chunk, from_user_id, through_user_id FROM tg.reconcile_run WHERE snapshot_id = %s "
-                         "ORDER BY chunk", (sid,)).fetchall() == [(1, None, None), (2, 21, 21), (3, None, None)]
+                         "ORDER BY chunk", (sid,)).fetchall() == runs
     assert lab.snapshot(sid)["reconciled_at"] is not None and lab.totals(sid)["listed"] == 1
     assert lab.c.execute("SELECT count(*) FROM tg.tg_user WHERE user_id = 20").fetchone()[0] == 0
 

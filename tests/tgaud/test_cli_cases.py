@@ -357,8 +357,7 @@ def test_growth_withholds_what_a_historical_as_of_cannot_know(cases):
     z = str(-1003000000020)  # joined 11-12 10:00, left 20:00
     noon = [r for r in cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-12T12:00:00+00:00")
             if r["day"] == "2026-11-12"]
-    (row,) = noon
-    assert row["withheld"] == "day" and row["exits"] == "" and row["short_stays"] == "" and row["joins"] == ""
+    assert noon == []  # the day of as_of is not over: left out (its row may hold what came after as_of)
     next_day = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-13T12:00:00+00:00"), day="2026-11-12")
     assert (next_day["joins"], next_day["exits"]) == ("1", "1")  # the day is over: its movement is known
     assert next_day["short_stays"] == "" and next_day["withheld"] == "short_stays"  # its 48 h are not
@@ -422,8 +421,8 @@ def test_a_late_exit_with_a_smaller_update_id_does_not_put_the_closed_stay_after
 
 def test_growth_withholds_a_day_with_a_count_sample_after_as_of(cases):
     z = str(-1003000000020)  # a count sample of 222 at 11-12 20:00
-    noon = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-12T12:00:00+00:00"), day="2026-11-12")
-    assert noon["reported_eod"] == "" and noon["residual"] == "" and noon["withheld"] == "day"
+    noon = cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-12T12:00:00+00:00")
+    assert [r for r in noon if r["day"] == "2026-11-12"] == []  # the day of as_of, with its 20:00 sample: left out
     next_day = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-13T12:00:00+00:00"), day="2026-11-12")
     assert next_day["reported_eod"] == "222" and next_day["known_eod"] == "5"  # the day is over: its sample is known
     now = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01"), day="2026-11-12")

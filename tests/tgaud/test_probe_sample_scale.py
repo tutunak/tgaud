@@ -126,3 +126,24 @@ def test_prober_queue_read_with_100k_pending(scale_dsn, record_property):
     assert p.queue[0].reason == "conflict"
     assert full == 199 * 5 + prober.PER_CHAT
     assert took < 5.0
+
+
+def test_prober_head_read_ranks_a_g1_batch_by_spell_with_100k_pending(scale_dsn, record_property):
+    """A G1 batch of OUTAGE_BUDGET outage probes in one tg.queue_probes call after the full read, beside the 100 000
+    pending ones; user 86399 has the newest spell of the chat but neither the first nor the last id of the batch."""
+    from tgaud.jobs import reconciler
+    p = prober.Prober(_ctx(), rate=5)
+    users = list(range(9, 10 * reconciler.OUTAGE_BUDGET, 10))
+    assert 86399 in users and users.index(86399) not in (0, len(users) - 1)
+    with psycopg.connect(scale_dsn) as c:
+        p._read(c, NOW.timestamp())  # noqa: SLF001
+        c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([BIG] * len(users), users))
+        t = time.perf_counter()
+        p._read_heads(c, NOW.timestamp() + 1)  # noqa: SLF001
+        heads = time.perf_counter() - t
+        c.rollback()
+    print(f"prober head read with a G1 batch of {len(users)} outage probes beside 100 000 pending: "
+          f"{heads * 1000:.0f} ms")
+    record_property("prober_head_read_batch_seconds", heads)
+    outage = [c.user_id for c in p.queue if c.chat_id == BIG and c.reason == "outage"]
+    assert outage[0] == 86399 and heads < 0.5

@@ -204,6 +204,8 @@ def test_unsupported_connection_options_are_refused_by_name():
     ("connect_timeout=5", True), ("connect_timeout=x", False),
     ("target_session_attrs=read-write", True), ("target_session_attrs=nope", False),
     ("channel_binding=require", True), ("channel_binding=maybe", False),
+    ("sslmode=disable&sslnegotiation=direct", False), ("sslnegotiation=direct", False),
+    ("sslmode=require&sslnegotiation=direct", True), ("sslmode=disable&sslnegotiation=postgres", True),
 ])
 def test_option_verdicts_agree_with_libpq(query, ok):
     """What config accepts, libpq accepts at connect time (and the reverse): nothing listens on port 1, so an
@@ -218,8 +220,17 @@ def test_option_verdicts_agree_with_libpq(query, ok):
     with pytest.raises(psycopg.Error) as e:  # psycopg itself checks connect_timeout before libpq
         psycopg.connect(url, connect_timeout=2 if "connect_timeout" not in query else None)
     text = str(e.value).lower()
-    libpq_refused_option = ("invalid" in text or "bad value" in text) and "refused" not in text
+    libpq_refused_option = (("invalid" in text or "bad value" in text or "may not be used" in text)
+                            and "refused" not in text)
     assert libpq_refused_option is (not ok), str(e.value)
+
+
+def test_selfcheck_refuses_the_tls_pair_libpq_refuses():
+    from tgaud import selfcheck
+
+    with pytest.raises(config.ConfigError, match="sslnegotiation=direct needs sslmode"):
+        selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=disable&sslnegotiation=direct"})
+    selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=verify-full&sslnegotiation=direct"})
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8081?", "http://127.0.0.1:8081#", "http://h/x?", "http://h/#"])

@@ -123,9 +123,26 @@ def test_growth_corrections_joins_rejoins_and_the_residual(cli):
     assert pick(rows, chat_id=A, day="2026-08-01")["corrections_in"] == "5"
     assert nums(pick(rows, chat_id=A, day="2026-11-05"), "joins", "exits") == ["1", "1"]
     assert pick(rows, chat_id=A, day="2026-11-03")["rejoins"] == "1"
-    assert nums(pick(rows, chat_id=A, day="2026-11-23"), "reported_eod", "known_eod", "residual") == ["15", "12", "1"]
+    assert not [r for r in rows if r["day"] == "2026-11-23"]  # the day of as_of (12:00) is not over: left out
+    after = cli.rows("growth", "--among", *AB, "--since", "2026-08-01", as_of="2026-11-24T00:00:00+00:00")
+    assert nums(pick(after, chat_id=A, day="2026-11-23"), "reported_eod", "known_eod", "residual") == ["15", "12", "1"]
     assert pick(rows, chat_id=B, day="2026-11-13")["corrections_out"] == "1"
     assert pick(rows, chat_id=B, day="2026-11-20")["messages"] == "9"
+    out = cli.run("growth", "--among", *AB, "--since", "2026-11-01", "--as-of", NOW_ARG)
+    assert out.code == 0, out.err
+    head = out.out.partition("\n\n")[0]
+    assert "window 2026-11-01 00:00:00 UTC .. 2026-11-23 00:00:00 UTC" in head
+    assert "days that ended by as_of only: through 2026-11-22; 2026-11-23, the day of as_of, is not over" in head
+    assert "short stays from 2026-11-21 on are withheld" in head
+
+
+def test_asof_eod_reports_a_day_only_once_it_has_ended(cli):
+    assert cli.rows("asof", "Alpha news", "2026-11-23", "--eod") == []  # as of 11-23 12:00
+    out = cli.run("asof", "Alpha news", "2026-11-23", "--eod", "--as-of", NOW_ARG)
+    assert out.code == 0 and "2026-11-23 has not ended at as_of: no end-of-day count" in out.out
+    ended = cli.rows("asof", "Alpha news", "2026-11-22", "--eod")
+    assert len(ended) == 1 and ended[0]["day"] == "2026-11-22"
+    assert "has not ended" not in cli.run("asof", "Alpha news", "2026-11-22", "--eod", "--as-of", NOW_ARG).out
 
 
 def test_short_stays_outside_campaigns(cli):
