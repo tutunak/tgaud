@@ -376,15 +376,18 @@ SELECT :'only' IN ('all', '9', '9a') AS run \gset
 -- corrections by reconciliation, Telegram's count at the end of the day (the day's last count sample), and the
 -- residual (change of Telegram's count - net of the events between the same two day-end samples, not the
 -- calendar day's net): a non-zero residual means events we did not see.
--- The rollup is kept up to date, so it can say nothing exact about a time before the data it holds: when as_of
--- is earlier than the last update ingest committed (tg.bot_state.last_poll_ok_at), the day of as_of is only
--- partly over and its values are withheld (NULL, withheld = 'day'), and so are the short stays of a join day
--- whose 48 h are not over at as_of (withheld = 'short_stays'): a later exit must not be counted. At as_of =
--- now every value is shown.
+-- The rollup is kept up to date, so it can say nothing exact about a time before the data it holds. It was last
+-- computed as of the as_of of its latest run (stats.rollup_run, 'chat_day'); when the report's as_of is earlier,
+-- the day of as_of is only partly over and its values are withheld (NULL, withheld = 'day'), and so are the
+-- short stays of a join day whose 48 h are not over at as_of (withheld = 'short_stays'): a later exit must not
+-- be counted. The sample columns (reported_eod, known_eod, reported_change, residual) are also withheld
+-- (withheld = 'samples') when the day's count sample is later than as_of. At as_of >= the rollup's every value
+-- is shown.
 :explain
 WITH ctx AS (
   SELECT :'as_of_ts'::timestamptz AS as_of,
-         :'as_of_ts'::timestamptz >= coalesce((SELECT max(b.last_poll_ok_at) FROM tg.bot_state b), '-infinity'::timestamptz) AS is_current
+         :'as_of_ts'::timestamptz >= coalesce((SELECT max(r.as_of) FROM stats.rollup_run r WHERE r.rollup = 'chat_day'),
+                                              '-infinity'::timestamptz) AS is_current
 )
 SELECT d.chat_id, d.day,
        CASE WHEN x.day_ok THEN d.joins END AS joins, CASE WHEN x.day_ok THEN d.rejoins END AS rejoins,
@@ -393,13 +396,15 @@ SELECT d.chat_id, d.day,
        CASE WHEN x.short_ok THEN d.short_stays END AS short_stays,
        CASE WHEN x.day_ok THEN d.corrections_in END AS corrections_in,
        CASE WHEN x.day_ok THEN d.corrections_out END AS corrections_out,
-       CASE WHEN x.day_ok THEN d.reported_eod END AS reported_eod, CASE WHEN x.day_ok THEN d.known_eod END AS known_eod,
-       CASE WHEN x.day_ok THEN d.reported_change END AS reported_change, CASE WHEN x.day_ok THEN d.residual END AS residual,
+       CASE WHEN x.sample_ok THEN d.reported_eod END AS reported_eod, CASE WHEN x.sample_ok THEN d.known_eod END AS known_eod,
+       CASE WHEN x.sample_ok THEN d.reported_change END AS reported_change, CASE WHEN x.sample_ok THEN d.residual END AS residual,
        CASE WHEN x.day_ok THEN d.messages END AS messages, CASE WHEN x.day_ok THEN d.active_users END AS active_users,
-       CASE WHEN NOT x.day_ok THEN 'day' WHEN NOT x.short_ok THEN 'short_stays' END AS withheld,
+       CASE WHEN NOT x.day_ok THEN 'day' WHEN NOT x.sample_ok THEN 'samples' WHEN NOT x.short_ok THEN 'short_stays' END AS withheld,
        tg.window_flags(d.chat_id, tstzrange(d.day::timestamp AT TIME ZONE 'UTC', (d.day + 1)::timestamp AT TIME ZONE 'UTC')) AS flags
 FROM stats.v_chat_day d CROSS JOIN ctx
 CROSS JOIN LATERAL (SELECT ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS day_ok,
+                           (ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of)
+                             AND (d.sample_at IS NULL OR d.sample_at <= ctx.as_of) AS sample_ok,
                            ctx.is_current OR (d.day + 3)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS short_ok) x
 WHERE d.chat_id = ANY (:'scope_ids'::bigint[])
   AND d.day >= (:'since_ts'::timestamptz AT TIME ZONE 'UTC')::date AND d.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
@@ -476,7 +481,8 @@ SELECT :'only' IN ('all', '11') AS run \gset
 \echo == 11. channel and its discussion group
 -- Q: what share of a channel's subscribers is in its discussion group, how many group members do not
 -- subscribe, and who of the group is active (wrote in the last active_days)? Counts of members come from
--- the pair matrix stats.overlap (R2); the active ones are checked live. The daily activity counts have no
+-- the pair matrix stats.overlap (R2, as of its own refresh time, the as_of column); the active ones are checked
+-- live, and who is a member of the group or a subscriber is read at as_of, not today. The daily activity counts have no
 -- time of day: when as_of is earlier than the last update ingest committed, only complete UTC days up to
 -- activity_through count (the day of as_of is partly over and its messages may come after as_of).
 :explain
@@ -498,12 +504,13 @@ WITH pair AS (
 ), active AS (
   SELECT p.channel_id, a.user_id,
          EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.channel_id AND m.user_id = a.user_id
-                 AND m.end_source IS NULL) AS subscribed
+                 AND m.stay @> :'as_of_ts'::timestamptz) AS subscribed
   FROM pair p
   JOIN tg.activity_daily a ON a.chat_id = p.group_id
    AND a.day > (SELECT last_day FROM lim) - :active_days AND a.day <= (SELECT last_day FROM lim)
   JOIN tg.tg_user u ON u.user_id = a.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
-  WHERE EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.group_id AND m.user_id = a.user_id AND m.end_source IS NULL)
+  WHERE EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.group_id AND m.user_id = a.user_id
+                AND m.stay @> :'as_of_ts'::timestamptz)
   GROUP BY p.channel_id, a.user_id
 )
 SELECT p.channel_id, p.channel, p.group_id, p.group_title, c.subscribers, c.group_members, c.in_both,

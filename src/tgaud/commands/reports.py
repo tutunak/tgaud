@@ -135,6 +135,20 @@ def _since_window(as_of: dt.datetime, since: dt.datetime) -> Window:
     return Window(since, as_of)
 
 
+def _activity_window(conn: psycopg.Connection, as_of: dt.datetime, days: int) -> Window:
+    """The period the activity counts of block 11 cover, from the same UTC day boundaries as its SQL: the last
+    `days` UTC days up to last_day, which is the day of as_of when the data is current (as_of is not before the
+    last update ingest committed; the window then ends at as_of) and the day before when it is not (the day of
+    as_of is partly over; the window ends at that day's end)."""
+    horizon = conn.execute("SELECT max(last_poll_ok_at) FROM tg.bot_state").fetchone()[0]
+    today = as_of.astimezone(UTC).date()
+    current = horizon is None or as_of >= horizon
+    last_day = today if current else today - dt.timedelta(days=1)
+    start = dt.datetime.combine(last_day - dt.timedelta(days=days - 1), dt.time(), UTC)
+    end = as_of if current else dt.datetime.combine(last_day + dt.timedelta(days=1), dt.time(), UTC)
+    return Window(start, end)
+
+
 def _with_discussion_groups(conn: psycopg.Connection, scope: list[int]) -> list[int]:
     """The scope and the tracked discussion groups linked to its channels (item 11 reads both)."""
     groups = conn.execute("SELECT g.chat_id FROM tg.chat ch JOIN tg.chat g ON g.chat_id = ch.linked_chat_id AND g.tracked "
@@ -164,7 +178,7 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
             if spec.block == "11":  # the table also reads each channel's discussion group and its activity
                 header_scope = _with_discussion_groups
                 days = params.get("active_days", 30)
-                window = lambda as_of, _since: Window(as_of - dt.timedelta(days=days), as_of)  # noqa: E731
+                window = lambda as_of, _since: _activity_window(conn, as_of, days)  # noqa: E731
             elif spec.window == "raid":
                 hours = params.get("raid_hours", 24)
                 window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=hours), as_of)  # noqa: E731

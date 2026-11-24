@@ -376,7 +376,17 @@ def test_erasing_a_link_creator_keeps_every_link_id_and_attribution(cli_for, fre
     assert cli_for(fresh_db).run("forget-user", str(u2), "--yes").code == 0
     assert q(fresh_db, "SELECT invite_link_id, creator_id, campaign_id, masked_link FROM tg.invite_link "
                        "WHERE invite_link_id IN (%s, %s) ORDER BY invite_link_id", (l1, l2)) == [
-        (l1, None, 1, "https://t.me/+Dd…"), (l2, 9100, 2, "https://t.me/+Dd…")]  # no twin without a creator: plain NULL
+        (l1, None, 1, f"https://t.me/+Dd… #{l1}"), (l2, 9100, 2, "https://t.me/+Dd…")]
+    # ingest, processing a delayed update of that link, resolves its erased creator to "none": the upsert on
+    # (chat, masked text, creator) must open a link of unknown origin and touch neither existing link
+    with psycopg.connect(fresh_db) as c:
+        late = c.execute("INSERT INTO tg.invite_link AS l (chat_id, masked_link, creator_id, name) VALUES (%s, 'https://t.me/+Dd…', NULL, 'late') "
+                         "ON CONFLICT (chat_id, masked_link, creator_id) WHERE link_digest IS NULL DO UPDATE SET name = excluded.name "
+                         "RETURNING invite_link_id, campaign_id", (B,)).fetchone()
+        c.commit()
+    assert late[0] not in (l1, l2) and late[1] is None
+    assert q(fresh_db, "SELECT name, campaign_id FROM tg.invite_link WHERE invite_link_id IN (%s, %s) ORDER BY invite_link_id", (l1, l2)) == [
+        ("first", 1), ("second", 2)]
     assert q(fresh_db, "SELECT invite_link_id FROM tg.membership WHERE user_id = 8888000555") == [(l1,)]
     assert q(fresh_db, "SELECT DISTINCT invite_link_id FROM tg.member_event WHERE user_id = 8888000555") == [(l1,)]
 
@@ -447,3 +457,34 @@ def test_a_failing_rollup_refresh_after_the_erasure_is_reported_and_repeatable(c
     monkeypatch.setattr(audience, "refresh", real)
     assert cli_for(fresh_db).run("forget-user", str(U), "--yes").code == 0
     assert ids_found(fresh_db, U) == []
+
+
+def test_an_older_repeatable_read_collector_transaction_cannot_restore_an_erased_person(fresh_db):
+    """The page's trigger cannot see an erasure committed after its transaction began unless it reads fresh: pages
+    are refused above READ COMMITTED, and an older READ COMMITTED transaction is skipped on a fresh read."""
+    build_person(fresh_db)
+    erase = psycopg.connect(fresh_db)
+    erase.execute("SELECT tg.forget_user(%s)", (U,))  # not committed yet
+    older = psycopg.connect(fresh_db)
+    older.isolation_level = psycopg.IsolationLevel.REPEATABLE_READ
+    older.execute("SET ROLE collect_writer")
+    snap = older.execute("INSERT INTO tg.snapshot (chat_id, started_at, method) VALUES (%s, '2026-11-23 11:00+00', 'listing') "
+                         "RETURNING snapshot_id", (B,)).fetchone()[0]
+    older.execute("SELECT count(*) FROM tg.snapshot")  # its snapshot is taken now, before the erasure commits
+    older_rc = psycopg.connect(fresh_db)
+    older_rc.execute("SET ROLE collect_writer")
+    older_rc.execute("SELECT count(*) FROM tg.snapshot")
+    erase.commit()
+    erase.close()
+    page = ("INSERT INTO tg.snapshot_member (snapshot_id, user_id, seen_at, username) VALUES (%s, %s, '2026-11-23 11:01+00', 'gone')")
+    with pytest.raises(psycopg.errors.InvalidTransactionState, match="READ COMMITTED"):
+        older.execute(page, (snap, U))
+    older.rollback()
+    older.close()
+    snap_rc = older_rc.execute("INSERT INTO tg.snapshot (chat_id, started_at, method) VALUES (%s, '2026-11-23 11:00+00', 'listing') "
+                               "RETURNING snapshot_id", (B,)).fetchone()[0]
+    older_rc.execute(page, (snap_rc, U))  # an older READ COMMITTED transaction: the statement reads fresh and skips it
+    older_rc.commit()
+    older_rc.close()
+    assert q(fresh_db, "SELECT count(*) FROM tg.snapshot_member WHERE user_id = %s", (U,)) == [(0,)]
+    assert q(fresh_db, "SELECT count(*) FROM tg.snapshot_member WHERE snapshot_id IN (%s, %s)", (snap, snap_rc)) == [(0,)]

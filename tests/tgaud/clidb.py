@@ -43,10 +43,17 @@ def copy_db(pg, source_dsn: str) -> str:
     return pg.tenant_dsn(name)
 
 
+def record_chat_day_run(c: psycopg.Connection, as_of: dt.datetime) -> None:
+    """The row the chat_day job writes at the end of a cycle: the cutoff the rollup rows were computed with."""
+    c.execute("INSERT INTO stats.rollup_run (rollup, started_at, finished_at, as_of, row_count) "
+              "VALUES ('chat_day', now(), now(), %s, 0)", (as_of,))
+
+
 def run_rollups(dsn: str, as_of: dt.datetime = NOW) -> None:
     with psycopg.connect(dsn) as c:
         chats = [r[0] for r in c.execute("SELECT chat_id FROM tg.chat WHERE tracked ORDER BY chat_id")]
         rollups.refresh_chat_days(c, chats, as_of)
+        record_chat_day_run(c, as_of)
         c.commit()
         audience.refresh(c, as_of)
 

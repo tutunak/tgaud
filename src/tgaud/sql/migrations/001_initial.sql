@@ -734,22 +734,32 @@ $$;
 -- The order of the spells of one person in one chat that start at the same instant (join, leave, join in one
 -- second), as a bigint[] {update_id, rank, membership_id} that compares lexicographically. Replay order is
 -- (event_at, update_id), events before sightings before probes (design.md 4). An exact spell is ordered by its
--- join event. An inferred start (E6, E9) has no join event of its own: the function replays the events of
--- that instant the way the rebuild does (an open stay is closed by an exit and by an out -> out event, opened by
--- a join; an exit or an in -> in event with no stay open opens an inferred stay) and gives each inferred stay the
--- update id of the event that opened it (the k-th inferred opening for the k-th inferred stay by id: stays of
--- one kind are interchangeable for every count). Snapshot starts follow the events (rank 2), probes follow
--- those (rank 3). Callers compare two stays of the same instant: tg.spell_order(a) < tg.spell_order(b).
+-- join event. An inferred start (E6, E9) has no join event of its own: the function replays the events of that
+-- instant the way the rebuild does (a join opens an exact stay; an exit or an in -> in event with no stay open
+-- opens an inferred one; an exit, a join over an open stay or an out -> out event closes one) and so knows, for
+-- each inferred stay of the replay, the update id of the event that opened it and how it ended: closed by an
+-- exit event (that event's update id), closed by inference (-1), or not at all within that instant (0). The
+-- stored spell is matched to its replayed stay by that ending (its left event, or left_before = the instant, or
+-- later), so it is the provenance of a stored stay, never the order of the membership ids, that decides; only
+-- stays with the very same ending (several inferred closes) fall back to the order of their ids, and those are
+-- interchangeable for every count. Snapshot starts follow the events (rank 2), probes follow those (rank 3).
+-- Callers compare two stays of the same instant: tg.spell_order(a) < tg.spell_order(b).
 CREATE FUNCTION tg.spell_order(p_membership_id bigint) RETURNS bigint[]
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
   s record;
   e record;
-  v_open boolean;
-  v_inferred bigint[] := '{}';
+  v_kind text;                       -- the stay open during the replay: none | exact | inferred
+  v_cur integer := 0;                -- its index in the arrays, when inferred
+  v_opener bigint[] := '{}';         -- inferred stays of the replay: the opening event's update id ...
+  v_closer bigint[] := '{}';         -- ... and how it ended: an exit's update id, -1 by inference, 0 not within the instant
+  v_key bigint;
   v_k integer;
+  v_i integer;
+  v_seen integer := 0;
 BEGIN
-  SELECT m.chat_id, m.user_id, m.known_from, m.start_source, m.join_event_id, m.joined_at INTO s
+  SELECT m.chat_id, m.user_id, m.known_from, m.start_source, m.join_event_id, m.joined_at, m.end_source,
+         m.left_event_id, m.left_at, m.left_before INTO s
     FROM tg.membership m WHERE m.membership_id = p_membership_id;
   IF NOT FOUND THEN
     RETURN NULL;
@@ -762,28 +772,57 @@ BEGIN
   ELSIF s.start_source = 'probe' THEN
     RETURN ARRAY[9223372036854775807, 3, p_membership_id];
   END IF;
-  v_open := EXISTS (SELECT 1 FROM tg.membership x
-                     WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from < s.known_from
-                       AND (x.left_before IS NULL OR x.left_before >= s.known_from));
+  v_kind := CASE WHEN EXISTS (SELECT 1 FROM tg.membership x
+                               WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from < s.known_from
+                                 AND (x.left_before IS NULL OR x.left_before >= s.known_from))
+                 THEN 'exact' ELSE 'none' END;
   FOR e IN SELECT x.update_id, x.kind FROM tg.member_event x
             WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.event_at = s.known_from
             ORDER BY x.update_id LOOP
     IF e.kind = 'join' THEN
-      v_open := true;                                           -- E1, E2, E4: an exact stay is open now
+      IF v_kind = 'inferred' THEN v_closer[v_cur] := -1; END IF;      -- E4: the old stay ends by inference
+      v_kind := 'exact';
     ELSIF e.kind IN ('ban_out', 'unban', 'out_change') THEN
-      v_open := false;                                          -- E10 closes an open stay, E11 changes nothing
+      IF v_kind = 'inferred' THEN v_closer[v_cur] := -1; END IF;      -- E10 closes, E11 changes nothing
+      v_kind := 'none';
     ELSIF e.kind IN ('leave', 'kick', 'restrict_out') THEN
-      IF NOT v_open THEN v_inferred := v_inferred || e.update_id; END IF;   -- E6, E7: inferred, closed at once
-      v_open := false;
-    ELSE
-      IF NOT v_open THEN v_inferred := v_inferred || e.update_id; END IF;   -- E9: a missed join
-      v_open := true;
+      IF v_kind = 'none' THEN                                         -- E6, E7: inferred, closed by this event
+        v_opener := v_opener || e.update_id;
+        v_closer := v_closer || e.update_id;
+      ELSIF v_kind = 'inferred' THEN
+        v_closer[v_cur] := e.update_id;                               -- E5
+      END IF;
+      v_kind := 'none';
+    ELSIF v_kind = 'none' THEN                                        -- E9: a missed join opens an inferred stay
+      v_opener := v_opener || e.update_id;
+      v_closer := v_closer || 0::bigint;
+      v_cur := cardinality(v_opener);
+      v_kind := 'inferred';
     END IF;
   END LOOP;
-  SELECT count(*) + 1 INTO v_k FROM tg.membership x
+  -- how this stored stay ended, in the replay's terms
+  v_key := CASE WHEN s.end_source IS NULL OR s.left_before > s.known_from THEN 0
+                WHEN s.left_event_id IS NOT NULL AND s.left_at = s.known_from
+                  THEN coalesce((SELECT x.update_id FROM tg.member_event x
+                                  WHERE x.event_id = s.left_event_id AND x.event_at = s.left_at), -1)
+                ELSE -1 END;
+  SELECT count(*) + 1 INTO v_k FROM tg.membership x            -- among stays with the same ending: by id
    WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from = s.known_from
-     AND x.start_source = 'inferred' AND x.membership_id < p_membership_id;
-  RETURN ARRAY[coalesce(v_inferred[least(v_k, cardinality(v_inferred))], 9223372036854775807), 1, p_membership_id];
+     AND x.start_source = 'inferred' AND x.membership_id < p_membership_id
+     AND (CASE WHEN x.end_source IS NULL OR x.left_before > x.known_from THEN 0
+               WHEN x.left_event_id IS NOT NULL AND x.left_at = x.known_from
+                 THEN coalesce((SELECT y.update_id FROM tg.member_event y
+                                 WHERE y.event_id = x.left_event_id AND y.event_at = x.left_at), -1)
+               ELSE -1 END) = v_key;
+  FOR v_i IN 1 .. cardinality(v_opener) LOOP
+    IF v_closer[v_i] = v_key THEN
+      v_seen := v_seen + 1;
+      IF v_seen = v_k THEN
+        RETURN ARRAY[v_opener[v_i], 1, p_membership_id];
+      END IF;
+    END IF;
+  END LOOP;
+  RETURN ARRAY[9223372036854775807, 1, p_membership_id];             -- the stored stays do not match the replay
 END $$;
 REVOKE EXECUTE ON FUNCTION tg.spell_order(bigint) FROM PUBLIC;
 
@@ -830,13 +869,13 @@ WITH g AS (
     SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
     FROM tg.membership s
     WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= e.draw_at
-    ORDER BY s.known_from DESC, tg.spell_order(s.membership_id) DESC
+    ORDER BY (s.stay @> e.draw_at) DESC, s.known_from DESC, tg.spell_order(s.membership_id) DESC
     LIMIT 1) d ON true
   LEFT JOIN LATERAL (                                      -- the latest spell that had started by as_of
     SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
     FROM tg.membership s
     WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= p_as_of
-    ORDER BY s.known_from DESC, tg.spell_order(s.membership_id) DESC
+    ORDER BY (s.stay @> p_as_of) DESC, s.known_from DESC, tg.spell_order(s.membership_id) DESC
     LIMIT 1) n ON true
 ), flagged AS (
   SELECT o.*,
@@ -992,13 +1031,13 @@ BEGIN
   UPDATE tg.member_event SET actor_id = NULL WHERE actor_id = p_user_id;
   UPDATE tg.join_request SET resolved_by = NULL WHERE resolved_by = p_user_id;
   UPDATE tg.snapshot_member SET inviter_id = NULL WHERE inviter_id = p_user_id;
-  -- A creator is cleared on its own row, so no link id, campaign or reference of anyone else changes. Masked
-  -- links of one chat can share their redacted text and differ only in the creator (unique index
-  -- invite_link_masked): when another row already has that text and no creator, the text gets the row's id.
-  FOR r IN SELECT l.invite_link_id, l.chat_id, l.masked_link FROM tg.invite_link l WHERE l.creator_id = p_user_id LOOP
-    IF r.masked_link IS NOT NULL AND EXISTS (SELECT 1 FROM tg.invite_link x
-                                              WHERE x.chat_id = r.chat_id AND x.masked_link = r.masked_link
-                                                AND x.creator_id IS NULL AND x.link_digest IS NULL) THEN
+  -- A creator is cleared on its own row, so no link id, campaign or reference of anyone else changes. A masked
+  -- link (the redacted text is all the Bot API shows of other admins' links, and two links can share it) gets
+  -- its id appended: its identity was (chat, text, creator), and with the creator gone a later update for the
+  -- same text, which ingest resolves to "no creator", must open a link of unknown origin, not match and
+  -- rename this one or its twin. Bot-made links are found by their digest and keep it.
+  FOR r IN SELECT l.invite_link_id, l.masked_link FROM tg.invite_link l WHERE l.creator_id = p_user_id LOOP
+    IF r.masked_link IS NOT NULL THEN
       UPDATE tg.invite_link SET creator_id = NULL, masked_link = masked_link || ' #' || invite_link_id
        WHERE invite_link_id = r.invite_link_id;
     ELSE

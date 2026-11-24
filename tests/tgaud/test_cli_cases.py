@@ -8,7 +8,7 @@ import datetime as dt
 import psycopg
 import pytest
 from clidb import A, NOW_ARG, UTC, Builder, cli_for, fresh_db, report_db, ts  # noqa: F401
-from clidb import copy_db
+from clidb import copy_db, record_chat_day_run
 
 from tgaud import rollups, sql
 
@@ -120,6 +120,37 @@ def cases_db(pg, report_db):
         c.execute("UPDATE tg.chat SET linked_chat_id = %s WHERE chat_id = %s", (ch, gp))
         b.stay(gp, 4801, ts("2026-11-01 10:00"), update_id=8000)
         c.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, 4801, '2026-11-12', 1)", (gp,))
+        # the stays of the group and the channel at a cutoff: two members wrote on 11-19; one left the group on 11-20
+        # 15:00 and the channel on 11-21, both after the noon cutoff of the test
+        b.stay(gp, 4802, ts("2026-11-01 10:00"), update_id=8010)
+        b.stay(gp, 4803, ts("2026-11-01 10:00"), ts("2026-11-20 15:00"), update_id=8020)
+        b.stay(ch, 4802, ts("2026-11-02 10:00"), update_id=8030)
+        b.stay(ch, 4803, ts("2026-11-02 10:00"), ts("2026-11-21 10:00"), update_id=8040)
+        c.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, 4802, '2026-11-19', 2), "
+                  "(%s, 4803, '2026-11-19', 1)", (gp, gp))
+        c.execute("INSERT INTO tg.gap (chat_id, period, reason) VALUES (%s, tstzrange('2026-11-19 04:00+00', '2026-11-19 08:00+00'), 'rights_lost')", (gp,))
+        # a count sample of Z after the noon cutoff of the growth test
+        c.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events) "
+                  "VALUES (%s, '2026-11-12 20:00+00', 222, 5, 0)", (z,))
+        # a late exit at the second of an inferred stay: exact join and exit at 08:00/08:30, then at 09:00 an exit
+        # (update 4: E6, a stay closed at once) and a promotion (update 5: E9, an open stay). The open stay has the
+        # smaller membership id in the first chat and the larger one in the second.
+        for chat, title, open_first in [(-1003000000090, "late exit F1", True), (-1003000000091, "late exit F2", False)]:
+            f = b.chat(chat, title)
+            first = b.stay(f, 4901, ts("2026-11-10 08:00"), ts("2026-11-10 08:30"), update_id=100)
+            assert first
+            e104 = b.event(f, 4901, T, "member", "left", 104)
+            b.event(f, 4901, T, "member", "administrator", 105)
+            if open_first:
+                b.spell(f, 4901, T)
+                b.spell(f, 4901, T, left_at=T, left_ev=e104)
+            else:
+                b.spell(f, 4901, T, left_at=T, left_ev=e104)
+                b.spell(f, 4901, T)
+        c.execute("INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at) VALUES "
+                  "('late exit', 'giveaway', 'annotation', '2026-11-10 00:00+00', '2026-11-12 00:00+00') RETURNING campaign_id")
+        c.execute("INSERT INTO tg.campaign_chat SELECT campaign_id, chat_id FROM tg.campaign, tg.chat "
+                  "WHERE name = 'late exit' AND chat_id IN (-1003000000090, -1003000000091)")
         # a gap and a poor coverage for the header cases
         c.execute("INSERT INTO tg.gap (chat_id, period, reason) VALUES (%s, tstzrange('2026-11-12 00:00+00', '2026-11-13 00:00+00'), 'not_admin')", (gp,))
         c.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events) "
@@ -127,6 +158,7 @@ def cases_db(pg, report_db):
         # the rollup for the new chats, as the job would have made it
         new = [r[0] for r in c.execute("SELECT chat_id FROM tg.chat WHERE tracked AND chat_id < -1002999999999 ORDER BY chat_id")]
         rollups.refresh_chat_days(c, new, ts("2026-11-23 12:00"))
+        record_chat_day_run(c, ts("2026-11-23 12:00"))
         c.commit()
     return dsn
 
@@ -138,7 +170,7 @@ def cases(cli_for, cases_db):
 
 def campaign_ids(dsn):
     with psycopg.connect(dsn) as c:
-        return dict(c.execute("SELECT name, campaign_id FROM tg.campaign WHERE name IN ('only new', 'everyone', 'five events', 'multi')").fetchall())
+        return dict(c.execute("SELECT name, campaign_id FROM tg.campaign WHERE name IN ('only new', 'everyone', 'five events', 'multi', 'late exit')").fetchall())
 
 
 # ------------------------------------------------------------------------------------------------------
@@ -364,5 +396,55 @@ def test_the_discussion_header_covers_the_group_and_the_activity_window(cases):
     assert out.code == 0, out.err
     head = out.out.partition("\n\n")[0]
     assert "chats in scope: 2" in head and "disc channel" in head and "disc group" in head
-    assert "window 2026-10-24" in head and "gap:not_admin" in head  # the gap of the group, 11-12, lies in the window
+    assert "window 2026-10-25 00:00:00 UTC .. 2026-11-23 12:00:00 UTC" in head  # 30 UTC days, the last one to as_of
+    assert "gap:not_admin" in head  # the gap of the group, 11-12, lies in the window
     assert "window: none" not in head
+
+
+# ------------------------------------------------------------------------------------------------------
+# Review round 2
+# ------------------------------------------------------------------------------------------------------
+
+
+def test_a_late_exit_with_a_smaller_update_id_does_not_put_the_closed_stay_after_the_open_one(cases, cases_db):
+    """Exit (update 104) and promotion (105) in one second: the closed inferred stay is the earlier one, in either
+    order of the membership ids; the stay open at the draw and at as_of is the promotion's."""
+    rows = cases.rows("campaign", "report", str(campaign_ids(cases_db)["late exit"]), "--entrants")
+    assert {r["chat_id"] for r in rows} == {"-1003000000090", "-1003000000091"}
+    for r in rows:
+        assert (r["first_time"], r["quick_exit"], r["at_draw"], r["still_in"]) == ("true", "yes", "in", "in"), r
+    with psycopg.connect(cases_db) as c:
+        for chat in (-1003000000090, -1003000000091):
+            order = c.execute("SELECT left_at IS NOT NULL FROM tg.membership WHERE chat_id = %s AND start_source = 'inferred' "
+                              "ORDER BY tg.spell_order(membership_id)", (chat,)).fetchall()
+            assert order == [(True,), (False,)], chat  # closed first, open last
+
+
+def test_growth_withholds_a_day_with_a_count_sample_after_as_of(cases):
+    z = str(-1003000000020)  # a count sample of 222 at 11-12 20:00
+    noon = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-12T12:00:00+00:00"), day="2026-11-12")
+    assert noon["reported_eod"] == "" and noon["residual"] == "" and noon["withheld"] == "day"
+    next_day = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-13T12:00:00+00:00"), day="2026-11-12")
+    assert next_day["reported_eod"] == "222" and next_day["known_eod"] == "5"  # the day is over: its sample is known
+    now = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01"), day="2026-11-12")
+    assert now["reported_eod"] == "222"
+
+
+def test_discussion_reads_membership_at_the_cutoff_not_today(cases):
+    """Two members of the group wrote on 11-19; one left the group on 11-20 15:00 and the channel on 11-21."""
+    row = pick(cases.rows("discussion", "--among", "disc channel", "--active-days", "1",
+                          as_of="2026-11-20T12:00:00+00:00"), channel_id=-1003000000080)
+    assert (row["active_in_group"], row["active_subscribers"], row["active_non_subscribers"]) == ("2", "2", "0")
+    assert row["activity_through"] == "2026-11-19"
+    now = pick(cases.rows("discussion", "--among", "disc channel", "--active-days", "1"), channel_id=-1003000000080)
+    assert now["active_in_group"] == "0"  # today nobody wrote and the cutoff is now
+
+
+def test_the_discussion_header_window_has_the_boundaries_of_the_activity_days(cases):
+    out = cases.run("discussion", "--among", "disc channel", "--active-days", "1", "--as-of", "2026-11-20T12:00:00+00:00")
+    assert out.code == 0, out.err
+    head = out.out.partition("\n\n")[0]
+    assert "window 2026-11-19 00:00:00 UTC .. 2026-11-20 00:00:00 UTC" in head  # all of the day the table counts
+    assert "gap:rights_lost" in head and "gap:not_admin" not in head  # the group's 04:00-08:00 gap, not the 11-12 one
+    now = cases.run("discussion", "--among", "disc channel", "--active-days", "1", "--as-of", NOW_ARG)
+    assert "window 2026-11-23 00:00:00 UTC .. 2026-11-23 12:00:00 UTC" in now.out.partition("\n\n")[0]
