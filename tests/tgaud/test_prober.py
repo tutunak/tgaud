@@ -139,7 +139,6 @@ def test_one_chat_gets_at_most_half_while_others_wait(env):
     # a manual probe of the busy chat skips its share: it is the next call
     queue(e, 500, "manual")
     e.w.c.commit()
-    e.clock.advance(prober.REFRESH)
     n = len(calls)
     e.run(p, 0.5)
     assert asked(e)[n] == (CHAT, 500)
@@ -210,7 +209,7 @@ def test_backoff_waits_exactly(env):
     gaps = [b - a for a, b in zip(seen, seen[1:])]
     assert len(seen) == 4
     for gap, backoff in zip(gaps, prober.BACKOFF):
-        assert backoff <= gap <= backoff + prober.REFRESH + 1, (gaps, prober.BACKOFF)
+        assert backoff <= gap <= backoff + prober.IDLE_REFRESH + 1, (gaps, prober.BACKOFF)
     assert probe_row(e, pid)["outcome"] == "error"
 
 
@@ -382,7 +381,7 @@ def test_m1_during_an_in_flight_probe_drops_the_old_answer(env):
     assert spells(e, 1, CHAT) == []
     # the re-keyed probe is asked for the new chat next
     e.fake.respond("getChatMember", lambda params: {"status": "member"})
-    e.clock.advance(prober.REFRESH)
+    e.clock.advance(1)
     e.run(p, 1)
     assert asked(e)[-1] == (new, 1) and probe_row(e, pid)["outcome"] == "in"
 
@@ -416,10 +415,11 @@ def _ingest_join(dsn: str, user: int, t: datetime, update_id: int) -> None:
         history.rebuild_pairs(c, [(CHAT, user)])
 
 
-def test_out_held_across_a_join_committed_first_is_not_stored_and_is_asked_again(env):
+@pytest.mark.parametrize("reason", ["manual", "conflict"])
+def test_out_held_across_a_join_committed_first_is_not_stored_and_is_asked_again(env, reason):
     e = env
     e.w.user(1)
-    pid = queue(e, 1, "conflict")
+    pid = queue(e, 1, reason)
     e.w.c.commit()
     sent, go = _held(e, "left")
     p = prober.make(e.ctx)
@@ -436,18 +436,21 @@ def test_out_held_across_a_join_committed_first_is_not_stored_and_is_asked_again
     (s,) = spells(e, 1)
     assert (s.start_source, s.joined_at, s.end_source) == ("event", event_at, None)
     e.fake.respond("getChatMember", lambda params: {"status": "member"})
-    e.clock.advance(prober.REFRESH)
+    e.clock.advance(1)
     e.run(p, 1)
-    assert probe_row(e, pid)["outcome"] == "in" and len(asked(e)) == 2
+    row = probe_row(e, pid)
+    assert (row["outcome"], row["reason"]) == ("in", reason) and len(asked(e)) == 2
 
 
-def test_out_committed_before_a_join_inside_its_call_is_ignored_by_the_rebuild(env):
+@pytest.mark.parametrize("reason", ["manual", "conflict"])
+def test_out_committed_before_a_join_inside_its_call_is_ignored_and_asked_again(env, reason):
     e = env
     e.w.user(1)
-    pid = queue(e, 1, "conflict")
+    pid = queue(e, 1, reason)
     e.w.c.commit()
     sent, go = _held(e, "left")
-    t = _step_in_thread(e, prober.make(e.ctx))
+    p = prober.make(e.ctx)
+    t = _step_in_thread(e, p)
     assert sent.wait(10)
     e.clock.advance(3)
     go.set()
@@ -456,17 +459,91 @@ def test_out_committed_before_a_join_inside_its_call_is_ignored_by_the_rebuild(e
     row = probe_row(e, pid)
     assert row["outcome"] == "out" and row["sent_at"] == START.replace(microsecond=0)
     assert spells(e, 1) == []  # an out with nothing open changes nothing
-    # the join happened during the call and arrives later (a late update)
+    # the join happened during the call and arrives later (a late update): the rebuild ignores the answer and the
+    # trigger queues the same question again, in the join's transaction
     _ingest_join(e.dsn, 1, START.replace(microsecond=0) + timedelta(seconds=1), 910002)
     (s,) = spells(e, 1)
     assert (s.start_source, s.end_source) == ("event", None)  # the straddling "out" never closes it
-    # without the straddle the same answer would close the spell
     with psycopg.connect(e.dsn) as c:
-        c.execute("UPDATE tg.probe SET sent_at = answered_at WHERE probe_id = %s", (pid,))
-        history.rebuild_pairs(c, [(CHAT, 1)])
-        assert c.execute("SELECT end_source FROM tg.membership WHERE chat_id = %s AND user_id = 1",
-                         (CHAT,)).fetchone()[0] == "probe"
+        again = c.execute("SELECT probe_id, reason, queued_at FROM tg.probe WHERE chat_id = %s AND user_id = 1 "
+                          "AND outcome = 'pending'", (CHAT,)).fetchall()
+    assert len(again) == 1 and again[0][1:] == (reason, probe_row(e, pid)["queued_at"])
+    assert probe_row(e, pid)["outcome"] == "out"  # the answered row stays as history ignores it
+    # the second call
+    e.fake.respond("getChatMember", lambda params: {"status": "member"})
+    e.clock.advance(1)
+    e.run(p, 1)
+    assert len(asked(e)) == 2
+    assert probe_row(e, again[0][0])["outcome"] == "in"
+    (s,) = spells(e, 1)
+    assert s.end_source is None and s.last_confirmed_at == probe_row(e, again[0][0])["answered_at"]
+
+
+def test_the_requeue_trigger_keeps_one_pending_probe_and_rolls_back_with_the_event(env):
+    e = env
+    w = e.w
+    w.user(1)
+    w.user(2)
+    sent = START - timedelta(seconds=10)
+    old1 = w.probe(1, sent + timedelta(seconds=2), "out", sent=sent, reason="outage")
+    w.probe(2, sent + timedelta(seconds=2), "in", sent=sent, reason="manual")
+    pending2 = queue(e, 2, "sample")  # a probe of the pair is already pending: it asks the question
+    w.c.commit()
+    with psycopg.connect(e.dsn) as c:  # an event inside both calls whose transaction rolls back: nothing queued
+        history.lock_chats(c, [CHAT])
+        for u, upd in ((1, 920001), (2, 920002)):
+            c.execute("""INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status)
+                         VALUES (%s, %s, %s, %s, 'left', 'member')""", (CHAT, u, sent + timedelta(seconds=1), upd))
+        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending'").fetchone()[0] == 2
         c.rollback()
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending'").fetchone()[0] == 1
+    _ingest_join(e.dsn, 1, sent + timedelta(seconds=1), 920003)
+    _ingest_join(e.dsn, 2, sent + timedelta(seconds=1), 920004)
+    _ingest_join(e.dsn, 1, sent + timedelta(seconds=5), 920005)  # outside the call: no new question
+    with psycopg.connect(e.dsn) as c:
+        rows = c.execute("SELECT user_id, reason, outcome FROM tg.probe WHERE outcome = 'pending' ORDER BY user_id"
+                         ).fetchall()
+    assert rows == [(1, "outage", "pending"), (2, "sample", "pending")]
+    assert probe_row(e, old1)["outcome"] == "out" and probe_row(e, pending2)["outcome"] == "pending"
+
+
+def test_a_conflict_of_another_chat_queued_during_a_backlog_is_asked_next(env):
+    e = env
+    e.w.add_chat(OTHER)
+    for u in range(1, 301):
+        queue(e, u, "sample")
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 3.0)  # the backlog is cached and draining with the whole budget
+    n = len(asked(e))
+    assert all(c == CHAT for c, _ in asked(e))
+    for u in range(1001, 1051):
+        queue(e, u, "conflict", chat=OTHER, queued=START)
+    e.w.c.commit()
+    e.run(p, 0.3)
+    assert asked(e)[n] == (OTHER, 1001)  # the very next call
+    e.run(p, 10.0)
+    later = asked(e)[n:]
+    a = sum(1 for c, _ in later if c == CHAT)
+    assert a <= len(later) / 2 + 3, (a, len(later))  # the busy chat is held to half while the other waits
+    assert [u for c, u in later if c == OTHER] == list(range(1001, 1001 + len(later) - a))
+
+
+def test_a_conflict_queued_after_the_read_goes_before_cached_lower_priority_probes(env):
+    e = env
+    for u in range(1, 101):
+        queue(e, u, "sample")
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 1.5)
+    n = len(asked(e))
+    queue(e, 500, "conflict", queued=START)
+    e.w.c.commit()
+    e.run(p, 0.3)
+    assert asked(e)[n] == (CHAT, 500)
 
 
 def test_no_transaction_is_open_during_the_call(env):

@@ -2,8 +2,10 @@
 
 Queue order: `manual` (the CLI) first, then `conflict`, `outage` (the newest open spell first), `snapshot_absent`,
 `sample`; ties by queued_at. Only probes that are ready are taken: never tried, or past the backoff of their
-last failure. The candidates are cached: a full read every FULL_REFRESH seconds or when the cache runs out, and a
-cheap read of new manual probes every REFRESH seconds in between.
+last failure. The candidates are cached: a full read every FULL_REFRESH seconds or when the cache runs out. Between
+full reads, every step first reads the heads of the queue (the oldest ready probes of each chat and reason, by the
+index probe_pending_reason) into the cache, after the cached ones of the same reason: a conflict or manual probe
+queued meanwhile, or a chat that starts waiting, is seen before the next tokens are spent.
 
 Budget: one global token bucket at `config.probe_rate` calls/s (TGAUD_PROBE_RATE, default 5; burst one second's
 worth). While other chats have ready probes, one chat gets at most half of the rate (its own bucket at rate/2);
@@ -22,8 +24,9 @@ Per probe, without a transaction open across the HTTP call:
      user the request was sent for (M1 re-keys rows, the CLI cancels a pending probe for its manual one);
      otherwise it is dropped;
   4. an exact event of the pair with sent_at <= event_at <= answered_at: the answer may describe either side, so
-     it is not stored and the probe stays pending (requeued; not an attempt). The other commit order (the answer
-     first, the event later) is history's rule: the rebuild ignores such an answer;
+     it is not stored and the probe stays pending (requeued; not an attempt). In the other commit order (the answer
+     first, the event later) the rebuild ignores the answer (history's rule) and the trigger
+     tg.probe_requeue_straddled (migration 005) queues the same question again in the event's transaction;
   5. the answer (outcome in/out, answered_at, sent_at, status) and rebuild_pairs for the pair (P1-P3) commit
      together.
 """
@@ -50,9 +53,9 @@ BACKOFF = (60.0, 600.0, 3600.0)  # seconds after the 1st, 2nd, 3rd failure; the 
 PRIORITY = ("manual", "conflict", "outage", "snapshot_absent", "sample")
 FULL_REFRESH = 120.0  # seconds between full candidate reads while the cache has work; a cache that runs out is read
 # again at once. The full read orders every pending probe (1-3 s at 100 000 outage probes), so it is not repeated often.
-REFRESH = 10.0  # seconds between the cheap reads of new manual probes (a manual probe waits at most this)
 IDLE_REFRESH = 5.0  # seconds between reads of an empty queue
 PER_CHAT = 600  # candidates read per chat: two minutes of the whole default budget
+PER_HEAD = 5  # ready probes read per chat and reason by each step's head read
 PER_STEP = 20  # probes per step
 STEP_SECONDS = 3.0  # and at most this long (wall time) per step
 STATUSES = frozenset({"creator", "administrator", "member", "restricted", "left", "kicked"})
@@ -61,9 +64,10 @@ _CANDIDATES = """
 WITH ready AS (
   SELECT p.probe_id, p.chat_id, p.user_id, p.reason, p.queued_at,
          array_position(%(priority)s::text[], p.reason) AS prio,
+         -- the pair's newest spell (the open one G1 queued it for): an index-only read of membership_pair
          CASE WHEN p.reason = 'outage' THEN
-           (SELECT m.known_from FROM tg.membership m
-             WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id AND m.end_source IS NULL) END AS spell_from
+           (SELECT max(m.known_from) FROM tg.membership m
+             WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id) END AS spell_from
   FROM tg.probe p
   WHERE p.outcome = 'pending'
     AND (p.attempts = 0 OR p.last_attempt_at IS NULL
@@ -74,15 +78,22 @@ WITH ready AS (
                                  ORDER BY r.prio, r.spell_from DESC NULLS LAST, r.queued_at, r.probe_id) AS rn
   FROM ready r
 )
-SELECT probe_id, chat_id, user_id, reason FROM ranked WHERE rn <= %(per_chat)s
+SELECT prio, probe_id, chat_id, user_id, reason FROM ranked WHERE rn <= %(per_chat)s
 ORDER BY prio, spell_from DESC NULLS LAST, queued_at, probe_id"""
 
-_MANUAL = """
-SELECT p.probe_id, p.chat_id, p.user_id, p.reason FROM tg.probe p
-WHERE p.outcome = 'pending' AND p.reason = 'manual'
-  AND (p.attempts = 0 OR p.last_attempt_at IS NULL
-       OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)]) <= %(now)s)
-ORDER BY p.queued_at, p.probe_id LIMIT 100"""
+# the heads: per chat and reason the oldest ready probes (one short index range each)
+_HEADS = """
+SELECT r.prio::int, h.probe_id, h.chat_id, h.user_id, r.reason
+FROM tg.chat c
+CROSS JOIN unnest(%(priority)s::text[]) WITH ORDINALITY AS r(reason, prio)
+CROSS JOIN LATERAL (
+  SELECT p.probe_id, p.chat_id, p.user_id FROM tg.probe p
+  WHERE p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending'
+    AND (p.attempts = 0 OR p.last_attempt_at IS NULL
+         OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)])
+            <= %(now)s)
+  ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s) h
+ORDER BY r.prio, h.chat_id, h.probe_id"""
 
 
 class TokenBucket:
@@ -127,7 +138,7 @@ class TokenBucket:
 
 @dataclass(frozen=True)
 class Candidate:
-    rank: int  # position in the queue order of the read that found it
+    key: tuple[int, int, int]  # queue order: (priority, 0 full read | 1 head read, position in that read)
     probe_id: int
     chat_id: int
     user_id: int
@@ -149,8 +160,7 @@ class Prober:
         self.chat_buckets: dict[int, TokenBucket] = {}
         self.queue: list[Candidate] = []
         self.next_read = now  # the full read
-        self.next_manual = now
-        self._manual_rank = -10**9  # manual probes found between full reads go before everything read
+        self._heads = 0  # positions of head-read candidates
 
     # --- scheduling --------------------------------------------------------------------------------------------
 
@@ -159,7 +169,7 @@ class Prober:
             return False
         if self.bucket.wait(now) > 0:
             return False
-        return now >= self.next_read or now >= self.next_manual or self._pick(now) is not None
+        return now >= self.next_read or self._pick(now) is not None
 
     def _chat_bucket(self, chat_id: int, now: float) -> TokenBucket:
         b = self.chat_buckets.get(chat_id)
@@ -185,7 +195,7 @@ class Prober:
         self._chat_bucket(cand.chat_id, now).take(now)  # counted even when the share did not apply
 
     def _requeue(self, cand: Candidate) -> None:
-        bisect.insort(self.queue, cand, key=lambda c: c.rank)
+        bisect.insort(self.queue, cand, key=lambda c: c.key)
 
     # --- the step -----------------------------------------------------------------------------------------------
 
@@ -193,8 +203,8 @@ class Prober:
         now = self.ctx.clock()
         if now >= self.next_read:
             self._read(conn, now)
-        elif now >= self.next_manual:
-            self._read_manual(conn, now)
+        else:
+            self._read_heads(conn, now)
         conn.commit()  # never hold a transaction (or the fence) across a Bot API call
         started = time.monotonic()
         done = 0
@@ -210,21 +220,21 @@ class Prober:
     def _read(self, conn: psycopg.Connection, now: float) -> None:
         rows = conn.execute(_CANDIDATES, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
                                           "steps": len(BACKOFF), "now": _utc(now), "per_chat": PER_CHAT}).fetchall()
-        self.queue = [Candidate(i, *r) for i, r in enumerate(rows)]
+        self.queue = [Candidate((r[0], 0, i), *r[1:]) for i, r in enumerate(rows)]
         self.next_read = now + (FULL_REFRESH if self.queue else IDLE_REFRESH)
-        self.next_manual = now + REFRESH
         known = {c.chat_id for c in self.queue}
         for chat_id in [c for c in self.chat_buckets if c not in known]:
             del self.chat_buckets[chat_id]  # idle chats start again with a full share
 
-    def _read_manual(self, conn: psycopg.Connection, now: float) -> None:
-        """Manual probes queued since the full read, in front of the queue (partial index probe_pending_manual)."""
-        self.next_manual = now + REFRESH
+    def _read_heads(self, conn: psycopg.Connection, now: float) -> None:
+        """Ready probes queued since the full read (and chats that started waiting), each after the cached probes
+        of its reason."""
         have = {c.probe_id for c in self.queue}
-        for row in conn.execute(_MANUAL, {"backoff": list(BACKOFF), "steps": len(BACKOFF), "now": _utc(now)}):
-            if row[0] not in have:
-                self._manual_rank += 1
-                self._requeue(Candidate(self._manual_rank, *row))
+        for prio, *rest in conn.execute(_HEADS, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
+                                                 "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD}):
+            if rest[0] not in have:
+                self._heads += 1
+                self._requeue(Candidate((prio, 1, self._heads), *rest))
 
     def probe(self, conn: psycopg.Connection, cand: Candidate) -> str:
         """Ask once and record the result; returns what happened (in, out, retry, error, late, dropped, 429)."""

@@ -173,7 +173,7 @@ def test_net_events_across_two_samples_and_a_late_join_gives_residual_zero(env):
     # ingest commits the updates, dated before the sample, then catches up past it
     w.join(4, t1 + timedelta(minutes=2))
     w.leave(1, t1 + timedelta(minutes=3))
-    w.join(5, t2)  # exactly at the sample time: inside (t1, t2]
+    w.join(5, t2.replace(microsecond=0) - timedelta(seconds=1))  # the second before the call: inside (t1, t2]
     w.join(6, t2 + timedelta(seconds=1))  # after it: the next interval
     w.rebuild()
     w.c.commit()
@@ -418,3 +418,125 @@ def test_join_requests_without_an_outcome_become_unknown_after_7_days(env):
     e.clock.advance(sampler.METRICS_EVERY + 86400)
     e.tick(job)
     assert report()[2:] == (2, 0) and value("tgaud_chat_join_requests_pending", CHAT) == 0
+
+
+# --- a count call that an exact transition falls into (review 1) -----------------------------------------------------
+
+@pytest.mark.parametrize("counted", [True, False], ids=["count-includes-the-join", "count-before-the-join"])
+def test_a_join_inside_the_count_call_withholds_the_residuals_on_both_sides(env, counted):
+    e = env
+    w = e.w
+    w.join(1, START - timedelta(days=1))
+    w.rebuild()
+    w.c.commit()
+    job = sampler.make(e.ctx)
+    e.tick(job)  # the schedule
+    caught_up(e, START - timedelta(days=1))
+    t1 = datetime.fromtimestamp(job.schedule[CHAT], timezone.utc)
+    reported = {CHAT: 10}
+    counts(e, reported)
+    sample_at(e, job, t1)
+
+    # the second call: a join happens (and ingest commits it) while getChatMemberCount is in flight
+    t2 = t1 + timedelta(seconds=INTERVAL)
+    join_at = t2.replace(microsecond=0) + timedelta(seconds=1)  # inside [floor(sent), reply]
+
+    def compute(params):
+        w.join(2, join_at)
+        w.rebuild()
+        w.c.commit()
+        e.clock.advance(1.5)  # the reply comes 1.5 s after the send
+        return 11 if counted else 10
+    e.fake.respond("getChatMemberCount", compute)
+    sample_at(e, job, t2)
+    # the third count after it: Telegram now has the join either way
+    t3 = t2 + timedelta(seconds=INTERVAL)
+    counts(e, {CHAT: 11})
+    sample_at(e, job, t3)
+    caught_up(e, t3 + timedelta(seconds=5))
+    sampler.finalize(e.conn)
+    e.conn.commit()
+    rows = samples(e)
+    assert [r[4] for r in rows] == [0, 0, 1]  # the join is dated after t2: it belongs to the third interval
+    with psycopg.connect(e.dsn) as c:
+        drift = c.execute("SELECT sampled_at, residual, straddled FROM stats.v_drift WHERE chat_id = %s "
+                          "ORDER BY sampled_at", (CHAT,)).fetchall()
+        assert drift == [(t1, None, False), (t2, None, True), (t3, None, False)]
+        res = sql.run(c, "9b", as_of=t3 + timedelta(minutes=1), scope=[CHAT]).dicts()
+        assert [r["residual"] for r in res] == [None, None, None]
+    e.clock.set(t3 + timedelta(minutes=1))
+    refresh(e, job)
+    assert value("tgaud_chat_drift_residual_24h", CHAT) == 0  # no false +1 (or -1): both residuals withheld
+    assert value("tgaud_chat_members_reported", CHAT) == 11
+
+
+def test_a_join_just_before_the_count_call_is_not_ambiguous(env):
+    e = env
+    w = e.w
+    job = sampler.make(e.ctx)
+    e.tick(job)
+    t1 = datetime.fromtimestamp(job.schedule[CHAT], timezone.utc)
+    counts(e, {CHAT: 10})
+    sample_at(e, job, t1)
+    t2 = t1 + timedelta(seconds=INTERVAL)
+    w.join(2, t2.replace(microsecond=0) - timedelta(seconds=1))  # the second before the send
+    w.rebuild()
+    w.c.commit()
+    counts(e, {CHAT: 11})
+    sample_at(e, job, t2)
+    caught_up(e, t2 + timedelta(seconds=5))
+    sampler.finalize(e.conn)
+    e.conn.commit()
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT residual, straddled FROM stats.v_drift WHERE chat_id = %s AND sampled_at = %s",
+                         (CHAT, t2)).fetchone() == (0, False)
+
+
+# --- finalizing an old sample marks its day for R1 (review 1) -------------------------------------------------------
+
+def test_finalizing_a_sample_of_an_earlier_day_marks_the_chat_dirty_from_that_day(env):
+    e = env
+    w = e.w
+    now = datetime.now(timezone.utc)
+    old = now.replace(microsecond=0) - timedelta(days=5)
+    day = old.date()
+    w.c.execute("INSERT INTO tg.coverage (chat_id, period) VALUES (%s, tstzrange(%s, NULL))",
+                (CHAT, now - timedelta(days=8)))
+    w.c.execute("""INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events)
+                   VALUES (%s, %s, 40, 0, 0)""", (CHAT, old - timedelta(minutes=10)))
+    w.c.commit()
+
+    def r1():
+        with psycopg.connect(e.dsn) as c:
+            sql.run(c, "R1", as_of=datetime.now(timezone.utc))
+            c.commit()
+            return c.execute("SELECT reported_eod FROM stats.chat_day WHERE chat_id = %s AND day = %s",
+                             (CHAT, day)).fetchone()
+    assert r1() == (40,)  # the chat's days are built
+    # a sample of that day arrives late and waits for ingest (it was stuck for days)
+    with psycopg.connect(e.dsn) as c:
+        c.execute("""INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events)
+                     VALUES (%s, %s, 42, 0, NULL)""", (CHAT, old))
+        c.execute("DELETE FROM tg.rollup_dirty")
+    assert r1() == (40,)  # a routine cycle looks back 2 days only
+    caught_up(e, datetime.now(timezone.utc))
+    assert sampler.finalize(e.conn) == 1
+    e.conn.rollback()  # interrupted: the sample stays pending and nothing is marked, together
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT count(*) FROM tg.rollup_dirty").fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM tg.count_sample WHERE net_events IS NULL").fetchone()[0] == 1
+    assert sampler.finalize(e.conn) == 1
+    e.conn.commit()
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT from_day FROM tg.rollup_dirty WHERE chat_id = %s", (CHAT,)).fetchone() == (day,)
+    assert r1() == (42,)  # the next cycle republishes the day with its finalized last sample
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT count(*) FROM tg.rollup_dirty").fetchone()[0] == 0  # consumed
+        # a sample of today marks nothing (R1's lookback covers it)
+        c.execute("""INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events)
+                     VALUES (%s, now() - interval '1 second', 43, 0, NULL)""", (CHAT,))
+    caught_up(e, datetime.now(timezone.utc) + timedelta(seconds=1))
+    assert sampler.finalize(e.conn) == 1
+    e.conn.commit()
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT count(*) FROM tg.rollup_dirty").fetchone()[0] == 0

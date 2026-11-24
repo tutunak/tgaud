@@ -5,10 +5,15 @@ Samples. Each tracked chat has a fixed phase in the 10-minute interval (a hash o
 chats spread over the interval instead of all coming at :00; a chat is sampled at the first slot after its last
 sample (after a longer stop, at the first slot after now, so a restart does not burst). A sample stores
 `reported`, `known_open` (open spells, all accounts: an index-only count) and `suspect_open` at once, and
-`net_events` NULL: the sample is pending. Every step finalizes the pending samples that ingest has caught up past
+`net_events` NULL: the sample is pending. sampled_at is the send time of getChatMemberCount and request_ms the
+call's length (job clock). Every step finalizes the pending samples that ingest has caught up past
 (tg.bot_state.caught_up_at > sampled_at, so every update dated before the sample is committed): net_events =
 exact joins minus exact exits of spells in (previous sample, this sample] (0 for a chat's first sample), the
-definition R1's sample_net uses. The residual reads finalized samples only.
+definition R1's sample_net uses; `straddled` = an exact transition lies inside the call (from sampled_at floored to
+the second, like event dates, to sampled_at + request_ms), so the count may or may not include it and the residuals
+on both sides of the sample are withheld. The residual reads finalized samples only. A newly finalized sample of an
+earlier UTC day than today marks its chat dirty from that day (tg.mark_dirty), so R1 republishes a day its 2-day
+lookback no longer covers.
 
 Metric cache (every minute): one query per gauge family over all tracked chats, then the gauges of
 tgaud.metrics are set from the results; a scrape reads only those values. A chat that is no longer tracked loses
@@ -18,7 +23,7 @@ tgaud_chat_join_requests_total{outcome="unknown"}; a later approval found by ing
 
 Values set: tgaud_chat_members_reported/_known/_suspect, tgaud_chat_drift_mismatch (reported - known_open of the
 latest finalized sample), tgaud_chat_drift_residual_24h (the sum of the delta residuals of the finalized samples of
-the last 24 h, each against the previous finalized sample, as stats.v_drift), tgaud_chat_gap_open,
+the last 24 h, each against the previous finalized sample, as stats.v_drift; withheld residuals count as nothing), tgaud_chat_gap_open,
 tgaud_chat_join_requests_pending, tgaud_snapshot_age_seconds (since the last good snapshot finished; no series
 without one), tgaud_chat_info, tgaud_lost_seconds_total (confirmed service_down gaps that have ended; the counter
 only grows), tgaud_probe_queue and tgaud_probe_oldest_age_seconds (0 for an empty queue).
@@ -51,22 +56,37 @@ REQUEST_UNKNOWN_AFTER = timedelta(days=7)
 RESIDUAL_WINDOW = timedelta(hours=24)
 
 _FINALIZE = """
-UPDATE tg.count_sample s SET net_events = n.net
-FROM (
-  SELECT p.chat_id, p.sampled_at,
-         CASE WHEN p.prev IS NULL THEN 0 ELSE
-           (SELECT count(*) FROM tg.membership m
-             WHERE m.chat_id = p.chat_id AND m.joined_at > p.prev AND m.joined_at <= p.sampled_at)
-         - (SELECT count(*) FROM tg.membership m
-             WHERE m.chat_id = p.chat_id AND m.end_source = 'event'
-               AND m.left_before > p.prev AND m.left_before <= p.sampled_at) END AS net
-  FROM (SELECT x.chat_id, x.sampled_at,
-               (SELECT max(y.sampled_at) FROM tg.count_sample y
-                 WHERE y.chat_id = x.chat_id AND y.sampled_at < x.sampled_at) AS prev
-        FROM tg.count_sample x
-        WHERE x.net_events IS NULL AND x.sampled_at < (SELECT max(b.caught_up_at) FROM tg.bot_state b)) p
-) n
-WHERE s.chat_id = n.chat_id AND s.sampled_at = n.sampled_at AND s.net_events IS NULL"""
+WITH fin AS (
+  UPDATE tg.count_sample s SET net_events = n.net, straddled = n.straddled
+  FROM (
+    SELECT p.chat_id, p.sampled_at,
+           CASE WHEN p.prev IS NULL THEN 0 ELSE
+             (SELECT count(*) FROM tg.membership m
+               WHERE m.chat_id = p.chat_id AND m.joined_at > p.prev AND m.joined_at <= p.sampled_at)
+           - (SELECT count(*) FROM tg.membership m
+               WHERE m.chat_id = p.chat_id AND m.end_source = 'event'
+                 AND m.left_before > p.prev AND m.left_before <= p.sampled_at) END AS net,
+           EXISTS (SELECT 1 FROM tg.membership m
+                    WHERE m.chat_id = p.chat_id AND m.joined_at >= p.call_from AND m.joined_at <= p.call_to)
+           OR EXISTS (SELECT 1 FROM tg.membership m
+                       WHERE m.chat_id = p.chat_id AND m.end_source = 'event'
+                         AND m.left_before >= p.call_from AND m.left_before <= p.call_to) AS straddled
+    FROM (SELECT x.chat_id, x.sampled_at,
+                 (SELECT max(y.sampled_at) FROM tg.count_sample y
+                   WHERE y.chat_id = x.chat_id AND y.sampled_at < x.sampled_at) AS prev,
+                 date_trunc('second', x.sampled_at) AS call_from,
+                 x.sampled_at + make_interval(secs => coalesce(x.request_ms, 0) / 1000.0) AS call_to
+          FROM tg.count_sample x
+          WHERE x.net_events IS NULL AND x.sampled_at < (SELECT max(b.caught_up_at) FROM tg.bot_state b)) p
+  ) n
+  WHERE s.chat_id = n.chat_id AND s.sampled_at = n.sampled_at AND s.net_events IS NULL
+  RETURNING s.chat_id, s.sampled_at
+), marked AS (
+  SELECT tg.mark_dirty(f.chat_id, f.day)
+  FROM (SELECT chat_id, min((sampled_at AT TIME ZONE 'UTC')::date) AS day FROM fin GROUP BY chat_id) f
+  WHERE f.day < (now() AT TIME ZONE 'UTC')::date
+)
+SELECT (SELECT count(*) FROM fin), (SELECT count(*) FROM marked)"""
 
 _INSERT_SAMPLE = """
 INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, suspect_open, net_events, request_ms)
@@ -98,30 +118,30 @@ SELECT m.chat_id, count(*) FROM tg.membership m
 WHERE m.chat_id = ANY(%(chats)s::bigint[]) AND m.end_source IS NULL AND m.suspect_since IS NOT NULL
 GROUP BY m.chat_id"""
 
-# The latest finalized sample (reported, mismatch) and the 24 h residual. The sum of the delta residuals of the
-# window's samples telescopes: (last reported - reported of the finalized sample before the window) - the window's
-# net_events; without a sample before the window, the window's first sample has no residual of its own.
+# The latest finalized sample (reported, mismatch) and the 24 h residual: the sum of the delta residuals of the
+# window's finalized samples, each against the previous finalized sample (the one before the window for the first),
+# without the withheld ones (a straddled count on either side), as stats.v_drift computes them.
 _Q_DRIFT = """
-SELECT c.chat_id, l.reported, l.reported - l.known_open AS mismatch,
-       CASE WHEN w.n IS NULL THEN NULL
-            WHEN b.reported IS NOT NULL THEN w.last_reported - b.reported - w.net
-            ELSE w.last_reported - w.first_reported - (w.net - w.first_net) END AS residual
+SELECT c.chat_id, l.reported, l.reported - l.known_open AS mismatch, w.residual
 FROM unnest(%(chats)s::bigint[]) AS c(chat_id)
 LEFT JOIN LATERAL (
   SELECT s.reported, s.known_open FROM tg.count_sample s
   WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at <= %(now)s
   ORDER BY s.sampled_at DESC LIMIT 1) l ON true
 LEFT JOIN LATERAL (
-  SELECT s.reported FROM tg.count_sample s
-  WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at <= %(since)s
-  ORDER BY s.sampled_at DESC LIMIT 1) b ON true
-LEFT JOIN LATERAL (
-  SELECT count(*) AS n, sum(s.net_events) AS net,
-         (array_agg(s.reported ORDER BY s.sampled_at DESC))[1] AS last_reported,
-         (array_agg(s.reported ORDER BY s.sampled_at))[1] AS first_reported,
-         (array_agg(s.net_events ORDER BY s.sampled_at))[1] AS first_net
-  FROM tg.count_sample s
-  WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at > %(since)s AND s.sampled_at <= %(now)s
+  SELECT coalesce(sum(d.residual), 0) AS residual FROM (
+    SELECT x.sampled_at,
+           CASE WHEN x.straddled OR lag(x.straddled) OVER o THEN NULL
+                ELSE (x.reported - lag(x.reported) OVER o) - x.net_events END AS residual
+    FROM (SELECT s.sampled_at, s.reported, s.net_events, s.straddled FROM tg.count_sample s
+          WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL
+            AND s.sampled_at > %(since)s AND s.sampled_at <= %(now)s
+          UNION ALL
+          (SELECT s.sampled_at, s.reported, s.net_events, s.straddled FROM tg.count_sample s
+           WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at <= %(since)s
+           ORDER BY s.sampled_at DESC LIMIT 1)) x
+    WINDOW o AS (ORDER BY x.sampled_at)) d
+  WHERE d.sampled_at > %(since)s
   HAVING count(*) > 0) w ON true"""
 
 _Q_GAP_OPEN = """
@@ -228,13 +248,12 @@ class Sampler:
         assert api is not None
         sent = self.ctx.clock()
         self.schedule[chat_id] = next_slot(chat_id, sent)
-        started = time.monotonic()
         try:
             reported = api.get_chat_member_count(chat_id)
         except ApiError as e:
             log.info("sampler: getChatMemberCount of %d failed (%s): next slot", chat_id, e.outcome)
             return False
-        ms = round((time.monotonic() - started) * 1000)
+        ms = max(0, math.ceil((self.ctx.clock() - sent) * 1000))  # the call's window, on the clock of sampled_at
         if isinstance(reported, bool) or not isinstance(reported, int) or reported < 0:
             log.warning("sampler: getChatMemberCount of %d returned no count", chat_id)
             return False
@@ -321,8 +340,9 @@ def _remove(gauge: Gauge, *labels: str) -> None:
 
 
 def finalize(conn: psycopg.Connection) -> int:
-    """Fill net_events of the pending samples ingest has caught up past; returns how many."""
-    return conn.execute(_FINALIZE).rowcount
+    """Fill net_events and straddled of the pending samples ingest has caught up past, and mark the chats of
+    samples from an earlier UTC day dirty from that day; returns how many samples were finalized."""
+    return conn.execute(_FINALIZE).fetchone()[0]
 
 
 def make(ctx: JobContext) -> Job:
