@@ -886,6 +886,23 @@ def test_pager_links_keep_only_the_reports_inputs(web, monkeypatch):
     assert links and all(set(dict(parse_qsl(u.partition("?")[2]))) <= {"chat", "since", "as_of", "offset"} for u in links)
 
 
+def test_pager_links_carry_only_the_values_the_report_read(web, monkeypatch):
+    """The review's case: a second value of a scalar input (here a date holding a user id) is ignored by the
+    report and must not travel into the Next/Previous links; every value of a chat list stays."""
+    monkeypatch.setattr(pages, "REPORT_PAGE", 3)
+    page = ok(web.request("GET", "/reports/asof", params=[
+        ("chat", str(B)), ("chat", "1001"), ("date", "2026-11-07"), ("date", "1001"), ("mode", "list"),
+        ("as_of", NOW_ARG), ("among", str(A)), ("among", str(B))]))
+    links = [u for u in urls(page) if "offset=" in u]
+    assert links
+    for u in links:
+        pairs = parse_qsl(u.partition("?")[2])
+        assert [v for k, v in pairs if k == "chat"] == [str(B)], u  # the as-of page reads one chat
+        assert [v for k, v in pairs if k == "date"] == ["2026-11-07"], u
+        assert [v for k, v in pairs if k == "among"] == [str(A), str(B)], u
+        assert "1001" not in u.replace(str(B), "").replace(str(A), "")
+
+
 PAGED = [(s.block, {"scope": AD, "since": "2026-08-01", "burst_users": 2} | ({"raid_min_joins": 5} if s.block == "13" else {}))
          for s in pages.reports.PLAIN if s.block not in ("13",)] + [
     ("13", {"raid_min_joins": 5}), ("16a", {"chat": A, "day": "2026-11-07"}), ("16b", {"chat": B, "day": "2026-11-07"}),

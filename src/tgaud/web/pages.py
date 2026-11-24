@@ -146,7 +146,7 @@ def transposed(result: sql.Result, titles: dict[int, str], key: str) -> Table:
 
 
 def paged_table(req: Request, report: reports.Report, titles: dict[int, str], offset: int,
-                inputs: Sequence[str]) -> Table:
+                inputs: Sequence[str], list_inputs: Sequence[str] = ("chat",)) -> Table:
     """One page of a report read with page=(offset, REPORT_PAGE + 1): its rows, and links to the pages before and
     after. A link keeps only the report's own `inputs` (scope, options) from the request, never another field
     (a lookup's user id must not travel into a URL), and freezes the as-of time."""
@@ -156,7 +156,16 @@ def paged_table(req: Request, report: reports.Report, titles: dict[int, str], of
     t.start = offset
 
     def href(at: int) -> str:
-        query = {k: v for k, v in req.query.items() if k in inputs and k not in ("offset", "as_of")}
+        # only what the report read: every value of the page's chat lists (`list_inputs`: each value checked as a
+        # tracked chat by _scope, or the request was refused), the first value of any other input; never a
+        # value it ignored
+        query: dict[str, list[str]] = {}
+        for k in inputs:
+            if k in ("offset", "as_of"):
+                continue
+            values = req.args(k) if k in list_inputs else [v for v in [req.arg(k)] if v is not None]
+            if values:
+                query[k] = values
         query["as_of"] = [report.as_of.isoformat()]
         if at:
             query["offset"] = [str(at)]
@@ -693,7 +702,8 @@ class WebApp:
             report = reports.build_report(conn, block, as_of=as_of, scope=scope, params=params, window=window,
                                           as_of_notes=as_of_notes, page=(offset, REPORT_PAGE + 1))
         return self.render("asof.html", header=header_of(report),
-                           table=paged_table(req, report, common.titles_of(chats), offset, ASOF_INPUTS), **page)
+                           table=paged_table(req, report, common.titles_of(chats), offset, ASOF_INPUTS,
+                                             list_inputs=("among",)), **page)
 
     def coverage(self, req: Request, _m: dict[str, str]) -> Response:
         gaps = req.arg("gaps") is not None
