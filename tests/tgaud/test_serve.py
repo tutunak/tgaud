@@ -196,6 +196,25 @@ def test_sigterm_during_a_blocked_startup(pg, migrated_dsn, fake, serves, tmp_pa
     assert offset(migrated_dsn) == 0
 
 
+def test_a_stop_before_the_identity_check_exits_0(pg, migrated_dsn, fake):
+    """SIGTERM while serve still connects: the stop closes the Bot API client, so identify's getMe fails; that is
+    the stop, not a failure (exit 0, nothing written)."""
+    from tgaud import config, jobs
+
+    dbname = psycopg.conninfo.conninfo_to_dict(migrated_dsn)["dbname"]
+    cfg = config.load({"TGAUD_DATABASE_URL": pg.tenant_url(dbname), "TGAUD_DATABASE_PASSWORD": pg.tenant_password,
+                       "TGAUD_BOT_TOKEN": TOKEN, "TGAUD_LINK_HMAC_KEY": KEY, "TGAUD_BOT_API_URL": fake.url,
+                       "TGAUD_METRICS_LISTEN": f"127.0.0.1:{free_port()}"}, need={"database", "bot", "link_key"})
+    supervisor = jobs.Supervisor(deadline=10 ** 9)  # not bound to signals (pytest owns them); never hard-exits
+    supervisor.thread.start()
+    supervisor.request(0, "a signal during startup")
+    deadline = time.monotonic() + 5
+    while not supervisor.stopping and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert jobs.serve(cfg, supervisor) == 0
+    assert bot_row(migrated_dsn) == []
+
+
 def test_the_hard_deadline_ends_a_stuck_process(pg, migrated_dsn, fake, serves, tmp_path):
     s = start(serves, pg, migrated_dsn, fake, "stuck_startup", tmp_path)
     s.wait_for(lambda: "startup stuck" in s.text(), what="the stuck startup")

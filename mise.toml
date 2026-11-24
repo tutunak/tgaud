@@ -3,9 +3,13 @@ python = "3.15"
 uv = "0.11.16"
 
 [tasks.ci]
-description = "The whole local test suite (tgstats and tgaud) and the container check. Set TGAUD_TEST_ADMIN_URL to use a running PostgreSQL 18.6; without it the tests start one with podman."
-depends = ["image-test"]
+description = "The whole local test suite (tgstats and tgaud) and the container checks. Set TGAUD_TEST_ADMIN_URL to use a running PostgreSQL 18.6; without it the tests start one with podman."
+depends = ["image-test", "container-e2e"]
 run = "uv run pytest"
+
+[tasks.container-e2e]
+description = "Run the image the way the deploy role does: --selfcheck offline, migrate and serve against a test database and the fake Bot API, /health through the published port, SIGTERM."
+run = "bash scripts/container-e2e.sh"
 
 [tasks.image-test]
 description = "Build the image and run it as the deploy role will: --selfcheck offline, migrate fails cleanly without a database."

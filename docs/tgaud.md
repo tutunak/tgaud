@@ -8,7 +8,7 @@ This file is how the code is put together and where each part plugs in.
 ## Tests
 
 ```sh
-mise run ci                       # = uv run pytest: tgstats and tgaud, everything
+mise run ci                       # uv run pytest (tgstats and tgaud) + image-test + container-e2e
 ```
 
 The database tests need PostgreSQL 18.6 and `psql`:
@@ -36,6 +36,10 @@ The fake Bot API (`tests/tgaud/botapi_fake.py`, never the real Telegram): `FakeB
 `TGAUD_BOT_API_URL`, also from a container) that can hold or trickle a response. Both script answers per method
 (`ok`, `error(code, ..., retry_after=)`, `updates`, `respond`) and record `calls`.
 
+`tests/tgaud/test_end_to_end.py` runs `tgaud serve` in process (`tgaud.jobs.serve` on a thread, its three threads
+and the metrics listener real) through a scripted day against the fake Bot API server: the module docstring lists
+the day and the few things shortened for the test (job intervals; count samples taken when the test asks).
+
 `tests/tgaud/serve_runner.py` runs `tgaud serve` through the real CLI with job modules from
 `tests/tgaud/serve_fakes.py` put into `sys.modules` under the real names; that is how a test replaces a job.
 
@@ -54,6 +58,11 @@ The fake Bot API (`tests/tgaud/botapi_fake.py`, never the real Telegram): `FakeB
   --security-opt=no-new-privileges`. `--selfcheck` must print one `selfcheck ok:` line; `migrate` with a database URL
   that refuses connections must exit 1 with one connection-failure line (no traceback, no empty message); no `.env`,
   `*.env`, session or database file may be in the image.
+- **Container end-to-end** (`scripts/container-e2e.sh`, `mise run container-e2e`, part of `mise run ci`): the deploy
+  order with the same flags: build, `--selfcheck` with `--network=none`, `migrate` against a fresh test database
+  (twice: the second is a no-op), `serve` with the fake Bot API (`tests/tgaud/container_env.py` provides both on the
+  host's loopback; the containers reach it through pasta's `--map-host-loopback`), `/health` 200 within 60 s through
+  the published port, and SIGTERM ends it with exit 0 within 10 s.
 - **CI** (`.forgejo/workflows/ci.yml`, the pattern of `~/projects/helpers/sui`): no `uses:` actions. Job `test` runs
   `uv run pytest -rs` on Python 3.13 with `TGAUD_TEST_NO_DATABASE=1`: the database tests skip with that reason, because
   the runner's job network is the host's and a PostgreSQL service is not reachable by name there. The local

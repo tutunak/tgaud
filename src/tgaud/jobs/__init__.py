@@ -435,6 +435,10 @@ def serve(config: Config, supervisor: Supervisor, *, health_window: float | None
             return exit_code[0] if exit_code else 0
         log.error("database error during startup: %s", e)
         return 1
+    except Exception:
+        if stop.is_set():  # a stop during startup: the closed Bot API client fails identify's getMe, say
+            return exit_code[0] if exit_code else 0
+        raise
     finally:
         # A connection whose thread is still inside it is left to the process exit: closing it under a
         # running statement would free libpq state that thread still uses. The server rolls it back.

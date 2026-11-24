@@ -180,3 +180,28 @@ uv run pytest
 ```
 
 The tests are offline: they use a fixture database and a fake client, never the network.
+
+## tgaud
+
+`tgaud` is the second program in this repository: a Telegram **Bot API** service that records every join and leave
+of your channels and groups into PostgreSQL 18.6 with full history (one row per stay, with how sure each start and
+end is), and the analytics on top: overlap, unique members, campaign and giveaway joiners, short stays, drift
+against Telegram's member count, `/metrics` for Prometheus. It runs as one container (`tgaud serve`) next to the
+database; `tgstats collect` can seed it with the members from before the bot.
+
+Read, in this order:
+
+- `docs/design/summary.md`: what it answers, for the owner;
+- `docs/design/design.md`: the rules (history model, snapshot contract, probes, metrics);
+- `docs/deploy-contract.md`: the image, commands, environment and deploy order the Ansible role relies on;
+- `docs/tgaud.md`: how the code is put together, and the tests.
+
+Tests (PostgreSQL 18.6 and podman; never the real Telegram, always the fake Bot API in `tests/tgaud/`):
+
+```sh
+mise run ci                                    # everything: pytest, the image check, the container end-to-end run
+TGAUD_TEST_ADMIN_URL=postgresql://postgres:PASSWORD@127.0.0.1:5432/postgres mise run ci   # use a running server
+uv run pytest tests/tgaud/test_end_to_end.py   # one scripted day through `tgaud serve`
+```
+
+Without `TGAUD_TEST_ADMIN_URL` the tests start a throwaway PostgreSQL container with podman.
