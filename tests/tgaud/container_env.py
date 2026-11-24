@@ -1,6 +1,8 @@
 """The outside world of scripts/container-e2e.sh: a test database (not migrated: the image's `migrate` does that) and
-the fake Bot API, both on the host's loopback, which the container reaches at the address given as argv[1] (pasta
---map-host-loopback). Never the real Telegram.
+the fake Bot API. Never the real Telegram. The container reaches the host's 127.0.0.1 at the address given as argv[1]
+(pasta --map-host-loopback); the fake listens there, and so does a relay to the database, which forwards to the
+server at the address this helper itself uses (any host address, another loopback address, a Unix socket), so the
+container needs no route of its own to it.
 
 Prints `KEY=VALUE` lines (the container's environment, then HEALTH_PORT, a free host port to publish /metrics on),
 then `ready`, and waits until stdin closes. Then it checks what the service did (getMe and getUpdates reached the
@@ -15,9 +17,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import psycopg
@@ -30,6 +34,61 @@ from conftest import IMAGE, SERVER_SETTINGS, PgServer, _free_port, _wait_ready  
 
 TOKEN = "5000:TEST-token_abcdefghijklmnop"  # the fake's bot id is 5000
 LINK_KEY = "cd" * 32
+
+
+class Relay:
+    """Forwards each TCP connection to 127.0.0.1:<port> to the database server at (host, port), as libpq on this
+    side would reach it (a host starting with / is a Unix socket directory)."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self.target = (host, port)
+        self.sock = socket.create_server(("127.0.0.1", 0))
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self._accept, name="db-relay", daemon=True).start()
+
+    def _open(self) -> socket.socket:
+        host, port = self.target
+        if host.startswith("/"):
+            s = socket.socket(socket.AF_UNIX)
+            s.connect(f"{host}/.s.PGSQL.{port}")
+            return s
+        return socket.create_connection(self.target, timeout=10)
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                client, _ = self.sock.accept()
+            except OSError:
+                return  # closed
+            threading.Thread(target=self._serve, args=(client,), daemon=True).start()
+
+    def _serve(self, client: socket.socket) -> None:
+        try:
+            upstream = self._open()
+        except OSError:
+            client.close()
+            return
+        upstream.settimeout(None)
+        for src, dst in ((client, upstream), (upstream, client)):
+            threading.Thread(target=self._pipe, args=(src, dst), daemon=True).start()
+
+    @staticmethod
+    def _pipe(src: socket.socket, dst: socket.socket) -> None:
+        try:
+            while data := src.recv(65536):
+                dst.sendall(data)
+        except OSError:
+            pass
+        finally:
+            for s in (src, dst):  # either side ending ends both
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                s.close()
+
+    def close(self) -> None:
+        self.sock.close()
 
 
 def main(host_alias: str) -> int:
@@ -48,6 +107,8 @@ def main(host_alias: str) -> int:
     with tempfile.TemporaryDirectory(prefix="tgaud-e2e-") as workdir:
         server = PgServer(admin_dsn, f"tgaud_e2e_{tag}", secrets.token_hex(16), Path(workdir), container)
         fake = FakeBotServer(token=TOKEN)
+        relay = Relay(server.host, server.port)
+        role_created = False
         try:
             _wait_ready(admin_dsn)
             with server.admin() as a:
@@ -55,10 +116,11 @@ def main(host_alias: str) -> int:
                     "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS "
                     "INHERIT CONNECTION LIMIT 10").format(psql_sql.Identifier(server.tenant),
                                                            psql_sql.Literal(server.tenant_password)))
+            role_created = True  # from here on the role is this run's to drop, never before (a name collision)
             dsn = server.make_db(migrated=False)
             dbname = psycopg.conninfo.conninfo_to_dict(dsn)["dbname"]
             fake_port = fake.httpd.server_address[1]
-            url = f"postgresql://{server.tenant}@{host_alias}:{server.port}/{dbname}?sslmode=disable"
+            url = f"postgresql://{server.tenant}@{host_alias}:{relay.port}/{dbname}?sslmode=disable"
             env = {
                 "TGAUD_DATABASE_URL": url,
                 "TGAUD_DATABASE_PASSWORD": server.tenant_password,
@@ -86,12 +148,14 @@ def main(host_alias: str) -> int:
             failures.append(f"{type(e).__name__}: {e}")
         finally:
             fake.close()
+            relay.close()
             try:
                 with server.admin() as a:
                     for name in server.databases:
                         a.execute(psql_sql.SQL("DROP DATABASE IF EXISTS {} WITH (FORCE)").format(
                             psql_sql.Identifier(name)))
-                    a.execute(psql_sql.SQL("DROP ROLE IF EXISTS {}").format(psql_sql.Identifier(server.tenant)))
+                    if role_created:
+                        a.execute(psql_sql.SQL("DROP ROLE {}").format(psql_sql.Identifier(server.tenant)))
             finally:
                 if container:
                     subprocess.run(["podman", "rm", "-f", container], capture_output=True)

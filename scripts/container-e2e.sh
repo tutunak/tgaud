@@ -7,9 +7,10 @@
 #   -> SIGTERM -> the container exits 0 within 10 s
 #
 # Every container runs with the unit's flags: read-only root, --tmpfs /tmp, all capabilities dropped,
-# no-new-privileges. The database and the fake listen on the host's loopback only; the containers reach them at
-# HOST_ALIAS, which pasta maps to the host's loopback (--map-host-loopback). Called by `mise run ci`; set
-# TGAUD_TEST_ADMIN_URL to use a running PostgreSQL 18.6, else the helper starts one with podman.
+# no-new-privileges. The fake and a relay to the database listen on the host's 127.0.0.1; the containers reach them
+# at HOST_ALIAS, which pasta maps to the host's loopback (--map-host-loopback), and the relay reaches the database
+# wherever TGAUD_TEST_ADMIN_URL points. Called by `mise run ci`; set TGAUD_TEST_ADMIN_URL to use a running
+# PostgreSQL 18.6, else the helper starts one with podman.
 set -euo pipefail
 
 repo=$(cd "$(dirname "$0")/.." && pwd)

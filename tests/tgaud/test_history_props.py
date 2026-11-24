@@ -91,8 +91,9 @@ world_evidence = st.fixed_dictionaries({
 
 
 def brute_force(d: dict) -> Evidence:
-    """The evidence by its definition: every applied listing a point, every applied good non-listing an absence;
-    a snapshot the owner rejected is no evidence at all."""
+    """The evidence by its definition: every applied listing a point, every applied good non-listing an absence,
+    except one taken at or after the chat's migration (M2: a retired source gives no absences); a snapshot the owner
+    rejected is no evidence at all."""
     ev = Evidence(CHAT, USER, events=list(d["events"]), probes=[p for p in d["probes"] if p.outcome != "error"],
                   gaps=[g for g, _ in d["gaps"]], echo_from=list(d["echo"]), migrations=list(d["m2"]))
     for k, (started, good, applied, page, hint, rejected) in enumerate(d["snapshots"]):
@@ -100,7 +101,7 @@ def brute_force(d: dict) -> Evidence:
             continue
         if page is not None:
             ev.sightings.append(SightingPoint(page, hint, k, 0))
-        elif good:
+        elif good and not any(m <= started for m in d["m2"]):
             ev.absences.append(Absence(started, k))
     return ev
 

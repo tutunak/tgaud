@@ -57,6 +57,13 @@ BOT_LINK = "https://t.me/+E2EcampaignLINKtoken01"
 LINK_NAME = "nov-giveaway"
 ACTIVATION = "e2e-activation-1"
 SERVE_APPS = ("tgaud-ingest", "tgaud-worker", "tgaud-batch")
+HARNESS = "tgaud-e2e-harness"  # the application_name of every connection this test opens itself
+# Every client session in the test database except the test's own and the CLI runs': the service's, whatever
+# their application_name (an empty or unexpected one counts too).
+SERVICE_SESSIONS = """SELECT application_name FROM pg_stat_activity
+                      WHERE datname = %s AND backend_type = 'client backend'
+                        AND application_name NOT IN ('tgaud-e2e-harness', 'tgaud-cli')
+                      ORDER BY 1"""
 
 
 def ts(at: dt.datetime) -> int:
@@ -191,9 +198,14 @@ class Service:
         return time.monotonic() - started
 
 
+def connect(dsn: str, **kw) -> psycopg.Connection:
+    """A connection of the test itself, tagged so the connection count leaves it out."""
+    return psycopg.connect(dsn, application_name=HARNESS, **kw)
+
+
 class Connections(threading.Thread):
-    """Samples pg_stat_activity every 50 ms: the most connections the service (every tgaud-* login except the
-    CLI's) held at once, and which ones."""
+    """Samples pg_stat_activity every 50 ms: the most connections the service held at once (SERVICE_SESSIONS),
+    and their application names."""
 
     def __init__(self, dsn: str, dbname: str) -> None:
         super().__init__(name="e2e-connections", daemon=True)
@@ -203,19 +215,15 @@ class Connections(threading.Thread):
         self.done = threading.Event()
 
     def run(self) -> None:
-        with psycopg.connect(self.dsn, autocommit=True) as c:
+        with connect(self.dsn, autocommit=True) as c:
             while not self.done.wait(0.05):
-                rows = c.execute("""SELECT application_name FROM pg_stat_activity
-                                    WHERE datname = %s AND application_name LIKE 'tgaud-%%'
-                                      AND application_name <> 'tgaud-cli'""", (self.dbname,)).fetchall()
+                rows = c.execute(SERVICE_SESSIONS, (self.dbname,)).fetchall()
                 self.most = max(self.most, len(rows))
                 self.apps |= {r[0] for r in rows}
 
     def now(self) -> list[str]:
-        with psycopg.connect(self.dsn, autocommit=True) as c:
-            return [r[0] for r in c.execute("""SELECT application_name FROM pg_stat_activity
-                                               WHERE datname = %s AND application_name LIKE 'tgaud-%%'
-                                               ORDER BY 1""", (self.dbname,))]
+        with connect(self.dsn, autocommit=True) as c:
+            return [r[0] for r in c.execute(SERVICE_SESSIONS, (self.dbname,))]
 
 
 def free_port() -> int:
@@ -295,7 +303,7 @@ def test_scripted_day(pg, migrated_dsn, made_jobs, monkeypatch, capsys):
     ]}
 
     def q(query: str, *args) -> list[tuple]:
-        with psycopg.connect(migrated_dsn, autocommit=True) as c:
+        with connect(migrated_dsn, autocommit=True) as c:
             return [tuple(utc(v) for v in r) for r in c.execute(query, args or None).fetchall()]
 
     def one(query: str, *args):
@@ -323,7 +331,7 @@ def test_scripted_day(pg, migrated_dsn, made_jobs, monkeypatch, capsys):
     def collect(chat: dict, started: dt.datetime, listed: dict[int, dt.datetime], reported: int) -> int:
         """A snapshot written the way the collect script writes it (design.md 5), as role collect_writer; `listed`
         maps each member to Telegram's participant date."""
-        with psycopg.connect(migrated_dsn) as c:
+        with connect(migrated_dsn) as c:
             c.execute("SET ROLE collect_writer")
             c.execute("INSERT INTO tg.chat (chat_id, chat_type, title, username) VALUES (%s, %s, %s, %s) "
                       "ON CONFLICT (chat_id) DO NOTHING",
@@ -603,7 +611,7 @@ def test_scripted_day(pg, migrated_dsn, made_jobs, monkeypatch, capsys):
         assert body.startswith("ok") and body.rstrip().endswith(f"activation={ACTIVATION}")
 
         # --- connections: ingest, worker, batch; never more than 3 (phase 1) --------------------------------------
-        assert sorted(a for a in watch.now() if a != "tgaud-cli") == sorted(SERVE_APPS)
+        assert watch.now() == sorted(SERVE_APPS)
     finally:
         took = service.stop()
         watch.done.set()
@@ -613,7 +621,4 @@ def test_scripted_day(pg, migrated_dsn, made_jobs, monkeypatch, capsys):
     assert took < 10, took
     assert watch.most <= 3, watch.most
     assert watch.apps == set(SERVE_APPS)
-    with psycopg.connect(migrated_dsn, autocommit=True) as c:
-        left = c.execute("SELECT count(*) FROM pg_stat_activity "
-                         "WHERE datname = %s AND application_name LIKE 'tgaud-%%'", (dbname,)).fetchone()[0]
-    assert left == 0
+    assert watch.now() == []
