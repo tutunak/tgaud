@@ -1284,15 +1284,21 @@ def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_pay
     # containers nested inside a link or a member, which hold only scalars besides `creator` and `user`
     text_in_object = chat_member(15, 47, T0, link=dict(bot_link(), invite_link={"url": BOT_LINK}))
     person_in_member = chat_member(16, 48, T0, "left", "banned", new_kw={"extra": [without_is_bot(49)]})
+    # an object at invite_link without the link's text is not a ChatInviteLink: dropped whole
+    link_without_text = chat_member(17, 51, T0, link={"url": BOT_LINK, "creator": BOT_USER, "name": "x"})
+    # a valid join whose link carries a field a ChatInviteLink does not have: the raw payload drops it
+    extra_field = chat_member(18, 50, T0, link=dict(masked_link(), url=BOT_LINK))
     h.poll(link_in_array, from_in_array, from_scalar, user_in_array, text_in_array, text_in_object,
-           person_in_member, chat_member(17, 50, T0))
+           person_in_member, link_without_text, extra_field)
     assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
-        *((u, "malformed") for u in range(10, 17)), (17, "chat_member")]
-    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id BETWEEN 10 AND 16"))
-    assert set(raw) == set(range(10, 17))
+        *((u, "malformed") for u in range(10, 18)), (18, "chat_member")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
+    assert set(raw) == set(range(10, 19))
     assert "invite_link" not in raw[10] and "from" not in raw[11] and "from" not in raw[12]
-    assert "user" not in raw[13]["new_chat_member"] and "invite_link" not in raw[14]["invite_link"]
-    assert "invite_link" not in raw[15]["invite_link"] and "extra" not in raw[16]["new_chat_member"]
+    assert "user" not in raw[13]["new_chat_member"] and "extra" not in raw[16]["new_chat_member"]
+    assert all("invite_link" not in raw[u] for u in (14, 15, 17))  # no link text: not a ChatInviteLink
+    assert raw[18]["invite_link"] == {k: v for k, v in masked_link().items() if k != "creator"} | {
+        "creator": {"id": ADMIN, "is_bot": False, "language_code": "en"}}
     tables = h.q("""SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname IN ('tg', 'stats') AND c.relkind IN ('r', 'p', 'm') AND NOT c.relispartition
                       AND (c.relkind <> 'm' OR c.relispopulated)""")
@@ -1303,7 +1309,7 @@ def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_pay
         for (row,) in h.q(f"SELECT t::text FROM {table} t"):
             found += [(table, s) for s in secrets if s in row]
     assert found == []
-    assert h.q("SELECT update_id FROM tg.member_event") == [(17,)]
+    assert h.q("SELECT update_id FROM tg.member_event") == [(18,)]
 
 
 def surrogate_and_nul(bad: dict) -> None:
@@ -1312,15 +1318,28 @@ def surrogate_and_nul(bad: dict) -> None:
     bad["chat_member"]["\udc00"] = True
 
 
-def nan_and_infinity(bad: dict) -> None:
-    bad["chat_member"]["date"] = float("inf")  # json.dumps sends Infinity and NaN, as json.loads reads them
+def nan_expiry(bad: dict) -> None:
+    # the kick's only invalid field is its expiry (json.dumps sends NaN and Infinity, as json.loads reads them);
+    # read as null it would be a valid kick without expiry
     bad["chat_member"]["new_chat_member"]["until_date"] = float("nan")
+    bad["chat_member"]["extra"] = float("-inf")  # a field nothing reads
 
 
-@pytest.mark.parametrize("spoil", [surrogate_and_nul, nan_and_infinity])
+def infinity_date(bad: dict) -> None:
+    bad["chat_member"]["date"] = float("inf")
+
+
+STORED_AS = {
+    surrogate_and_nul: lambda p: p["new_chat_member"]["custom_title"] == "x\ufffdy\ufffdz" and p["\ufffd"] is True,
+    nan_expiry: lambda p: p["new_chat_member"]["until_date"] is None and p["extra"] is None,
+    infinity_date: lambda p: p["date"] is None,
+}
+
+
+@pytest.mark.parametrize("spoil", list(STORED_AS))
 def test_values_postgresql_cannot_store_in_a_malformed_update_commit_once(h, spoil):
     tracked_channel(h)
-    bad = chat_member(10, 42, T0)
+    bad = chat_member(10, 42, T0, "member", "kicked")
     spoil(bad)
     db_failures = sample("tgaud_ingest_failures_total", stage="db")
     attempts = []
@@ -1340,16 +1359,13 @@ def test_values_postgresql_cannot_store_in_a_malformed_update_commit_once(h, spo
     assert sample("tgaud_ingest_failures_total", stage="db") == db_failures + 1
     assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
         (10, "malformed"), (11, "chat_member")]
-    payload = h.one("SELECT payload FROM tg.raw_update WHERE update_id = 10")
-    if spoil is surrogate_and_nul:
-        assert payload["new_chat_member"]["custom_title"] == "x\ufffdy\ufffdz" and payload["\ufffd"] is True
-    else:
-        assert payload["date"] is None and payload["new_chat_member"]["until_date"] is None
+    assert STORED_AS[spoil](h.one("SELECT payload FROM tg.raw_update WHERE update_id = 10"))
     assert h.q("SELECT update_id FROM tg.member_event") == [(11,)]
     assert h.one("SELECT next_offset FROM tg.bot_state") == 12
 
 
-@pytest.mark.parametrize("trigger", ["restart", "chat_member", "my_chat_member"])
+@pytest.mark.parametrize("trigger", ["restart", "chat_member", "my_chat_member", "erased_subject", "malformed",
+                                     "my_chat_member_admin"])
 def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trigger):
     h = make().start()
     tracked_channel(h, upd=1, chat=BASIC, at=T0 - dt.timedelta(hours=5))
@@ -1366,12 +1382,29 @@ def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trig
         h.clock.advance(hours=26)  # the outage the promotion update expired in
         h.restart()
         assert BASIC["id"] not in [c.params["chat_id"] for c in h.fake.calls_of("getChatMember")]
+    elif trigger == "my_chat_member_admin":
+        # news of the promotion itself: M1 runs in its transaction and no check is left due
+        h.clock.advance(minutes=10)
+        h.poll(my_chat_member(4, h.clock.now - dt.timedelta(minutes=1), chat=NEW_SG))
+        assert h.one("SELECT rights_due_at FROM tg.chat WHERE chat_id = %s", NEW_SG["id"]) is None
     else:
         h.clock.advance(minutes=10)
-        news = (chat_member(4, 43, h.clock.now - dt.timedelta(minutes=1), chat=NEW_SG) if trigger == "chat_member"
-                # queued from before the first check, so it says nothing about now
-                else my_chat_member(4, checked - dt.timedelta(minutes=1), "member", "left", chat=NEW_SG))
-        h.poll(news)
+        at = h.clock.now - dt.timedelta(minutes=1)
+        news = chat_member(4, 43, at, chat=NEW_SG)
+        if trigger == "my_chat_member":  # queued from before the first check, so it says nothing about now
+            news = my_chat_member(4, checked - dt.timedelta(minutes=1), "member", "left", chat=NEW_SG)
+        elif trigger == "erased_subject":  # dated before the person's erasure: a receipt only
+            erase(h, 43, at=h.clock.now)
+        elif trigger == "malformed":  # a valid chat id, an unreadable date
+            news["chat_member"]["date"] = "soon"
+        # the check is queued in the update's transaction: a crash before its commit queues nothing
+        h.ing.before_commit = lambda update_id: (_ for _ in ()).throw(Crash()) if update_id == 4 else None
+        with pytest.raises(Crash):
+            h.poll(news)
+        assert h.q("SELECT count(*) FROM tg.update_receipt WHERE update_id = 4") == [(0,)]
+        assert h.one("SELECT rights_due_at FROM tg.chat WHERE chat_id = %s", NEW_SG["id"]) is None
+        h.ing.before_commit = None
+        assert h.poll(news) == 1
         assert h.one("SELECT moved_at FROM tg.chat_alias") is None
         assert h.ing.refresh_rights() == 1
     assert h.one("SELECT moved_at IS NOT NULL FROM tg.chat_alias") is True
@@ -1380,3 +1413,10 @@ def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trig
         NEW_SG["id"], BASIC["id"])
     assert h.q("SELECT count(*) FROM tg.member_event WHERE chat_id = %s", BASIC["id"]) == [(0,)]
     assert h.ing.refresh_rights() == 0  # nothing left due: M1 ran once
+    if trigger in ("erased_subject", "malformed"):  # each path keeps only its usual rows (erased: the receipt)
+        assert h.q("SELECT update_type, chat_id FROM tg.update_receipt WHERE update_id = 4") == [
+            ("chat_member" if trigger == "erased_subject" else "malformed", NEW_SG["id"])]
+        for table in ("tg.member_event", "tg.tg_user"):
+            assert h.q(f"SELECT count(*) FROM {table} WHERE user_id = 43") == [(0,)], table
+        assert h.q("SELECT count(*) FROM tg.raw_update WHERE update_id = 4") == [(0 if trigger == "erased_subject"
+                                                                                  else 1,)]

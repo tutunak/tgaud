@@ -39,8 +39,8 @@ offset; a lost connection ends ingest (serve exits 1). Any other exception (a pr
 rebuild) rolls back and ends ingest, so the restarted service retries the valid update rather than
 acknowledging it without its data. An entry whose update_id can't be read ends its response there: the
 updates before it commit, neither the offset nor caught_up_at passes it, it is counted (stage "parse") and
-the same offset is polled again after a backoff. Values are made storable before anything is written (NUL and
-unpaired surrogates become U+FFFD, NaN and Infinity null).
+the same offset is polled again after a backoff. Strings are made storable before parsing (NUL and unpaired
+surrogates become U+FFFD); a NaN or Infinity fails validation and is stored as null in the raw payload.
 
 Bot rights: my_chat_member events and rights checks set the bot's status as of their time. A queued event
 older than the last check (processed after the startup check) is replayed at its own time for coverage and
@@ -122,6 +122,10 @@ DIGEST_MARK = "hmac-sha256:"
 USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
 MEMBER_KEYS = ("new_chat_member", "old_chat_member")  # a ChatMember: holds the person at `user`
 NAME_KEYS = ("first_name", "last_name", "username")
+LINK_FIELDS = frozenset((  # ChatInviteLink (Bot API 10.5); a raw payload keeps no other field of a link
+    "invite_link", "creator", "creates_join_request", "is_primary", "is_revoked", "name", "expire_date",
+    "member_limit", "pending_join_request_count", "subscription_period", "subscription_price",
+))
 
 
 class Malformed(ValueError):
@@ -137,14 +141,12 @@ UNSTORABLE = re.compile("[\x00\ud800-\udfff]")  # NUL and surrogates: PostgreSQL
 
 
 def _clean(v: Any) -> Any:
-    """The JSON value made storable: in every string (keys included) NUL and unpaired surrogates (a JSON escape
-    like \\ud800 survives decoding) replaced with U+FFFD, and NaN or Infinity (Python's JSON decoder accepts
-    them, jsonb does not) as null. Applied to each update before parsing, so the raw payload is clean before its
-    jsonb write and the text columns too."""
+    """The JSON value with every string (keys included) storable: NUL and unpaired surrogates (a JSON escape like
+    \\ud800 survives decoding) replaced with U+FFFD. Applied to each update before parsing, so the raw payload is
+    clean before its jsonb write and the text columns too. Numbers stay as sent: a NaN or Infinity must fail
+    validation (redact makes it null for the jsonb write)."""
     if isinstance(v, str):
         return UNSTORABLE.sub("\ufffd", v)
-    if isinstance(v, float) and not math.isfinite(v):
-        return None
     if isinstance(v, dict):
         return {_clean(k): _clean(x) for k, x in v.items()}
     if isinstance(v, list):
@@ -405,16 +407,19 @@ def _is_user_dict(d: dict) -> bool:
 
 
 def _expected_shape(holder: str | None, key: Any, value: Any) -> bool:
-    """Whether a value has the shape redaction reads at its position in a membership payload. A person, a member
-    and invite_link are objects (invite_link may also be the link's text); inside one of them (`holder`) only a
-    member's `user` and a link's `creator` are objects, the rest scalars; a name is a string. Other positions
-    hold anything."""
+    """Whether a value has the shape redaction reads at its position in a membership payload. A person and a
+    member are objects; invite_link is a ChatInviteLink (an object recognized by its text at invite_link) or the
+    link's text; inside one of them (`holder`) only a member's `user` and a link's `creator` are objects, the
+    rest scalars, and a link keeps only the ChatInviteLink fields; a name is a string. Other positions hold
+    anything."""
+    if holder == "link" and key not in LINK_FIELDS:
+        return False
     if holder is not None and isinstance(value, (dict, list)):
         return (holder, key) in (("member", "user"), ("link", "creator")) and isinstance(value, dict)
     if key in USER_KEYS or key in MEMBER_KEYS:
         return isinstance(value, dict)
     if key == "invite_link":
-        return isinstance(value, (dict, str))
+        return isinstance(value, str) or isinstance(value, dict) and isinstance(value.get("invite_link"), str)
     if key in NAME_KEYS:
         return isinstance(value, str)
     return True
@@ -805,6 +810,8 @@ class Ingest:
             self.conn.execute("""INSERT INTO tg.update_receipt (update_id, update_date, update_type, chat_id, received_at)
                                  VALUES (%s, %s, 'malformed', %s, %s) ON CONFLICT DO NOTHING""",
                               (update_id, received, chat_id, received))
+            if kind in ("chat_member", "my_chat_member") and chat_id is not None:
+                self._queue_m2_check(chat_id, received)
             if kind in MEMBERSHIP_TYPES and chat_id is not None and isinstance(inner, dict):
                 subject = _subject_id(kind, inner)
                 # the erasure cutoff by the payload's date; when that is unusable, anyone ever erased counts
@@ -843,6 +850,8 @@ class Ingest:
                             (p.update_id, p.date, p.type, p.chat.id if in_scope else None, received)).fetchone() is None
         if not seen and in_scope:
             self._body(fx, p, raw, received)
+            if p.type in ("chat_member", "my_chat_member"):
+                self._queue_m2_check(p.chat.id, received)  # after the body: M1 may have just run
         self._advance(fx, received, update_id=p.update_id, update_date=p.date, caught_up=caught_up)
         lag = max(0.0, (received - p.date).total_seconds())
         fx.add(lambda: metrics.UPDATES.labels(p.type).inc())
@@ -948,13 +957,15 @@ class Ingest:
             self._message(fx, p, chat_id, erased, received)
         elif p.type == "channel_post":
             self._channel_post(fx, p, chat_id)
-        if p.type in ("chat_member", "my_chat_member"):
-            # news from the destination of a migration still in M2 (after the body: M1 may have just run): the
-            # bot may be admin there by now with its promotion update lost; a rights check decides M1
-            conn.execute("""UPDATE tg.chat c SET rights_due_at = coalesce(c.rights_due_at, %s)
-                            WHERE c.chat_id = %s AND EXISTS (SELECT 1 FROM tg.chat_alias a
-                                                             WHERE a.chat_id = c.chat_id AND a.moved_at IS NULL)""",
-                         (received, chat_id))
+
+    def _queue_m2_check(self, chat_id: int, received: dt.datetime) -> None:
+        """A chat_member or my_chat_member update from the destination of a migration still in M2 (any receipt:
+        stored, receipt-only for an erased person, or malformed): the bot may be admin there by now with its
+        promotion update lost, so a rights check decides M1. Chat-level: nothing about the person is stored."""
+        self.conn.execute("""UPDATE tg.chat c SET rights_due_at = coalesce(c.rights_due_at, %s)
+                             WHERE c.chat_id = %s AND EXISTS (SELECT 1 FROM tg.chat_alias a
+                                                              WHERE a.chat_id = c.chat_id AND a.moved_at IS NULL)""",
+                          (received, chat_id))
 
     def _pending_aliases(self, chat_id: int) -> list[tuple[int, dt.datetime]]:
         """Migrations into this chat whose history waits for M1 (old chat id, migrated_at)."""
@@ -1360,14 +1371,17 @@ class Ingest:
     def redact(self, inner: dict, erased: set[int] = frozenset()) -> dict:  # type: ignore[assignment]
         """The payload as stored in tg.raw_update: no bio or user_chat_id anywhere, a full invite link (one
         this bot made, or any link Telegram did not mask) replaced by its digest marker, erased people replaced,
-        names and usernames of people dropped when store_names is off, and a value of another shape at a
-        sensitive position (a person, a member, invite_link, a name) dropped."""
+        names and usernames of people dropped when store_names is off, a value of another shape at a sensitive
+        position (a person, a member, invite_link, a name) dropped, a link object keeping only the ChatInviteLink
+        fields, and NaN or Infinity stored as null."""
         bot_id = self._bot_id()
         digest = self.ctx.config.link_digest
 
         def walk(v: Any, key: str | None = None) -> Any:
             if isinstance(v, list):
                 return [walk(x) for x in v]
+            if isinstance(v, float) and not math.isfinite(v):
+                return None  # NaN and Infinity: Python's JSON decoder accepts them, jsonb does not
             if not isinstance(v, dict):
                 return v
             # a person: by its position in the payload (even when the object is incomplete) or by its shape
