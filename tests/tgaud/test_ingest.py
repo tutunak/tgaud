@@ -1016,10 +1016,11 @@ def test_m2_restart_never_checks_the_old_group_and_m1_moves_no_open_gap(h):
     tracked_channel(h, upd=1, chat=BASIC, at=t)
     mig = T0 - dt.timedelta(hours=2)
     h.poll(migrate_to(2, mig))
-    h.fake.error("getChatMember", 400, "Bad Request: group chat was upgraded to a supergroup chat", times=3)
+    # the bot was promoted in the supergroup before the restart (its update is still queued)
+    h.fake.respond("getChatMember", lambda params: member(BOT_ID, "administrator", **admin_rights()))
     h.restart()
-    assert [c.params["chat_id"] for c in h.fake.calls_of("getChatMember")] == []
-    assert h.one("SELECT rights_due_at, metadata_due_at FROM tg.chat WHERE chat_id = %s", BASIC["id"]) == (None, None)
+    assert BASIC["id"] not in [c.params["chat_id"] for c in h.fake.calls_of("getChatMember")]
+    assert h.one("SELECT rights_due_at, metadata_due_at FROM tg.chat WHERE chat_id = %s", NEW_SG["id"])[0] is None
     h.poll(my_chat_member(3, T0 - dt.timedelta(minutes=30), chat=NEW_SG))
     assert h.q("SELECT chat_id FROM tg.chat") == [(NEW_SG["id"],)]
     assert h.q("SELECT count(*) FROM tg.gap WHERE upper_inf(period)") == [(0,)]
@@ -1074,4 +1075,158 @@ def test_move_chat_history_keeps_what_only_the_source_rows_know(migrated_dsn):
         assert conn.execute("SELECT chat_id, outcome, resolved_at, resolved_by FROM tg.join_request").fetchall() == [
             (new, "approved", c, 7)]
         assert conn.execute("SELECT from_day FROM tg.rollup_dirty WHERE chat_id = %s", (new,)).fetchone()[0] == a.date()
+        conn.rollback()
+
+
+# ------------------------------------------------------------------------------------------------------------
+# review round 2 regressions
+# ------------------------------------------------------------------------------------------------------------
+
+
+def test_updates_not_allowed_closes_through_the_serve_entry_points(make):
+    h = make().start()
+    tracked_channel(h, at=T0 - dt.timedelta(hours=1))
+    with psycopg.connect(h.dsn, autocommit=True) as c:
+        c.execute("UPDATE tg.bot_state SET allowed_updates = '{message}'")
+    h.close()
+    conn = psycopg.connect(h.dsn)
+    ctx = JobContext(config=h.cfg, api=h.fake.api(), health=metrics.Health(), stop=threading.Event(), clock=h.clock)
+    ingest.identify(ctx, conn)
+    ctx.generation = db.claim_generation(conn)
+    ingest.startup(ctx, conn)  # one Ingest instance ...
+    assert h.q("SELECT upper_inf(period) FROM tg.gap WHERE reason = 'updates_not_allowed'") == [(True,)]
+    t = threading.Thread(target=ingest.run, args=(ctx, conn), daemon=True)  # ... and another one polls
+    t.start()
+    deadline = dt.datetime.now() + dt.timedelta(seconds=10)
+    while dt.datetime.now() < deadline and h.q("SELECT 1 FROM tg.gap WHERE reason = 'updates_not_allowed' "
+                                               "AND upper_inf(period)"):
+        threading.Event().wait(0.05)
+    ctx.stop.set()
+    t.join(5)
+    conn.close()
+    assert h.q("SELECT upper_inf(period) FROM tg.gap WHERE reason = 'updates_not_allowed'") == [(False,)]
+
+
+def test_unhashable_ids_and_a_scalar_invite_link_in_malformed_payloads(h):
+    tracked_channel(h)
+    odd_from = chat_member(10, 42, T0)
+    odd_from["chat_member"]["from"]["id"] = [1, 2]
+    odd_user = chat_member(11, 43, T0)
+    odd_user["chat_member"]["new_chat_member"]["user"]["id"] = {"x": 1}
+    scalar_link = chat_member(12, 44, T0)
+    scalar_link["chat_member"]["invite_link"] = BOT_LINK
+    h.poll(odd_from, odd_user, scalar_link, chat_member(13, 45, T0))
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "malformed"), (12, "malformed"), (13, "chat_member")]
+    assert h.q("SELECT update_id FROM tg.member_event") == [(13,)]
+    raw = h.one("SELECT payload FROM tg.raw_update WHERE update_id = 12")
+    assert raw["invite_link"] == ingest.DIGEST_MARK + digest(BOT_LINK).hex()
+    for table in ("tg.raw_update", "tg.invite_link", "tg.update_receipt", "tg.member_event"):
+        assert not [r for (r,) in h.q(f"SELECT t::text FROM {table} t") if "BOTLINKfulltoken" in r], table
+
+
+def test_an_event_older_than_a_failed_check_keeps_the_retry(make):
+    h = make().start()
+    tracked_channel(h, at=T0 - dt.timedelta(hours=1))
+    h.clock.advance(hours=1)
+    h.fake.error("getChatMember", 500, "Internal Server Error")
+    h.restart()
+    failed_at = h.clock.now
+    # a queued rights change from before the failed check: newer than the last good check, older than the failure
+    h.poll(my_chat_member(2, failed_at - dt.timedelta(minutes=10), "administrator", "administrator",
+                          can_change_info=False))
+    assert h.one("SELECT rights_due_at IS NOT NULL, rights_attempts, rights_failed_at FROM tg.chat") == (
+        True, 1, failed_at)
+    assert h.q("SELECT confirmed, upper_inf(period) FROM tg.gap WHERE chat_id IS NOT NULL") == [(False, True)]
+    # an event from the failure on resolves it
+    h.clock.advance(seconds=5)
+    h.poll(my_chat_member(3, h.clock.now, "administrator", "administrator"))
+    assert h.one("SELECT rights_due_at, rights_attempts, rights_failed_at FROM tg.chat") == (None, 0, None)
+    assert h.q("SELECT confirmed, upper(period) FROM tg.gap WHERE chat_id IS NOT NULL") == [(False, h.clock.now)]
+
+
+@pytest.mark.parametrize("crash", [False, True])
+def test_moving_a_gap_start_earlier_restarts_its_g1_progress(make, crash):
+    h = make().start()
+    tracked_channel(h, at=T0 - dt.timedelta(hours=1))
+    h.clock.advance(minutes=6)
+    check = h.clock.now
+    h.fake.ok("getChatMember", member(BOT_ID, "member"))
+    h.restart()
+    gap_id, lower = h.one("SELECT gap_id, lower(period) FROM tg.gap WHERE reason = 'not_admin'")
+    assert lower == check
+    with psycopg.connect(h.dsn, autocommit=True) as c:
+        c.execute("INSERT INTO tg.gap_progress (gap_id, chat_id, last_user_id, done) VALUES (%s, %s, 100, true)",
+                  (gap_id, CHANNEL["id"]))
+    demoted = my_chat_member(2, T0 + dt.timedelta(minutes=1), "member", "administrator")
+    if crash:
+        h.ing.before_commit = lambda update_id: (_ for _ in ()).throw(Crash())
+        with pytest.raises(Crash):
+            h.poll(demoted)
+        assert h.one("SELECT lower(period) FROM tg.gap WHERE gap_id = %s", gap_id) == check
+        assert h.q("SELECT done FROM tg.gap_progress") == [(True,)]
+        h.ing.before_commit = None
+    h.poll(demoted)
+    assert h.one("SELECT lower(period) FROM tg.gap WHERE gap_id = %s", gap_id) == T0 + dt.timedelta(minutes=1)
+    assert h.q("SELECT count(*) FROM tg.gap_progress") == [(0,)]
+
+
+@pytest.mark.parametrize("collector_row", [False, True])
+def test_a_migration_queues_the_destinations_rights_check_and_m1_follows(h, collector_row):
+    tracked_channel(h, upd=1, chat=BASIC, at=T0 - dt.timedelta(hours=5))
+    h.poll(chat_member(2, 42, T0 - dt.timedelta(hours=4), chat=BASIC))
+    if collector_row:
+        with psycopg.connect(h.dsn, autocommit=True) as c:
+            c.execute("INSERT INTO tg.chat (chat_id, chat_type, title) VALUES (%s, 'supergroup', 'from collect')",
+                      (NEW_SG["id"],))
+    h.poll(migrate_to(3, T0 - dt.timedelta(hours=2)))
+    assert h.one("SELECT moved_at FROM tg.chat_alias") is None
+    assert h.one("SELECT rights_due_at IS NOT NULL FROM tg.chat WHERE chat_id = %s", NEW_SG["id"]) is True
+    # the promotion update was lost; the check finds the bot admin there
+    h.fake.ok("getChatMember", member(BOT_ID, "administrator", **admin_rights()))
+    assert h.ing.refresh_rights() == 1
+    assert h.one("SELECT moved_at IS NOT NULL FROM tg.chat_alias") is True
+    assert h.q("SELECT chat_id, source_chat_id FROM tg.member_event") == [(NEW_SG["id"], BASIC["id"])]
+
+
+def test_a_self_join_after_the_link_stopped_asking_for_approval_leaves_the_request(h):
+    tracked_channel(h)
+    approval_link = dict(masked_link(), name="approval link", creates_join_request=True)
+    h.poll(join_request(10, 43, T0 - dt.timedelta(hours=2), link=approval_link))
+    edited = dict(approval_link, creates_join_request=False)
+    h.poll(chat_member(11, 43, T0 - dt.timedelta(hours=1), link=edited))  # a self-join: from = the user
+    assert h.q("SELECT outcome FROM tg.join_request") == [(None,)]
+
+
+def test_update_ids_at_and_past_the_int4_limit_commit(h):
+    tracked_channel(h)
+    h.poll(chat_member(2 ** 31 - 1, 42, T0))
+    assert h.one("SELECT next_offset, last_update_id FROM tg.bot_state") == (2 ** 31, 2 ** 31 - 1)
+    h.poll(chat_member(2 ** 62, 43, T0))
+    assert h.one("SELECT next_offset FROM tg.bot_state") == 2 ** 62 + 1
+    assert h.q("SELECT count(*) FROM tg.member_event") == [(2,)]
+
+
+def test_a_migration_to_the_same_id_is_malformed(h):
+    tracked_channel(h, chat=BASIC)
+    h.poll(message(10, T0, chat=BASIC, uid=ADMIN, mid=91, migrate_to_chat_id=BASIC["id"]),
+           chat_member(11, 42, T0, chat=BASIC))
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "chat_member")]
+    assert h.q("SELECT count(*) FROM tg.chat_alias") == [(0,)]
+    assert h.q("SELECT update_id FROM tg.member_event") == [(11,)]
+
+
+def test_move_chat_history_marks_utc_days_whatever_the_session_time_zone(migrated_dsn):
+    old, new = -400003, -1004000000003
+    late = dt.datetime(2026, 11, 10, 23, 45, tzinfo=dt.UTC)  # 00:45 on the 11th in Belgrade
+    with psycopg.connect(migrated_dsn) as conn:
+        conn.execute("SET TIME ZONE 'Europe/Belgrade'")
+        conn.execute("INSERT INTO tg.chat (chat_id, chat_type, title, tracked) VALUES (%s, 'group', 'o', true), "
+                     "(%s, 'supergroup', 'n', true)", (old, new))
+        conn.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events) "
+                     "VALUES (%s, %s, 10, 9, 0)", (old, late))
+        conn.execute("SELECT tg.move_chat_history(%s, %s, %s)", (old, new, late + dt.timedelta(days=5)))
+        assert conn.execute("SELECT from_day FROM tg.rollup_dirty WHERE chat_id = %s", (new,)).fetchone()[0] == (
+            dt.date(2026, 11, 10))
         conn.rollback()

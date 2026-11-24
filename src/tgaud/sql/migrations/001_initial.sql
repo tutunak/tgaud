@@ -840,10 +840,11 @@ BEGIN
   IF EXISTS (SELECT 1 FROM tg.chat_alias WHERE old_chat_id = p_old_chat_id AND moved_at IS NOT NULL) THEN
     RETURN 0;
   END IF;
-  -- the earliest UTC day whose rollup inputs move (events, samples, activity, the old rollups and marker)
-  SELECT least(p_migrated_at::date,
-               (SELECT min(event_at)::date FROM tg.member_event WHERE chat_id = p_old_chat_id),
-               (SELECT min(sampled_at)::date FROM tg.count_sample WHERE chat_id = p_old_chat_id),
+  -- the earliest UTC day whose rollup inputs move (events, samples, activity, the old rollups and marker);
+  -- timestamps are taken to UTC dates explicitly, whatever the session's TimeZone
+  SELECT least((p_migrated_at AT TIME ZONE 'UTC')::date,
+               (SELECT (min(event_at) AT TIME ZONE 'UTC')::date FROM tg.member_event WHERE chat_id = p_old_chat_id),
+               (SELECT (min(sampled_at) AT TIME ZONE 'UTC')::date FROM tg.count_sample WHERE chat_id = p_old_chat_id),
                (SELECT min(day) FROM tg.activity_daily WHERE chat_id = p_old_chat_id),
                (SELECT min(day) FROM tg.unattributed_daily WHERE chat_id = p_old_chat_id),
                (SELECT min(day) FROM stats.chat_day WHERE chat_id = p_old_chat_id),

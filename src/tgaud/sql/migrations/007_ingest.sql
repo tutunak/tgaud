@@ -33,4 +33,10 @@ ALTER TABLE tg.chat ADD COLUMN rights_attempts integer NOT NULL DEFAULT 0 CHECK 
 COMMENT ON COLUMN tg.chat.rights_attempts IS
   'Failed rights checks since the last success (the backoff of rights_due_at); 0 after a success.';
 
+ALTER TABLE tg.chat ADD COLUMN rights_failed_at timestamptz;
+COMMENT ON COLUMN tg.chat.rights_failed_at IS
+  'The first failed rights check since the last success; NULL = none pending. A my_chat_member dated before it '
+  'does not cancel the retry (it says nothing about the state at the failure); a successful check or a newer '
+  'event clears it.';
+
 CREATE INDEX chat_rights_due ON tg.chat (rights_due_at) WHERE rights_due_at IS NOT NULL;
