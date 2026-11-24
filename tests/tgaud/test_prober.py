@@ -608,6 +608,123 @@ def test_a_reconcile_batch_of_outage_probes_is_asked_by_spell_not_by_queue_order
     assert later[1:] == sorted(later[1:], reverse=True) and not set(later) & set(range(302, 307))
 
 
+def _outage_backlog(e: Env, newest: int = 301) -> None:
+    """200 outage probes of spells from minute 101 to 300, and user `newest` with the newest spell, no probe yet."""
+    for u in range(1, 201):
+        e.w.join(u, at(100 + u))
+    e.w.join(newest, at(1000))
+    for u in range(302, 307):
+        e.w.join(u, at(u - 301))  # the oldest spells
+    e.w.rebuild()
+    for u in range(1, 201):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+
+
+def test_a_probe_promoted_to_outage_in_place_is_asked_by_its_spell(env):
+    """review round 1: the newest spell's pair has an hour-old sample probe, cached at the end of the queue; the batch
+    of tg.queue_probes raises it to outage in place (its queued_at and id stay) and adds five old spells. The promoted
+    probe is the next call, once; the five wait behind every cached outage probe."""
+    e = env
+    _outage_backlog(e)
+    queue(e, 301, "sample", queued=START - timedelta(hours=1))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')",
+                         ([CHAT] * 6, list(range(301, 307)))).fetchone()[0] == 6  # one raised, five inserted
+    e.run(p, 20.0)
+    later = [u for _, u in asked(e)[n:]]
+    assert later[0] == 301 and later.count(301) == 1 and len(later) > 90
+    assert later[1:] == sorted(later[1:], reverse=True) and not set(later) & set(range(302, 307))
+
+
+def test_an_outage_probe_out_of_its_backoff_is_asked_at_its_place(env):
+    """review round 1: the newest spell's outage probe failed once 30 s before the cache was read (backoff 60 s): it is
+    cached waiting, skipped until its backoff ends, and the first call after that."""
+    e = env
+    _outage_backlog(e)
+    pid = queue(e, 301, "outage", queued=START - timedelta(hours=2))
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=30), pid))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 29.0)
+    assert 301 not in [u for _, u in asked(e)]
+    n = len(asked(e))
+    e.clock.set(START + timedelta(seconds=30))  # the end of its backoff
+    e.run(p, 2.0)
+    assert asked(e)[n] == (CHAT, 301)
+    assert probe_row(e, pid)["outcome"] == "in"
+
+
+def test_a_failure_is_cached_until_its_backoff_ends_and_own_answers_rank_nothing_again(env, monkeypatch):
+    """The fix's bookkeeping: the job's own answers and failures leave the outage set it expects in step with the
+    database (no ranking again while nothing else changes); a probe that failed is asked again when its backoff ends,
+    at its place; one change by someone else ranks the chat again once."""
+    e = env
+    _outage_backlog(e)
+    e.w.c.commit()
+    failed = {200: 0}
+
+    def compute(params):
+        if params["user_id"] == 200 and failed[200] == 0:
+            failed[200] += 1
+            return None  # an answer without a status: a failure (attempt 1, backoff 60 s)
+        return {"status": "member", "user": {"id": params["user_id"], "is_bot": False}}
+    e.fake.respond("getChatMember", compute)
+    p = prober.make(e.ctx)
+    ranked = []
+    real = p._rank_outage
+    monkeypatch.setattr(p, "_rank_outage", lambda *a: (ranked.append(a[2]), real(*a)))
+    e.run(p, 10.0)
+    assert ranked == [] and [u for _, u in asked(e)][:2] == [200, 199]  # 200 failed: attempt 1, backoff 60 s
+    with psycopg.connect(e.dsn) as c:  # someone else's change while the backlog drains
+        c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [301]))
+    n = len(asked(e))
+    e.run(p, 1.0)
+    assert ranked == [CHAT] and asked(e)[n] == (CHAT, 301)
+    e.run(p, 52.0)  # user 200's backoff ends 60 s after its failure: asked again then
+    calls = [u for _, u in asked(e)]
+    assert calls.count(200) == 2 and calls[-1] == 200 and ranked == [CHAT]
+    pid = e.w.c.execute("SELECT probe_id FROM tg.probe WHERE user_id = 200").fetchone()[0]
+    assert probe_row(e, pid)["outcome"] == "in"
+
+
+def test_a_probe_queued_while_the_chat_is_ranked_again_is_caught_by_the_next_head_read(env, monkeypatch):
+    """Ordering of the set read and the ranking: another session queues a newer spell's probe between them. The ranking
+    may or may not see it; the expected set is the one read before, so the next head read ranks again if needed. Each
+    probe is asked once, newest spell first."""
+    e = env
+    _outage_backlog(e)
+    e.w.join(400, at(2000))
+    e.w.rebuild([400])
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    ranked = []
+    real = p._rank_outage
+
+    def between(conn, now, chat, expect):
+        ranked.append(chat)
+        if len(ranked) == 1:
+            with psycopg.connect(e.dsn) as c:
+                c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [400]))
+        return real(conn, now, chat, expect)
+    monkeypatch.setattr(p, "_rank_outage", between)
+    e.run(p, 2.0)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:
+        c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [301]))
+    e.run(p, 5.0)
+    later = [u for _, u in asked(e)[n:]]
+    assert later[:2] == [400, 301] and len(set(asked(e))) == len(asked(e))
+    assert ranked[:2] == [CHAT, CHAT]  # the second ranking picked up what the first one's expected set did not hold
+
+
 def test_a_conflict_of_another_chat_queued_during_a_backlog_is_asked_next(env):
     e = env
     e.w.add_chat(OTHER)

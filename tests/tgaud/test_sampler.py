@@ -421,6 +421,33 @@ def test_join_requests_without_an_outcome_become_unknown_after_7_days(env):
     assert report()[2:] == (2, 0) and value("tgaud_chat_join_requests_pending", CHAT) == 0
 
 
+def test_the_funnel_ages_requests_by_168_hours_across_the_autumn_clock_change(env):
+    """crossfix review 1: a request of 10-19 12:00 UTC is 7 days (168 h) old at 10-26 12:00 UTC, when the sampler marks
+    it unknown. Europe/Belgrade's clocks went back on 10-25, so a calendar week in a session of that zone ends an hour
+    later. Block 12 read in that session at 12:30 UTC agrees with the gauge, before and after a late approval."""
+    e = env
+    requested = datetime(2026, 10, 19, 12, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 10, 26, 12, 30, tzinfo=timezone.utc)
+    e.w.user(1)
+    e.w.c.execute("INSERT INTO tg.join_request (chat_id, user_id, requested_at) VALUES (%s, 1, %s)", (CHAT, requested))
+    e.w.c.commit()
+    e.clock.set(cutoff)
+    job = sampler.make(e.ctx)
+    e.tick(job)
+    assert value("tgaud_chat_join_requests_pending", CHAT) == 0
+
+    def funnel() -> tuple:
+        with psycopg.connect(e.dsn) as c:
+            c.execute("SET TIME ZONE 'Europe/Belgrade'")
+            (r,) = sql.run(c, "12", as_of=cutoff, since=requested - timedelta(days=1)).dicts()
+            return r["unknown"], r["pending"]
+    assert funnel() == (1, 0)
+    with psycopg.connect(e.dsn) as c:  # a late approval: ingest supersedes the unknown outcome
+        c.execute("UPDATE tg.join_request SET outcome = 'approved', resolved_at = %s WHERE user_id = 1",
+                  (cutoff + timedelta(days=1),))
+    assert funnel() == (1, 0)  # as of the cutoff the answer had not come: unknown, as the gauge said then
+
+
 # --- a count call that an exact transition falls into (review 1) -----------------------------------------------------
 
 @pytest.mark.parametrize("counted", [True, False], ids=["count-includes-the-join", "count-before-the-join"])

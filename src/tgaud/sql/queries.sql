@@ -519,7 +519,8 @@ SELECT :'only' IN ('all', '12') AS run \gset
 -- unknown = no answer seen within 7 days (declines by other admins send no update, F§3); pending = younger.
 -- Outcomes are read as of as_of: an answer after as_of leaves the request pending until its 7 days have passed
 -- and unknown after that (an answer the sampler had not seen within 7 days), 'unknown' only once 7 days have
--- passed, and the approved join must be before as_of.
+-- passed, and the approved join must be before as_of. 7 days = 168 hours, as the sampler ages them: a calendar
+-- interval would follow the session's time zone and gain or lose an hour across a clock change.
 :explain
 SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS week, count(*) AS requests,
        count(*) FILTER (WHERE o.outcome = 'approved') AS approved,
@@ -535,7 +536,8 @@ SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS
 FROM tg.join_request r
 JOIN tg.chat c ON c.chat_id = r.chat_id AND c.tracked
 CROSS JOIN LATERAL (SELECT CASE WHEN r.outcome = 'unknown' OR r.resolved_at > :'as_of_ts'::timestamptz
-                                THEN CASE WHEN r.requested_at + interval '7 days' <= :'as_of_ts'::timestamptz THEN 'unknown' END
+                                THEN CASE WHEN r.requested_at + interval '168 hours' <= :'as_of_ts'::timestamptz
+                                          THEN 'unknown' END
                                 ELSE r.outcome END AS outcome) o
 LEFT JOIN LATERAL (
   SELECT m.joined_at, m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since

@@ -3,15 +3,18 @@
 Queue order: `manual` (the CLI) first, then `conflict`, `outage` (the newest open spell first), `snapshot_absent`,
 `sample`; ties by queued_at. Only probes that are ready are taken: never tried, or past the backoff of their
 last failure. The candidates are cached: a full read every FULL_REFRESH seconds or when the cache runs out. Between
-full reads, every step first reads the heads of the queue (by the index probe_pending_reason) into the cache at
-their place in the same order: per chat and first-come reason the oldest ready probes (a conflict or manual probe
-queued or raised in place meanwhile, or a chat that starts waiting), and per chat the outage probes queued since the
-full read (queued_at from ARRIVAL_MARGIN before it: a queuing transaction that began before the read and committed
-after it), ranked by their spells, newest first, before the limit: a reconciliation batch of any size that queues
-the newest spell last is still asked newest spell first. The limit is PER_STEP, all a step can take ahead of the
-cached ones. A head candidate the full read would have left out (after the last cached candidate of a chat whose
-read was cut at PER_CHAT) stays out. An outage probe raised in place from a lower reason keeps its older queued_at
-and waits for the next full read.
+full reads, every step first brings the cache up to date at the places of the same order:
+  - per chat and first-come reason, the oldest ready probes (by the index probe_pending_reason): a conflict or manual
+    probe queued or raised in place meanwhile, or a chat that starts waiting;
+  - outage: the count and the id sum of each chat's pending outage probes, read before the full read and before
+    every head read, are compared with what the cache expects (the read's, less the outage probes this job has
+    answered since). Any other change (probes queued, raised in place to outage, re-keyed by M1, cancelled) makes
+    the job rank that chat's outage probes by their spells again, every one before the cut, so a batch of any size
+    or a promotion is asked newest spell first;
+  - probes in backoff are cached too, with the time their backoff ends (the full read's, and every failure this
+    job records): they are skipped until then and taken at their place from then on.
+A head candidate the full read would have left out (after the last cached candidate of a chat whose read was cut at
+PER_CHAT) stays out.
 
 Budget: one global token bucket at `config.probe_rate` calls/s (TGAUD_PROBE_RATE, default 5; burst one second's
 worth). While other chats have ready probes, one chat gets at most half of the rate (its own bucket at rate/2);
@@ -43,7 +46,7 @@ import bisect
 import logging
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 import psycopg
@@ -62,61 +65,62 @@ FULL_REFRESH = 120.0  # seconds between full candidate reads while the cache has
 IDLE_REFRESH = 5.0  # seconds between reads of an empty queue
 PER_CHAT = 600  # candidates read per chat: two minutes of the whole default budget
 PER_HEAD = 5  # ready probes read per chat and first-come reason by each step's head read
-PER_STEP = 20  # probes per step; also the outage arrivals per chat each head read ranks in
-ARRIVAL_MARGIN = 60.0  # seconds before the full read from which an outage probe counts as queued after it
+PER_STEP = 20  # probes per step
 STEP_SECONDS = 3.0  # and at most this long (wall time) per step
 STATUSES = frozenset({"creator", "administrator", "member", "restricted", "left", "kicked"})
 
+# Pending probes in queue order, per chat at most per_chat ready ones and per_chat in backoff (with the end of their
+# backoff, so the cache takes them when they become ready). {where} narrows it to one chat's outage probes.
 _CANDIDATES = """
-WITH ready AS (
+WITH pending AS (
   SELECT p.probe_id, p.chat_id, p.user_id, p.reason, p.queued_at,
          array_position(%(priority)s::text[], p.reason) AS prio,
-         -- the pair's newest spell (the open one G1 queued it for): an index-only read of membership_pair
-         CASE WHEN p.reason = 'outage' THEN
-           (SELECT max(m.known_from) FROM tg.membership m
-             WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id) END AS spell_from
+         CASE WHEN p.attempts > 0 AND p.last_attempt_at IS NOT NULL THEN
+           p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)]) END
+           AS ready_at
   FROM tg.probe p
-  WHERE p.outcome = 'pending'
-    AND (p.attempts = 0 OR p.last_attempt_at IS NULL
-         OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)])
-            <= %(now)s)
+  WHERE p.outcome = 'pending'{where}
+), keyed AS (
+  SELECT q.*, coalesce(q.ready_at > %(now)s, false) AS waiting,
+         -- the pair's newest spell (the open one G1 queued it for): an index-only read of membership_pair
+         CASE WHEN q.reason = 'outage' THEN
+           (SELECT max(m.known_from) FROM tg.membership m
+             WHERE m.chat_id = q.chat_id AND m.user_id = q.user_id) END AS spell_from
+  FROM pending q
 ), ranked AS (
-  SELECT r.*, row_number() OVER (PARTITION BY r.chat_id
-                                 ORDER BY r.prio, r.spell_from DESC NULLS LAST, r.queued_at, r.probe_id) AS rn
-  FROM ready r
+  SELECT k.*, row_number() OVER (PARTITION BY k.chat_id, k.waiting
+                                 ORDER BY k.prio, k.spell_from DESC NULLS LAST, k.queued_at, k.probe_id) AS rn
+  FROM keyed k
 )
 SELECT prio, extract(epoch FROM spell_from)::float8, extract(epoch FROM queued_at)::float8, probe_id, chat_id,
-       user_id, reason
+       user_id, reason, CASE WHEN waiting THEN extract(epoch FROM ready_at)::float8 END
 FROM ranked WHERE rn <= %(per_chat)s
 ORDER BY prio, spell_from DESC NULLS LAST, queued_at, probe_id"""
+
+_ALL = _CANDIDATES.format(where="")
+_CHAT_OUTAGE = _CANDIDATES.format(where=" AND p.chat_id = %(chat)s AND p.reason = 'outage'")
+
+# The pending outage probes of each chat as a count and an id sum: any change but this job's own answers shows
+_OUTAGE_SETS = """
+SELECT p.chat_id, count(*), sum(p.probe_id) FROM tg.probe p
+WHERE p.outcome = 'pending' AND p.reason = 'outage' GROUP BY p.chat_id"""
 
 _READY = """
     AND (p.attempts = 0 OR p.last_attempt_at IS NULL
          OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)])
             <= %(now)s)"""
 
-# The heads, per chat and reason (short index ranges of probe_pending_reason): the oldest ready probes (first-come
-# reasons, so also a row whose reason was raised in place), and for outage the ready ones queued since the full read
-# (%(since)s), every one ranked by its pair's newest spell before the limit: their number is what was queued since,
-# not the queue's. Same columns and order key as _CANDIDATES.
+# The heads of the first-come reasons, per chat and reason (short index ranges of probe_pending_reason): the oldest
+# ready probes, so also a row whose reason was raised in place. Same columns and order key as _CANDIDATES.
 _HEADS = f"""
-SELECT r.prio::int, extract(epoch FROM h.spell_from)::float8, extract(epoch FROM h.queued_at)::float8, h.probe_id,
-       h.chat_id, h.user_id, r.reason
+SELECT r.prio::int, NULL::float8, extract(epoch FROM h.queued_at)::float8, h.probe_id, h.chat_id, h.user_id, r.reason
 FROM tg.chat c
 CROSS JOIN unnest(%(priority)s::text[]) WITH ORDINALITY AS r(reason, prio)
 CROSS JOIN LATERAL (
-  (SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at, NULL::timestamptz AS spell_from FROM tg.probe p
-   WHERE r.reason <> 'outage' AND p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending' {_READY}
-   ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s)
-  UNION ALL
-  (SELECT a.probe_id, a.chat_id, a.user_id, a.queued_at, a.spell_from FROM (
-     SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at,
-            (SELECT max(m.known_from) FROM tg.membership m WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id)
-              AS spell_from
-     FROM tg.probe p
-     WHERE r.reason = 'outage' AND p.chat_id = c.chat_id AND p.reason = 'outage' AND p.outcome = 'pending'
-       AND p.queued_at >= %(since)s {_READY}) a
-   ORDER BY a.spell_from DESC NULLS LAST, a.queued_at, a.probe_id LIMIT %(per_arrivals)s)) h"""
+  SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at FROM tg.probe p
+  WHERE p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending' {_READY}
+  ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s) h
+WHERE r.reason <> 'outage'"""
 
 
 class TokenBucket:
@@ -166,6 +170,7 @@ class Candidate:
     chat_id: int
     user_id: int
     reason: str
+    ready_at: float = 0.0  # the end of its backoff (job clock); taken only from then on
 
 
 def _utc(t: float) -> datetime:
@@ -173,10 +178,10 @@ def _utc(t: float) -> datetime:
 
 
 def _candidate(prio: int, spell_from: float | None, queued_at: float, probe_id: int, chat_id: int, user_id: int,
-               reason: str) -> Candidate:
+               reason: str, ready_at: float | None = None) -> Candidate:
     """A row of _CANDIDATES or _HEADS, keyed like their ORDER BY (spell_from DESC NULLS LAST)."""
     spell = -spell_from if spell_from is not None else math.inf
-    return Candidate((prio, spell, queued_at, probe_id), probe_id, chat_id, user_id, reason)
+    return Candidate((prio, spell, queued_at, probe_id), probe_id, chat_id, user_id, reason, ready_at or 0.0)
 
 
 class Prober:
@@ -190,8 +195,8 @@ class Prober:
         self.chat_buckets: dict[int, TokenBucket] = {}
         self.queue: list[Candidate] = []
         self.next_read = now  # the full read
-        self.read_at: float | None = None  # when the last full read ran
-        self.horizon: dict[int, tuple[int, float, float, int]] = {}  # chat -> its last candidate's key, if cut
+        self.horizon: dict[int, tuple[int, float, float, int]] = {}  # chat -> its last ready candidate's key, if cut
+        self.outage_sets: dict[int, tuple[int, int]] = {}  # chat -> (count, id sum) of pending outage the cache expects
 
     # --- scheduling --------------------------------------------------------------------------------------------
 
@@ -212,15 +217,16 @@ class Prober:
         """The first candidate in queue order the budget allows now, or None."""
         if not self.queue or self.bucket.wait(now) > 0:
             return None
-        alone = len({c.chat_id for c in self.queue}) == 1
-        for cand in self.queue:
+        ready = [c for c in self.queue if c.ready_at <= now]
+        alone = len({c.chat_id for c in ready}) == 1
+        for cand in ready:
             if cand.reason == "manual" or alone or self._chat_bucket(cand.chat_id, now).wait(now) == 0:
                 return cand
         return None
 
     def _take(self, cand: Candidate, now: float) -> None:
         self.queue.remove(cand)
-        if not self.queue:
+        if not any(c.ready_at <= now for c in self.queue):
             self.next_read = min(self.next_read, now)  # a backlog longer than one read: read on at once
         self.bucket.take(now)
         self._chat_bucket(cand.chat_id, now).take(now)  # counted even when the share did not apply
@@ -248,28 +254,45 @@ class Prober:
             self.probe(conn, cand)
             done += 1
 
+    def _params(self, now: float, **more) -> dict:
+        return {"priority": list(PRIORITY), "backoff": list(BACKOFF), "steps": len(BACKOFF), "now": _utc(now),
+                "per_chat": PER_CHAT, **more}
+
+    def _cached(self, rows: list[tuple]) -> list[Candidate]:
+        """The rows of a read as cache entries: the ready ones, and those in backoff up to the chat's cut."""
+        cands = [_candidate(*r) for r in rows]
+        ready: dict[int, list[Candidate]] = {}
+        for c in cands:
+            if not c.ready_at:
+                ready.setdefault(c.chat_id, []).append(c)
+        for chat, rs in ready.items():
+            if len(rs) >= PER_CHAT:
+                cut = rs[-1].key
+                if chat not in self.horizon or cut < self.horizon[chat]:
+                    self.horizon[chat] = cut
+        return [c for c in cands if c.chat_id not in self.horizon or c.key <= self.horizon[c.chat_id]]
+
     def _read(self, conn: psycopg.Connection, now: float) -> None:
-        rows = conn.execute(_CANDIDATES, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
-                                          "steps": len(BACKOFF), "now": _utc(now), "per_chat": PER_CHAT}).fetchall()
-        self.queue = [_candidate(*r) for r in rows]
+        sets = dict((c, (n, s)) for c, n, s in conn.execute(_OUTAGE_SETS).fetchall())  # before: a change shows later
+        rows = conn.execute(_ALL, self._params(now)).fetchall()
+        self.horizon = {}
+        self.queue = self._cached(rows)
+        self.outage_sets = sets
         self.next_read = now + (FULL_REFRESH if self.queue else IDLE_REFRESH)
-        self.read_at = now
-        per_chat: dict[int, list[Candidate]] = {}
-        for c in self.queue:
-            per_chat.setdefault(c.chat_id, []).append(c)
-        self.horizon = {chat: cands[-1].key for chat, cands in per_chat.items() if len(cands) >= PER_CHAT}
         known = {c.chat_id for c in self.queue}
         for chat_id in [c for c in self.chat_buckets if c not in known]:
             del self.chat_buckets[chat_id]  # idle chats start again with a full share
 
     def _read_heads(self, conn: psycopg.Connection, now: float) -> None:
-        """Ready probes queued since the full read (and chats that started waiting) into the cache at their place in
-        the queue order; a cached probe whose reason was raised in place moves to its new place."""
+        """The changes since the full read into the cache at their place in the queue order: a chat whose outage
+        probes changed is ranked again; the heads of the first-come reasons (a cached probe whose reason was raised
+        in place moves to its new place)."""
+        sets = dict((c, (n, s)) for c, n, s in conn.execute(_OUTAGE_SETS).fetchall())
+        for chat in sorted(set(sets) | set(self.outage_sets)):
+            if sets.get(chat) != self.outage_sets.get(chat):
+                self._rank_outage(conn, now, chat, sets.get(chat))
         cached = {c.probe_id: c for c in self.queue}
-        since = _utc(self.read_at - ARRIVAL_MARGIN if self.read_at is not None else 0.0)
-        for row in conn.execute(_HEADS, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
-                                         "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD,
-                                         "since": since, "per_arrivals": PER_STEP}):
+        for row in conn.execute(_HEADS, self._params(now, per_head=PER_HEAD)):
             cand = _candidate(*row)
             cut = self.horizon.get(cand.chat_id)
             if cut is not None and cand.key > cut:
@@ -281,6 +304,31 @@ class Prober:
                 self.queue.remove(old)
             self._requeue(cand)
             cached[cand.probe_id] = cand
+
+    def _rank_outage(self, conn: psycopg.Connection, now: float, chat: int, expect: tuple[int, int] | None) -> None:
+        """One chat's outage probes read and ranked again (their set changed): they replace its cached outage
+        entries and any cached entry of the same probe under its former reason. `expect` is the set read before."""
+        rows = conn.execute(_CHAT_OUTAGE, self._params(now, chat=chat)).fetchall()
+        fresh = self._cached(rows)
+        ids = {c.probe_id for c in fresh}
+        cut = self.horizon.get(chat)
+        self.queue = [c for c in self.queue
+                      if c.probe_id not in ids and not (c.chat_id == chat and (c.reason == "outage"
+                                                                               or (cut is not None and c.key > cut)))]
+        for c in fresh:
+            self._requeue(c)
+        if expect is None:
+            self.outage_sets.pop(chat, None)
+        else:
+            self.outage_sets[chat] = expect
+
+    def _answered_outage(self, chat: int, probe_id: int) -> None:
+        """This job took a pending outage probe off the queue: the set the cache expects shrinks with it."""
+        n, total = self.outage_sets.get(chat, (0, 0))
+        if n <= 1:
+            self.outage_sets.pop(chat, None)
+        else:
+            self.outage_sets[chat] = (n - 1, total - probe_id)
 
     def probe(self, conn: psycopg.Connection, cand: Candidate) -> str:
         """Ask once and record the result; returns what happened (in, out, retry, error, late, dropped, 429)."""
@@ -305,14 +353,15 @@ class Prober:
 
         self.ctx.fence(conn)
         history.lock_chats(conn, [cand.chat_id])
-        row = conn.execute("SELECT chat_id, user_id, attempts FROM tg.probe WHERE probe_id = %s AND outcome = 'pending' "
-                           "FOR UPDATE", (cand.probe_id,)).fetchone()
+        row = conn.execute("SELECT chat_id, user_id, attempts, reason FROM tg.probe WHERE probe_id = %s "
+                           "AND outcome = 'pending' FOR UPDATE", (cand.probe_id,)).fetchone()
         if row is None or (row[0], row[1]) != (cand.chat_id, cand.user_id):
             conn.commit()
             log.info("prober: probe %d is no longer pending for (%d, %d): answer dropped",
                      cand.probe_id, cand.chat_id, cand.user_id)
             return "dropped"
         attempts = row[2] + 1
+        outage = row[3] == "outage"
 
         if error is not None:
             if attempts > len(BACKOFF):
@@ -320,12 +369,16 @@ class Prober:
                                        last_attempt_at = %s WHERE probe_id = %s""",
                              (error.outcome, attempts, _utc(sent), cand.probe_id))
                 conn.commit()
+                if outage:
+                    self._answered_outage(cand.chat_id, cand.probe_id)
                 metrics.PROBES.labels("error").inc()
                 log.info("prober: probe %d failed %d times (%s): error", cand.probe_id, attempts, error.outcome)
                 return "error"
             conn.execute("UPDATE tg.probe SET attempts = %s, last_attempt_at = %s WHERE probe_id = %s",
                          (attempts, _utc(sent), cand.probe_id))
             conn.commit()
+            # the SQL's readiness (last_attempt_at + the backoff of its attempts) on the job's clock
+            self._requeue(replace(cand, ready_at=sent + BACKOFF[attempts - 1]))
             return "retry"
 
         assert isinstance(member, dict)
@@ -347,6 +400,8 @@ class Prober:
                      (outcome, answered_at, sent_at, status, is_member, attempts, _utc(sent), cand.probe_id))
         history.rebuild_pairs(conn, [(cand.chat_id, cand.user_id)])
         conn.commit()
+        if outage:
+            self._answered_outage(cand.chat_id, cand.probe_id)
         metrics.PROBES.labels(outcome).inc()
         return outcome
 

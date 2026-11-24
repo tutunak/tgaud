@@ -165,7 +165,7 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
     password = secret("TGAUD_DATABASE_PASSWORD")
     raw_url = get("TGAUD_DATABASE_URL")
     if raw_url:
-        parsed = _parse_database_url(raw_url, problems)
+        parsed = _parse_database_url(raw_url, problems, env)
         if parsed is not None:
             conninfo, url_password, database_url = parsed
             if password is None and url_password:
@@ -252,7 +252,8 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
     )
 
 
-def _parse_database_url(raw: str, problems: list[str]) -> tuple[dict[str, str], str | None, str] | None:
+def _parse_database_url(raw: str, problems: list[str], env: Mapping[str, str] | None = None
+                        ) -> tuple[dict[str, str], str | None, str] | None:
     """(conninfo without password, the URL's password, a display URL) or None after a problem.
 
     Neither the display URL nor an error is ever built from the raw text: libpq accepts percent-encoded
@@ -280,11 +281,41 @@ def _parse_database_url(raw: str, problems: list[str]) -> tuple[dict[str, str], 
         elif value is not None and not check(str(value)):
             problems.append(f"TGAUD_DATABASE_URL has an invalid value for {key}")
     clean = {k: str(v) for k, v in info.items() if v is not None}
-    # a pair libpq refuses at connect time; its sslmode defaults to PGSSLMODE, else prefer
-    if clean.get("sslnegotiation") == "direct" and clean.get(
-            "sslmode", os.environ.get("PGSSLMODE") or "prefer") not in ("require", "verify-ca", "verify-full"):
-        problems.append("TGAUD_DATABASE_URL: sslnegotiation=direct needs sslmode require, verify-ca or verify-full")
+    problems.extend(_tls_problems(clean, os.environ if env is None else env))
     return clean, (str(url_password) if url_password else None), _display_url(clean)
+
+
+# The TLS options libpq checks against each other at connect time, with the environment variable it falls back to.
+_TLS_ENV = {"sslmode": "PGSSLMODE", "sslnegotiation": "PGSSLNEGOTIATION", "sslrootcert": "PGSSLROOTCERT"}
+
+
+def _tls_problems(info: Mapping[str, str], env: Mapping[str, str]) -> list[str]:
+    """The combinations libpq refuses before it connects, on the effective values: the URL's option, else the
+    environment variable (libpq reads it even when empty), else libpq's default (sslnegotiation postgres; sslmode
+    verify-full with sslrootcert=system, else prefer). Names and these fixed values only: never a path."""
+    found: dict[str, tuple[str, str]] = {}  # option -> (value, where it came from)
+    problems = []
+    valid = True
+    for key, var in _TLS_ENV.items():
+        if key in info:
+            found[key] = (info[key], f"{key} in TGAUD_DATABASE_URL")
+        elif var in env:
+            found[key] = (env[var], var)
+            if not _CONN_OPTIONS[key](env[var]):
+                problems.append(f"{var} has an invalid value for {key}")
+        valid = valid and (key not in found or _CONN_OPTIONS[key](found[key][0]))
+    if not valid:
+        return problems  # an invalid value is reported once (the URL's by the caller), never compared or shown
+    rootcert = found.get("sslrootcert", ("", ""))[0]
+    mode, mode_from = found.get("sslmode", ("verify-full" if rootcert == "system" else "prefer", "the default sslmode"))
+    negotiation, negotiation_from = found.get("sslnegotiation", ("postgres", ""))
+    if rootcert == "system" and mode != "verify-full":
+        problems.append(f"TGAUD_DATABASE_URL: sslrootcert=system ({found['sslrootcert'][1]}) needs sslmode "
+                        f"verify-full, not {mode} ({mode_from})")
+    if negotiation == "direct" and mode not in ("require", "verify-ca", "verify-full"):
+        problems.append(f"TGAUD_DATABASE_URL: sslnegotiation=direct ({negotiation_from}) needs sslmode require, "
+                        f"verify-ca or verify-full, not {mode} ({mode_from})")
+    return problems
 
 
 def _one_of(*allowed: str) -> Callable[[str], bool]:

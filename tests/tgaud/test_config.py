@@ -225,12 +225,56 @@ def test_option_verdicts_agree_with_libpq(query, ok):
     assert libpq_refused_option is (not ok), str(e.value)
 
 
-def test_selfcheck_refuses_the_tls_pair_libpq_refuses():
+TLS_ENV = ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT")
+
+
+@pytest.mark.parametrize("query,env,ok", [
+    ("sslmode=disable", {"PGSSLNEGOTIATION": "direct"}, False),          # review round 1: the environment's direct
+    ("sslnegotiation=direct&sslrootcert=system", {}, True),               # ... and the system roots' verify-full
+    ("sslnegotiation=direct", {"PGSSLROOTCERT": "system"}, True),
+    ("sslnegotiation=direct", {"PGSSLMODE": "require"}, True),
+    ("sslnegotiation=direct&sslmode=prefer", {"PGSSLMODE": "require"}, False),  # the URL wins over the environment
+    ("sslnegotiation=postgres", {"PGSSLNEGOTIATION": "direct"}, True),
+    ("sslrootcert=system&sslmode=require", {}, False),
+    ("sslmode=require", {"PGSSLROOTCERT": "system"}, False),
+    ("sslrootcert=system", {"PGSSLMODE": "require"}, False),
+    ("sslmode=disable", {"PGSSLMODE": "bogus"}, True),
+    ("connect_timeout=5", {"PGSSLMODE": "bogus"}, False),
+])
+def test_tls_verdicts_on_the_effective_values_agree_with_libpq(query, env, ok, monkeypatch):
+    """The TLS options libpq checks against each other: URL option, else environment variable, else libpq's default,
+    the way libpq resolves them (nothing listens on port 1: an accepted set fails with a refused connection)."""
+    for var in TLS_ENV:
+        monkeypatch.delenv(var, raising=False)
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    url = f"postgresql://u@127.0.0.1:1/d?{query}"
+    accepted = True
+    try:
+        config.load({"TGAUD_DATABASE_URL": url, **env})
+    except config.ConfigError as e:
+        accepted = False
+        assert "bogus" not in str(e)
+    assert accepted is ok
+    with pytest.raises(psycopg.Error) as e:
+        psycopg.connect(url, connect_timeout=2)
+    text = str(e.value).lower()
+    assert (("may not be used" in text or "invalid" in text) and "refused" not in text) is (not ok), str(e.value)
+
+
+def test_selfcheck_refuses_the_tls_options_libpq_refuses(monkeypatch):
     from tgaud import selfcheck
 
-    with pytest.raises(config.ConfigError, match="sslnegotiation=direct needs sslmode"):
+    for var in TLS_ENV:
+        monkeypatch.delenv(var, raising=False)
+    with pytest.raises(config.ConfigError, match="sslnegotiation=direct .* needs sslmode"):
         selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=disable&sslnegotiation=direct"})
+    with pytest.raises(config.ConfigError, match=r"sslnegotiation=direct \(PGSSLNEGOTIATION\) needs sslmode"):
+        selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=disable", "PGSSLNEGOTIATION": "direct"})
+    with pytest.raises(config.ConfigError, match="sslrootcert=system .* needs sslmode verify-full, not require"):
+        selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=require&sslrootcert=system"})
     selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=verify-full&sslnegotiation=direct"})
+    selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslnegotiation=direct&sslrootcert=system"})
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8081?", "http://127.0.0.1:8081#", "http://h/x?", "http://h/#"])

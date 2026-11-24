@@ -130,7 +130,8 @@ def test_prober_queue_read_with_100k_pending(scale_dsn, record_property):
 
 def test_prober_head_read_ranks_a_g1_batch_by_spell_with_100k_pending(scale_dsn, record_property):
     """A G1 batch of OUTAGE_BUDGET outage probes in one tg.queue_probes call after the full read, beside the 100 000
-    pending ones; user 86399 has the newest spell of the chat but neither the first nor the last id of the batch."""
+    pending ones; user 86399 has the newest spell of the chat but neither the first nor the last id of the batch. The
+    head read that sees the batch ranks the chat's outage probes again; the next one only reads the sets."""
     from tgaud.jobs import reconciler
     p = prober.Prober(_ctx(), rate=5)
     users = list(range(9, 10 * reconciler.OUTAGE_BUDGET, 10))
@@ -140,10 +141,15 @@ def test_prober_head_read_ranks_a_g1_batch_by_spell_with_100k_pending(scale_dsn,
         c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([BIG] * len(users), users))
         t = time.perf_counter()
         p._read_heads(c, NOW.timestamp() + 1)  # noqa: SLF001
-        heads = time.perf_counter() - t
+        ranked = time.perf_counter() - t
+        outage = [x.user_id for x in p.queue if x.chat_id == BIG and x.reason == "outage"]
+        t = time.perf_counter()
+        p._read_heads(c, NOW.timestamp() + 2)  # noqa: SLF001
+        steady = time.perf_counter() - t
         c.rollback()
     print(f"prober head read with a G1 batch of {len(users)} outage probes beside 100 000 pending: "
-          f"{heads * 1000:.0f} ms")
-    record_property("prober_head_read_batch_seconds", heads)
-    outage = [c.user_id for c in p.queue if c.chat_id == BIG and c.reason == "outage"]
-    assert outage[0] == 86399 and heads < 0.5
+          f"{ranked * 1000:.0f} ms (the chat ranked again), then {steady * 1000:.0f} ms")
+    record_property("prober_head_read_batch_seconds", ranked)
+    record_property("prober_head_read_after_batch_seconds", steady)
+    assert outage[0] == 86399 and len(outage) == prober.PER_CHAT
+    assert ranked < 3.0 and steady < 0.2
