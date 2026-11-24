@@ -421,7 +421,8 @@ def post_kind(msg: dict) -> str:
 
 
 def _is_user_dict(d: dict) -> bool:
-    return isinstance(d.get("id"), int) and "is_bot" in d
+    """A User by its shape: the is_bot marker, whatever its id (redaction leaves one without a usable id out)."""
+    return "is_bot" in d
 
 
 def _person_field(key: Any, value: Any, store_names: bool) -> bool:

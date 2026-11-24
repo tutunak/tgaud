@@ -1557,3 +1557,41 @@ def test_a_link_with_a_users_fields_is_never_replaced_by_the_erasure_marker(h):
         "creator": {"erased": True}}
     assert h.one("SELECT creator_id, masked_link FROM tg.invite_link") == (None, MASKED_LINK)
     assert h.q("SELECT update_id, user_id FROM tg.member_event") == [(10, 43)]
+
+
+def test_a_nested_user_without_a_usable_id_is_left_out_on_both_paths(make):
+    """The reviewer's case: names off, an erasure on file, a valid and a malformed pre-erasure update holding
+    nested Users (is_bot, names) whose id is missing or a string. A User is recognised by its is_bot marker
+    whatever its id, so each is left out whole. The link position still wins over that marker, and a member
+    carrying a stray is_bot leaves its update's columns and the subject's erasure check as they were."""
+    h = make(store_names=False).start()
+    tracked_channel(h)
+    erase(h, 47, 48)
+    before = T0 - dt.timedelta(minutes=10)
+
+    def people() -> dict:
+        no_id = user(47)
+        del no_id["id"]
+        return {"people": [no_id, user(47, id="47")]}
+
+    valid = chat_member(10, 42, before, extra=people())
+    bad = chat_member(11, 43, before, extra=people())
+    bad["chat_member"]["new_chat_member"]["status"] = "banned"
+    stray_link = chat_member(12, 44, before, link=dict(masked_link(), id="x", is_bot=False))
+    stray_member = chat_member(13, 45, before, new_kw={"is_bot": False})
+    erased_subject = chat_member(14, 48, before, new_kw={"is_bot": False})
+    erased_bad = chat_member(15, 48, before, new_kw={"is_bot": False})
+    erased_bad["chat_member"]["new_chat_member"]["status"] = "banned"
+    h.poll(valid, bad, stray_link, stray_member, erased_subject, erased_bad)
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "chat_member"), (11, "malformed"), (12, "chat_member"), (13, "chat_member"), (14, "chat_member"),
+        (15, "malformed")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
+    assert set(raw) == {10, 11, 12, 13}
+    assert raw[10]["extra"] == raw[11]["extra"] == {"people": []}
+    assert raw[12]["invite_link"] == {k: v for k, v in masked_link().items() if k != "creator"} | {
+        "creator": {"id": ADMIN, "is_bot": False, "language_code": "en"}}
+    assert "new_chat_member" not in raw[13] and raw[13]["old_chat_member"]["user"]["id"] == 45
+    assert stored(h, ["Name47", "Surname47", "handle47", "Name48", "handle48"]) == []
+    assert h.q("SELECT update_id, user_id FROM tg.member_event ORDER BY 1") == [(10, 42), (12, 44), (13, 45)]
+    assert h.q("SELECT count(*) FROM tg.tg_user WHERE user_id = 48") == [(0,)]
