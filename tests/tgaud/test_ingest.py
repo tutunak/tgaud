@@ -1286,19 +1286,25 @@ def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_pay
     person_in_member = chat_member(16, 48, T0, "left", "banned", new_kw={"extra": [without_is_bot(49)]})
     # an object at invite_link without the link's text is not a ChatInviteLink: dropped whole
     link_without_text = chat_member(17, 51, T0, link={"url": BOT_LINK, "creator": BOT_USER, "name": "x"})
-    # a valid join whose link carries a field a ChatInviteLink does not have: the raw payload drops it
+    # valid joins whose link carries what a ChatInviteLink does not: a field it lacks (18), a user's shape
+    # (19: the link position wins), fields of another type (20); the raw payload keeps only its typed fields
     extra_field = chat_member(18, 50, T0, link=dict(masked_link(), url=BOT_LINK))
+    user_shaped = chat_member(19, 52, T0, link=dict(masked_link(), id=ADMIN, is_bot=False, description=BOT_LINK))
+    mistyped = chat_member(20, 53, T0, link=dict(masked_link(), member_limit=BOT_LINK, expire_date=True,
+                                                 is_primary="yes"))
     h.poll(link_in_array, from_in_array, from_scalar, user_in_array, text_in_array, text_in_object,
-           person_in_member, link_without_text, extra_field)
+           person_in_member, link_without_text, extra_field, user_shaped, mistyped)
     assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
-        *((u, "malformed") for u in range(10, 18)), (18, "chat_member")]
+        *((u, "malformed") for u in range(10, 18)), (18, "chat_member"), (19, "chat_member"), (20, "chat_member")]
     raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
-    assert set(raw) == set(range(10, 19))
+    assert set(raw) == set(range(10, 21))
     assert "invite_link" not in raw[10] and "from" not in raw[11] and "from" not in raw[12]
     assert "user" not in raw[13]["new_chat_member"] and "extra" not in raw[16]["new_chat_member"]
     assert all("invite_link" not in raw[u] for u in (14, 15, 17))  # no link text: not a ChatInviteLink
-    assert raw[18]["invite_link"] == {k: v for k, v in masked_link().items() if k != "creator"} | {
+    kept = {k: v for k, v in masked_link().items() if k != "creator"} | {
         "creator": {"id": ADMIN, "is_bot": False, "language_code": "en"}}
+    assert raw[18]["invite_link"] == raw[19]["invite_link"] == kept
+    assert raw[20]["invite_link"] == {k: v for k, v in kept.items() if k != "is_primary"}
     tables = h.q("""SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname IN ('tg', 'stats') AND c.relkind IN ('r', 'p', 'm') AND NOT c.relispartition
                       AND (c.relkind <> 'm' OR c.relispopulated)""")
@@ -1309,7 +1315,7 @@ def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_pay
         for (row,) in h.q(f"SELECT t::text FROM {table} t"):
             found += [(table, s) for s in secrets if s in row]
     assert found == []
-    assert h.q("SELECT update_id FROM tg.member_event") == [(18,)]
+    assert h.q("SELECT update_id FROM tg.member_event ORDER BY 1") == [(18,), (19,), (20,)]
 
 
 def surrogate_and_nul(bad: dict) -> None:
@@ -1365,7 +1371,7 @@ def test_values_postgresql_cannot_store_in_a_malformed_update_commit_once(h, spo
 
 
 @pytest.mark.parametrize("trigger", ["restart", "chat_member", "my_chat_member", "erased_subject", "malformed",
-                                     "my_chat_member_admin"])
+                                     "no_chat_type", "unknown_chat_type", "my_chat_member_admin"])
 def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trigger):
     h = make().start()
     tracked_channel(h, upd=1, chat=BASIC, at=T0 - dt.timedelta(hours=5))
@@ -1397,6 +1403,10 @@ def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trig
             erase(h, 43, at=h.clock.now)
         elif trigger == "malformed":  # a valid chat id, an unreadable date
             news["chat_member"]["date"] = "soon"
+        elif trigger == "no_chat_type":  # the destination's id without chat.type: malformed, no chat id kept
+            news["chat_member"]["chat"] = {k: v for k, v in NEW_SG.items() if k != "type"}
+        elif trigger == "unknown_chat_type":  # parses, but not an audience chat: a receipt without the chat id
+            news["chat_member"]["chat"] = dict(NEW_SG, type="megagroup")
         # the check is queued in the update's transaction: a crash before its commit queues nothing
         h.ing.before_commit = lambda update_id: (_ for _ in ()).throw(Crash()) if update_id == 4 else None
         with pytest.raises(Crash):
@@ -1420,3 +1430,9 @@ def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trig
             assert h.q(f"SELECT count(*) FROM {table} WHERE user_id = 43") == [(0,)], table
         assert h.q("SELECT count(*) FROM tg.raw_update WHERE update_id = 4") == [(0 if trigger == "erased_subject"
                                                                                   else 1,)]
+    if trigger in ("no_chat_type", "unknown_chat_type"):  # raw data is still kept only for an audience chat
+        assert h.q("SELECT update_type, chat_id FROM tg.update_receipt WHERE update_id = 4") == [
+            ("malformed" if trigger == "no_chat_type" else "chat_member", None)]
+        for table in ("tg.member_event", "tg.tg_user"):
+            assert h.q(f"SELECT count(*) FROM {table} WHERE user_id = 43") == [(0,)], table
+        assert h.q("SELECT count(*) FROM tg.raw_update WHERE update_id = 4") == [(0,)]

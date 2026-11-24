@@ -122,10 +122,12 @@ DIGEST_MARK = "hmac-sha256:"
 USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
 MEMBER_KEYS = ("new_chat_member", "old_chat_member")  # a ChatMember: holds the person at `user`
 NAME_KEYS = ("first_name", "last_name", "username")
-LINK_FIELDS = frozenset((  # ChatInviteLink (Bot API 10.5); a raw payload keeps no other field of a link
-    "invite_link", "creator", "creates_join_request", "is_primary", "is_revoked", "name", "expire_date",
-    "member_limit", "pending_join_request_count", "subscription_period", "subscription_price",
-))
+# ChatInviteLink (Bot API 10.5): a link in a raw payload keeps only these fields, each only with its type
+LINK_FIELDS = {
+    "invite_link": str, "creator": dict, "creates_join_request": bool, "is_primary": bool, "is_revoked": bool,
+    "name": str, "expire_date": int, "member_limit": int, "pending_join_request_count": int,
+    "subscription_period": int, "subscription_price": int,
+}
 
 
 class Malformed(ValueError):
@@ -410,10 +412,11 @@ def _expected_shape(holder: str | None, key: Any, value: Any) -> bool:
     """Whether a value has the shape redaction reads at its position in a membership payload. A person and a
     member are objects; invite_link is a ChatInviteLink (an object recognized by its text at invite_link) or the
     link's text; inside one of them (`holder`) only a member's `user` and a link's `creator` are objects, the
-    rest scalars, and a link keeps only the ChatInviteLink fields; a name is a string. Other positions hold
-    anything."""
-    if holder == "link" and key not in LINK_FIELDS:
-        return False
+    rest scalars, and a link keeps only the ChatInviteLink fields, each with its type; a name is a string. Other
+    positions hold anything."""
+    if holder == "link":
+        kind = LINK_FIELDS.get(key)
+        return kind is not None and isinstance(value, kind) and not (kind is int and isinstance(value, bool))
     if holder is not None and isinstance(value, (dict, list)):
         return (holder, key) in (("member", "user"), ("link", "creator")) and isinstance(value, dict)
     if key in USER_KEYS or key in MEMBER_KEYS:
@@ -810,8 +813,10 @@ class Ingest:
             self.conn.execute("""INSERT INTO tg.update_receipt (update_id, update_date, update_type, chat_id, received_at)
                                  VALUES (%s, %s, 'malformed', %s, %s) ON CONFLICT DO NOTHING""",
                               (update_id, received, chat_id, received))
-            if kind in ("chat_member", "my_chat_member") and chat_id is not None:
-                self._queue_m2_check(chat_id, received)
+            # the chat id read whatever chat.type says (the queue only matches a pending destination)
+            notice_chat = _id_at(inner, "chat", "id")
+            if kind in ("chat_member", "my_chat_member") and notice_chat is not None:
+                self._queue_m2_check(notice_chat, received)
             if kind in MEMBERSHIP_TYPES and chat_id is not None and isinstance(inner, dict):
                 subject = _subject_id(kind, inner)
                 # the erasure cutoff by the payload's date; when that is unusable, anyone ever erased counts
@@ -850,8 +855,10 @@ class Ingest:
                             (p.update_id, p.date, p.type, p.chat.id if in_scope else None, received)).fetchone() is None
         if not seen and in_scope:
             self._body(fx, p, raw, received)
-            if p.type in ("chat_member", "my_chat_member"):
-                self._queue_m2_check(p.chat.id, received)  # after the body: M1 may have just run
+        if not seen and p.chat is not None and p.type in ("chat_member", "my_chat_member"):
+            # after the body (M1 may have just run), and whatever chat.type says: the queue only matches a
+            # pending destination
+            self._queue_m2_check(p.chat.id, received)
         self._advance(fx, received, update_id=p.update_id, update_date=p.date, caught_up=caught_up)
         lag = max(0.0, (received - p.date).total_seconds())
         fx.add(lambda: metrics.UPDATES.labels(p.type).inc())
@@ -1389,7 +1396,8 @@ class Ingest:
             uid = v.get("id")
             if person and isinstance(uid, int) and uid in erased:
                 return {"erased": True}
-            holder = "person" if person else "member" if key in MEMBER_KEYS else "link" if key == "invite_link" \
+            # the link position wins over a user-like shape: a link keeps only its typed fields
+            holder = "link" if key == "invite_link" else "person" if person else "member" if key in MEMBER_KEYS \
                 else None
             out: dict[str, Any] = {}
             for k, x in v.items():
