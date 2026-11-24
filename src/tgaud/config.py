@@ -91,6 +91,7 @@ class Config:
     bot_api_url: str
     activation_id: str
     _conninfo: Mapping[str, str] = field(default_factory=dict, repr=False, compare=False)
+    probe_rate: float = 5.0  # getChatMember calls per second, the prober's global token bucket (design.md 6)
 
     def dsn(self, job: str) -> str:
         """libpq conninfo for one job's connection: password, application_name tgaud-<job>, keepalives."""
@@ -222,6 +223,16 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
     if any(ch in activation_id for ch in "\r\n"):
         problems.append("TGAUD_ACTIVATION_ID must be one line")
 
+    probe_rate = 5.0
+    raw_rate = get("TGAUD_PROBE_RATE")
+    if raw_rate:
+        try:
+            probe_rate = float(raw_rate)
+        except ValueError:
+            probe_rate = float("nan")
+        if not 0.1 <= probe_rate <= 100:  # also refuses nan and inf
+            problems.append("TGAUD_PROBE_RATE must be a number of calls per second from 0.1 to 100")
+
     if problems:
         raise ConfigError("; ".join(problems))
     return Config(
@@ -237,6 +248,7 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
         bot_api_url=bot_api_url,
         activation_id=activation_id,
         _conninfo=conninfo,
+        probe_rate=probe_rate,
     )
 
 

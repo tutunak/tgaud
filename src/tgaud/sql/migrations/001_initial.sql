@@ -952,8 +952,11 @@ SELECT s.chat_id, s.sampled_at, s.reported, s.known_open, s.suspect_open, s.net_
        s.reported - s.known_open AS mismatch,
        (s.reported - lag(s.reported) OVER w) - s.net_events AS residual
 FROM tg.count_sample s
+WHERE s.net_events IS NOT NULL
 WINDOW w AS (PARTITION BY s.chat_id ORDER BY s.sampled_at);
-COMMENT ON VIEW stats.v_drift IS 'Count samples: absolute mismatch and delta residual (D7, item 9).';
+COMMENT ON VIEW stats.v_drift IS
+  'Finalized count samples (net_events set once ingest caught up past them, migration 005): absolute mismatch '
+  'and delta residual against the previous finalized sample (D7, item 9).';
 
 CREATE VIEW stats.v_gaps AS
 SELECT g.gap_id, g.chat_id, c.title, lower(g.period) AS gap_from, upper(g.period) AS gap_to, g.reason, g.confirmed

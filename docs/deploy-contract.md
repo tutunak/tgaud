@@ -38,6 +38,7 @@ Secrets come as Podman secrets with `type=env`; everything else from the env fil
 | `TGAUD_LOG_LEVEL` | env file | no | `INFO` | logs go to stdout/stderr, one line per record (journald) |
 | `TGAUD_BOT_API_URL` | env file | no | `https://api.telegram.org` | for tests only |
 | `TGAUD_ACTIVATION_ID` | env file | no | `""` | an opaque id the deploy role gives each activation; `/health` echoes it, so the role can tell which inputs answered |
+| `TGAUD_PROBE_RATE` | env file | no | `5` | `getChatMember` calls per second for the prober (0.1-100); the real limit is unknown: the owner measures it (design.md 13.3) and sets it here |
 
 The selfcheck runs with dummy secret values only if the real ones are absent; it never connects anywhere.
 
