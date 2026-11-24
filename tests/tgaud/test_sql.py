@@ -102,8 +102,8 @@ def test_block_2_chats_per_user_matches_verify(fx):
 def test_block_4_giveaways_match_verify(fx):
     per_chat = {(r["campaign_id"], r["chat_id"]): r for r in sql.run(fx, "4a", as_of=NOW).dicts()}
     a = per_chat[(1, A)]
-    assert [a[k] for k in ("entrants", "first_time", "returners", "quick_exit", "in_at_draw", "exit_after_draw",
-                           "still_in")] == [6, 5, 1, 3, 4, 2, 2]
+    assert [a[k] for k in ("entrants", "first_time", "returners", "eligible", "quick_exit", "in_at_draw",
+                           "exit_after_draw", "still_in")] == [6, 5, 1, 5, 3, 4, 2, 2]  # G1 has only_new_members
     b = per_chat[(1, B)]
     assert [b[k] for k in ("entrants", "quick_exit", "quick_exit_kicked", "quick_exit_unknown", "in_at_draw",
                            "in_at_draw_unknown", "exit_after_draw_unknown", "still_in")] == [3, 1, 1, 1, 1, 1, 1, 1]
@@ -111,8 +111,8 @@ def test_block_4_giveaways_match_verify(fx):
     assert [c[k] for k in ("entrants", "quick_exit", "in_at_draw", "still_in")] == [2, 1, 1, 1]
     persons = {r["campaign_id"]: r for r in sql.run(fx, "4b", as_of=NOW).dicts()}
     g1 = persons[1]
-    assert [g1[k] for k in ("persons", "multi_chat", "first_time", "quick_exit", "in_at_draw", "exit_after_draw",
-                            "still_in")] == [8, 1, 7, 4, 5, 2, 3]
+    assert [g1[k] for k in ("persons", "multi_chat", "first_time", "eligible", "quick_exit", "in_at_draw",
+                            "exit_after_draw", "still_in")] == [8, 1, 7, 7, 4, 5, 2, 3]
     assert len(sql.run(fx, "4c", as_of=NOW).rows) == 11
     # block "4" runs 4a, 4b and 4c; the last is the entrant list
     assert sql.run(fx, "4", as_of=NOW).columns[:3] == ["campaign_id", "chat_id", "user_id"]

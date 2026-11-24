@@ -75,7 +75,8 @@ Every report shows its time, the chats it covers, how complete the data is, and 
 3. **Unique users per chat.** How many members of a chat are in none of the other chats you pick, plus the distinct
    total. You learn the reach each chat adds. Counted inside the chosen chats only. Reads `tg.chat_set`.
 4. **Giveaway joiners.** Who joined during a giveaway, who left within 48 hours of joining, who left within 48 hours
-   of the draw, who is still in; first-time joiners apart from returners. You learn the real yield of a giveaway.
+   of the draw, who is still in; first-time joiners apart from returners (when the giveaway is for new members only,
+   the eligible count is the first-time joiners). You learn the real yield of a giveaway.
    Only confirmed exits count; unsure ones are shown apart; multi-chat giveaways are counted per chat and per
    person. Reads `tg.campaign`, `tg.campaign_chat`, `tg.membership`.
 5. **Short stays without a campaign.** Joined and left within 48 hours, per chat and week, outside campaign windows.

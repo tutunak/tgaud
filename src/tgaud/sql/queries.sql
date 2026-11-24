@@ -148,10 +148,13 @@ SELECT :'only' IN ('all', '4', '4a') AS run \gset
 \if :run
 \echo == 4a. giveaway report per campaign and chat
 -- Q: for each campaign chat: who joined inside [starts_at, draw_at] (first qualifying exact join per person
--- and chat); how many were first-time joiners (no earlier stay; only these count when only_new_members);
--- how many left within H hours of their join (confirmed exits; kicked apart; uncertain bounds apart); how
--- many were in at the draw and left within H after it; how many are still in. Immature = H not over yet.
--- window_flags: gaps or missing coverage over [starts_at, draw_at + H].
+-- and chat; every entrant is reported); how many were first-time joiners (no earlier stay) and how many
+-- returners; when the campaign has only_new_members, `eligible` is the first-time count and returners are not
+-- eligible (NULL otherwise); how many left within H hours of their join (confirmed exits; kicked apart;
+-- uncertain bounds apart); how many were in at the draw and left within H after it; how many are in at as_of.
+-- Immature = H not over yet at as_of; an outcome after as_of is never counted, and a campaign that starts
+-- after as_of has no entrants.
+-- window_flags: gaps or missing coverage over [starts_at, min(draw_at + H, as_of)].
 -- Body: tg.campaign_entrant (one row per chat and person) aggregated by stats.campaign_summary (schema.sql).
 :explain
 SELECT * FROM stats.campaign_summary(:hours, :'as_of_ts', nullif(:campaign, 0)) ORDER BY campaign_id, chat_id;
@@ -161,14 +164,17 @@ SELECT :'only' IN ('all', '4', '4b') AS run \gset
 \if :run
 \echo == 4b. giveaway report per person (multi-chat giveaways)
 -- Q: counted once per person across all chats of the campaign: entrants, how many joined several of its
--- chats, first-time in every chat they entered, left at least one within H (confirmed; unknown only if no
--- confirmed one), were in at least one at the draw, left one within H after it, are still in at least one.
+-- chats, first-time in every chat they entered, eligible (only_new_members campaigns: first-time in at least
+-- one chat they entered; NULL otherwise), left at least one within H (confirmed; unknown only if no confirmed
+-- one), were in at least one at the draw, left one within H after it, are still in at least one.
 :explain
 WITH e AS (
-  SELECT x.* FROM tg.campaign c CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
+  SELECT x.*, c.only_new_members FROM tg.campaign c
+  CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
   WHERE :campaign = 0 OR c.campaign_id = :campaign
 ), p AS (
   SELECT campaign_id, user_id, count(*) AS chats_joined, bool_and(first_time) AS first_time,
+         bool_or(eligible) AS eligible, bool_or(only_new_members) AS only_new_members,
          bool_or(quick_exit = 'yes') AS quick_yes, bool_or(quick_exit = 'unknown') AS quick_unknown,
          bool_or(at_draw = 'in') AS in_at_draw, bool_or(exit_after_draw = 'yes') AS left_after_draw,
          bool_or(still_in = 'in') AS still_in
@@ -176,6 +182,7 @@ WITH e AS (
 )
 SELECT campaign_id, count(*) AS persons, count(*) FILTER (WHERE chats_joined > 1) AS multi_chat,
        count(*) FILTER (WHERE first_time) AS first_time,
+       CASE WHEN bool_or(only_new_members) THEN count(*) FILTER (WHERE eligible) END AS eligible,
        count(*) FILTER (WHERE quick_yes) AS quick_exit,
        count(*) FILTER (WHERE quick_unknown AND NOT quick_yes) AS quick_exit_unknown,
        count(*) FILTER (WHERE in_at_draw) AS in_at_draw,
@@ -188,8 +195,8 @@ SELECT :'only' IN ('all', '4', '4c') AS run \gset
 \if :run
 \echo == 4c. giveaway entrants, one row per chat and person (CLI --csv, web drill-down)
 :explain
-SELECT x.campaign_id, x.chat_id, x.user_id, u.username, x.joined_at, x.first_time, x.quick_exit, x.exit_reason,
-       x.at_draw, x.exit_after_draw, x.still_in
+SELECT x.campaign_id, x.chat_id, x.user_id, u.username, x.joined_at, x.first_time, x.eligible, x.quick_exit,
+       x.exit_reason, x.at_draw, x.exit_after_draw, x.still_in
 FROM tg.campaign c
 CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
 JOIN tg.tg_user u ON u.user_id = x.user_id
@@ -205,12 +212,13 @@ SELECT :'only' IN ('all', '5') AS run \gset
 \echo == 5. short stays per chat and week, outside campaign windows
 -- Q: per chat and join week: how many joiners left within H hours, counting only joins outside every
 -- campaign window of that chat (so it works where the owner never entered a campaign). Exits are confirmed
--- ones; kicked apart; unknown = exit bounds straddle H; immature = joined less than H ago and still in.
+-- ones; kicked apart; unknown = exit bounds straddle H; immature = joined less than H ago and still in. The
+-- state is read at min(join + H, as_of): an exit after as_of is never counted (immature, or unknown).
 :explain
 WITH j AS (
   SELECT m.chat_id, date_trunc('week', m.joined_at AT TIME ZONE 'UTC')::date AS week, m.end_reason,
          tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                     m.joined_at + :hours * interval '1 hour') AS state,
+                     least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) AS state,
          m.joined_at + :hours * interval '1 hour' > :'as_of_ts'::timestamptz AS young,
          EXISTS (SELECT 1 FROM tg.campaign_chat cc JOIN tg.campaign g ON g.campaign_id = cc.campaign_id
                  WHERE cc.chat_id = m.chat_id AND m.joined_at BETWEEN g.starts_at AND g.draw_at) AS in_campaign
@@ -238,7 +246,8 @@ FROM j GROUP BY chat_id, week ORDER BY chat_id, week;
 SELECT :'only' IN ('all', '6', '6a') AS run \gset
 \if :run
 \echo == 6a. serial short-stayers: people with 2+ short stays in the window
--- Q: who keeps joining and leaving within H hours, in one chat or across chats (prize hunters)?
+-- Q: who keeps joining and leaving within H hours, in one chat or across chats (prize hunters)? An exit after
+-- as_of is not counted.
 :explain
 SELECT m.user_id, u.username, count(*) AS short_stays, count(DISTINCT m.chat_id) AS chats,
        min(m.joined_at) AS first_join, max(m.joined_at) AS last_join
@@ -247,7 +256,7 @@ JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
 JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 WHERE m.joined_at >= :'since_ts' AND m.joined_at < :'as_of_ts' AND m.chat_id = ANY (:'scope_ids'::bigint[])
   AND tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                  m.joined_at + :hours * interval '1 hour') = 'out'
+                  least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) = 'out'
 GROUP BY m.user_id, u.username
 HAVING count(*) >= 2
 ORDER BY short_stays DESC, chats DESC, m.user_id;
@@ -400,7 +409,9 @@ SELECT :'only' IN ('all', '10', '10a') AS run \gset
 \echo == 10a. rejoiners per chat
 -- Q: how many people came back to a chat they had left? A rejoin is a stay that starts after an earlier
 -- stay of the same person in the chat: observed (a join event) or found later (snapshot or probe).
--- Migration echoes are not stays, so they never count.
+-- Migration echoes are not stays, so they never count. Stays that start at the same instant (join, leave, join
+-- in one second) are ordered by tg.spell_order: the opening event's update_id, an inferred start after an exact
+-- join that opened the first stay, events before sightings and probes.
 :explain
 SELECT m.chat_id, count(*) AS rejoins, count(DISTINCT m.user_id) AS users,
        count(*) FILTER (WHERE m.start_source = 'event') AS observed,
@@ -410,23 +421,22 @@ FROM tg.membership m
 JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
 JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 WHERE m.known_from >= :'since_ts' AND m.known_from < :'as_of_ts' AND m.chat_id = ANY (:'scope_ids'::bigint[])
-  AND (EXISTS (SELECT 1 FROM tg.membership p
-               WHERE p.chat_id = m.chat_id AND p.user_id = m.user_id AND p.known_from < m.known_from)
-       OR EXISTS (SELECT 1 FROM tg.membership p     -- the same instant (join, leave, join in one second): the
-                  WHERE p.chat_id = m.chat_id       -- opening event's order (update_id) decides; events come
-                    AND p.user_id = m.user_id       -- before sightings and probes
-                    AND p.known_from = m.known_from AND p.membership_id <> m.membership_id
-                    AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT min(px.update_id) FROM tg.member_event px WHERE p.start_source = 'inferred' AND px.chat_id = p.chat_id AND px.user_id = p.user_id AND px.event_at = p.known_from), 9223372036854775807),
-                         p.membership_id)
-                      < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT min(mx.update_id) FROM tg.member_event mx WHERE m.start_source = 'inferred' AND mx.chat_id = m.chat_id AND mx.user_id = m.user_id AND mx.event_at = m.known_from), 9223372036854775807),
-                         m.membership_id)))
+  AND EXISTS (SELECT 1 FROM tg.membership p
+              WHERE p.chat_id = m.chat_id AND p.user_id = m.user_id AND p.membership_id <> m.membership_id
+                AND (p.known_from < m.known_from
+                     OR (p.known_from = m.known_from
+                         AND (tg.spell_order(p.chat_id, p.user_id, p.join_event_id, p.joined_at, p.start_source, p.known_from)
+                              || p.membership_id)
+                           < (tg.spell_order(m.chat_id, m.user_id, m.join_event_id, m.joined_at, m.start_source, m.known_from)
+                              || m.membership_id))))
 GROUP BY m.chat_id ORDER BY m.chat_id;
 \endif
 
 SELECT :'only' IN ('all', '10', '10b') AS run \gset
 \if :run
 \echo == 10b. flow between own chats: joined A, then B within flow_days
--- Q: does chat A feed chat B? People with an exact join to A and a later exact join to B within flow_days.
+-- Q: does chat A feed chat B? People with an exact join to A and a later exact join to B within flow_days;
+-- both joins must be before as_of (a join to B after as_of is not counted).
 :explain
 SELECT a.chat_id AS from_chat, b.chat_id AS to_chat, count(DISTINCT a.user_id) AS users,
        round((percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM b.joined_at - a.joined_at) / 3600))::numeric, 2) AS median_hours
@@ -435,6 +445,7 @@ JOIN tg.chat ca ON ca.chat_id = a.chat_id AND ca.tracked
 JOIN tg.tg_user u ON u.user_id = a.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 JOIN tg.membership b ON b.user_id = a.user_id AND b.chat_id <> a.chat_id
                     AND b.joined_at > a.joined_at AND b.joined_at <= a.joined_at + :flow_days * interval '1 day'
+                    AND b.joined_at < :'as_of_ts'::timestamptz
 JOIN tg.chat cb ON cb.chat_id = b.chat_id AND cb.tracked
 WHERE a.joined_at >= :'since_ts' AND a.joined_at < :'as_of_ts'
   AND a.chat_id = ANY (:'scope_ids'::bigint[]) AND b.chat_id = ANY (:'scope_ids'::bigint[])
@@ -493,25 +504,32 @@ SELECT :'only' IN ('all', '12') AS run \gset
 \echo == 12. join-request funnel per chat and week
 -- Q: how many asked to join, how many were approved, how fast, and did the approved stay 30 days?
 -- unknown = no answer seen within 7 days (declines by other admins send no update, F§3); pending = younger.
+-- Outcomes are read as of as_of: an answer after as_of leaves the request pending, 'unknown' only once 7 days
+-- have passed, and the approved join must be before as_of.
 :explain
 SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS week, count(*) AS requests,
-       count(*) FILTER (WHERE r.outcome = 'approved') AS approved,
-       count(*) FILTER (WHERE r.outcome = 'declined') AS declined,
-       count(*) FILTER (WHERE r.outcome = 'unknown') AS unknown,
-       count(*) FILTER (WHERE r.outcome IS NULL) AS pending,
+       count(*) FILTER (WHERE o.outcome = 'approved') AS approved,
+       count(*) FILTER (WHERE o.outcome = 'declined') AS declined,
+       count(*) FILTER (WHERE o.outcome = 'unknown') AS unknown,
+       count(*) FILTER (WHERE o.outcome IS NULL) AS pending,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM r.resolved_at - r.requested_at) / 60)
-         FILTER (WHERE r.outcome = 'approved') AS median_minutes_to_approve,
+         FILTER (WHERE o.outcome = 'approved') AS median_minutes_to_approve,
        count(*) FILTER (WHERE j.joined_at + interval '30 days' <= :'as_of_ts'::timestamptz) AS approved_mature_30d,
        count(*) FILTER (WHERE j.joined_at + interval '30 days' <= :'as_of_ts'::timestamptz
                           AND tg.state_at(j.known_from, j.left_after, j.left_before, j.end_source, j.suspect_since,
                                           j.joined_at + interval '30 days') = 'in') AS approved_retained_30d
 FROM tg.join_request r
 JOIN tg.chat c ON c.chat_id = r.chat_id AND c.tracked
+CROSS JOIN LATERAL (SELECT CASE WHEN r.outcome = 'unknown'
+                                THEN CASE WHEN r.requested_at + interval '7 days' <= :'as_of_ts'::timestamptz THEN 'unknown' END
+                                WHEN r.resolved_at > :'as_of_ts'::timestamptz THEN NULL
+                                ELSE r.outcome END AS outcome) o
 LEFT JOIN LATERAL (
   SELECT m.joined_at, m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since
   FROM tg.membership m
   WHERE m.chat_id = r.chat_id AND m.user_id = r.user_id AND m.joined_at >= r.requested_at
-  ORDER BY m.joined_at LIMIT 1) j ON r.outcome = 'approved'
+    AND m.joined_at <= :'as_of_ts'::timestamptz
+  ORDER BY m.joined_at LIMIT 1) j ON o.outcome = 'approved'
 WHERE r.requested_at >= :'since_ts' AND r.requested_at < :'as_of_ts' AND r.chat_id = ANY (:'scope_ids'::bigint[])
 GROUP BY 1, 2 ORDER BY 1, 2;
 \endif
@@ -524,11 +542,12 @@ SELECT :'only' IN ('all', '13') AS run \gset
 \echo == 13. raids: minutes with joins far above the baseline of the chat, share kicked within an hour
 -- Q: in the last raid_hours, which minutes had at least raid_min_joins joins and 10x the chat's average
 -- per-minute joins of the 7 days before, and what share of those joiners was kicked within an hour?
--- All accounts count (spam accounts are often bots).
+-- All accounts count (spam accounts are often bots). A kick after as_of is not counted.
 :explain
 WITH j AS (
   SELECT m.chat_id, date_trunc('minute', m.joined_at) AS minute, count(*) AS joins,
-         count(*) FILTER (WHERE m.end_reason = 'kicked' AND m.left_before <= m.joined_at + interval '1 hour') AS kicked_1h
+         count(*) FILTER (WHERE m.end_reason = 'kicked' AND m.left_before <= m.joined_at + interval '1 hour'
+                            AND m.left_before <= :'as_of_ts'::timestamptz) AS kicked_1h
   FROM tg.membership m JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
   WHERE m.joined_at > :'as_of_ts'::timestamptz - :raid_hours * interval '1 hour' AND m.joined_at <= :'as_of_ts'::timestamptz
     AND m.chat_id = ANY (:'scope_ids'::bigint[])
@@ -555,7 +574,8 @@ SELECT :'only' IN ('all', '14') AS run \gset
 \if :run
 \echo == 14. groups: active vs silent members, and did short-stayers ever write
 -- Q: per group: how many current members wrote in the last active_days, how many are silent; of the
--- short stays in the window (exit within H), how many wrote at least once during their stay?
+-- short stays in the window (exit within H, an exit after as_of not counted), how many wrote at least once
+-- during their stay? Members are the stays that hold as_of.
 :explain
 WITH g AS (
   SELECT chat_id, title FROM tg.chat
@@ -566,7 +586,7 @@ WITH g AS (
            SELECT 1 FROM tg.activity_daily a WHERE a.chat_id = m.chat_id AND a.user_id = m.user_id
              AND a.day > (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - :active_days
              AND a.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date)) AS active
-  FROM g JOIN tg.membership m ON m.chat_id = g.chat_id AND m.end_source IS NULL
+  FROM g JOIN tg.membership m ON m.chat_id = g.chat_id AND m.stay @> :'as_of_ts'::timestamptz
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
   GROUP BY g.chat_id
 ), ss AS (
@@ -578,7 +598,7 @@ WITH g AS (
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
   WHERE m.joined_at >= :'since_ts' AND m.joined_at < :'as_of_ts'
     AND tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                    m.joined_at + :hours * interval '1 hour') = 'out'
+                    least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) = 'out'
   GROUP BY g.chat_id
 )
 SELECT g.chat_id, g.title, coalesce(mem.members, 0) AS members, coalesce(mem.active, 0) AS active,
@@ -596,17 +616,21 @@ SELECT :'only' IN ('all', '15') AS run \gset
 \if :run
 \echo == 15. leaves within post_hours after each channel post, against the same span before it
 -- Q: which posts make people leave? Exact self-leaves in (posted_at, posted_at + post_hours], with the
--- span before the post as a baseline. Posts close together share leaves.
+-- span before the post as a baseline. Posts close together share leaves. Leaves after as_of are not counted:
+-- a post whose window after it reaches past as_of is marked immature.
 :explain
 SELECT p.chat_id, p.message_id, p.posted_at, p.kind,
        (SELECT count(*) FROM tg.membership m
          WHERE m.chat_id = p.chat_id AND m.end_source = 'event' AND m.end_reason = 'left'
-           AND m.left_before > p.posted_at AND m.left_before <= p.posted_at + :post_hours * interval '1 hour') AS leaves_after,
+           AND m.left_before > p.posted_at
+           AND m.left_before <= least(p.posted_at + :post_hours * interval '1 hour', :'as_of_ts'::timestamptz)) AS leaves_after,
        (SELECT count(*) FROM tg.membership m
          WHERE m.chat_id = p.chat_id AND m.end_source = 'event' AND m.end_reason = 'left'
            AND m.left_before > p.posted_at - :post_hours * interval '1 hour' AND m.left_before <= p.posted_at) AS leaves_before,
+       p.posted_at + :post_hours * interval '1 hour' > :'as_of_ts'::timestamptz AS immature,
        tg.window_flags(p.chat_id, tstzrange(p.posted_at - :post_hours * interval '1 hour',
-                                            p.posted_at + :post_hours * interval '1 hour')) AS flags
+                                            least(p.posted_at + :post_hours * interval '1 hour',
+                                                  :'as_of_ts'::timestamptz))) AS flags
 FROM tg.post p JOIN tg.chat c ON c.chat_id = p.chat_id AND c.tracked AND c.chat_type = 'channel'
 WHERE p.posted_at >= :'since_ts' AND p.posted_at < :'as_of_ts' AND p.chat_id = ANY (:'scope_ids'::bigint[])
 ORDER BY p.chat_id, p.posted_at;
