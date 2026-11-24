@@ -3,8 +3,8 @@
 
 Every page reads in one REPEATABLE READ transaction through the blocks of queries.sql (tgaud.sql) or the CLI's
 own helpers (tgaud.commands), so a page and `tgaud <report>` give the same numbers for the same as-of time.
-The pages of the audience rollup carry its as_of: a drill-down is answered only while that generation is still
-the published one; after a newer R2 publish the page asks to reload the matrix instead of showing a different
+The pages of the audience rollup show its as_of and carry its publication (the rollup_run id): a drill-down is
+answered only while that publication is still the current one; after a newer R2 publish the page asks to reload the matrix instead of showing a different
 population.
 """
 
@@ -38,11 +38,11 @@ log = logging.getLogger(__name__)
 
 UTC = dt.timezone.utc
 PAGE_SIZE = 100  # people per page of a pair drill-down
-TABLE_LIMIT = 500  # rows a report table shows; the CLI's --csv has them all
+ALL_ROWS = 2**31 - 1  # block 1b's own page size when sql.run_page pages it by position
+REPORT_PAGE = 500  # rows per page of a report table; every page is its own bounded query (sql.run_page)
 SIDES = {"shared": "in both", "only_a": "only in A", "only_b": "only in B"}
 USER_COLUMNS = frozenset({"user_id"})
-NOT_ON_WEB = {"16c": "the overlap matrix at a past date is a batch of about a minute: run "
-                     "`tgaud asof CHAT DATE --matrix` instead"}
+ASOF_MODES = {"counts": "16a", "list": "16b", "eod": "16d", "matrix": "16c"}
 PAGES = (("/", "Overview"), ("/overlap", "Overlap"), ("/user", "User"), ("/campaigns", "Campaigns"),
          ("/reports", "Reports"))
 
@@ -79,6 +79,7 @@ class Cell:
     text: str
     href: str | None = None
     sub: str | None = None  # small text after it (a chat's id)
+    user: bool = False  # a user id: a POST form to the lookup (no user id ever goes into a URL)
     time: bool = False  # a date or a time: may break only between the date and the time
 
 
@@ -87,11 +88,13 @@ class Table:
     columns: list[str]
     rows: list[list[Cell]]
     numeric: list[bool]
-    total: int
+    start: int = 0  # the offset of the first row (a page of a longer result)
+    next: str | None = None  # the URL of the next page
+    prev: str | None = None  # the URL of the previous page
 
     @property
-    def cut(self) -> bool:
-        return self.total > len(self.rows)
+    def paged(self) -> bool:
+        return self.next is not None or self.prev is not None
 
 
 def _numeric(values: Sequence[Any]) -> bool:
@@ -99,11 +102,11 @@ def _numeric(values: Sequence[Any]) -> bool:
     return bool(present) and all(isinstance(v, (int, float, Decimal)) and not isinstance(v, bool) for v in present)
 
 
-def table(result: sql.Result, titles: dict[int, str], *, limit: int = TABLE_LIMIT) -> Table:
-    """A result as cells: a chat id column shows "title (id)" unless the result has its own title column, a user id
-    links to its lookup, a campaign id to its page."""
+def table(result: sql.Result, titles: dict[int, str]) -> Table:
+    """A result as cells, every row: a chat id column shows the chat's title and id unless the result has its own
+    title column, a user id links to its lookup, a campaign id to its page."""
     own_titles = any("title" in c or c in ("channel", "campaign") for c in result.columns)
-    rows = result.rows[:limit]
+    rows = result.rows
     numeric: list[bool] = []
     cols: list[list[Cell]] = []
     for i, name in enumerate(result.columns):
@@ -116,7 +119,7 @@ def table(result: sql.Result, titles: dict[int, str], *, limit: int = TABLE_LIMI
             elif decorate:
                 out.append(Cell(titles.get(int(v), "?"), sub=str(v)))
             elif name in USER_COLUMNS:
-                out.append(Cell(str(v), "/user?" + urlencode({"q": v})))
+                out.append(Cell(str(v), user=True))
             elif name == "campaign_id":
                 out.append(Cell(str(v), f"/campaigns/{int(v)}"))
             elif isinstance(v, (dt.datetime, dt.date)):
@@ -126,7 +129,7 @@ def table(result: sql.Result, titles: dict[int, str], *, limit: int = TABLE_LIMI
         cols.append(out)
         numeric.append(not decorate and name not in common.CHAT_COLUMNS and _numeric([r[i] for r in result.rows]))
     grid = [[cols[c][r] for c in range(len(result.columns))] for r in range(len(rows))]
-    return Table(list(result.columns), grid, numeric, len(result.rows))
+    return Table(list(result.columns), grid, numeric)
 
 
 def transposed(result: sql.Result, titles: dict[int, str], key: str) -> Table:
@@ -138,7 +141,34 @@ def transposed(result: sql.Result, titles: dict[int, str], key: str) -> Table:
              for r in result.rows[:len(t.rows)]]
     rows = [[Cell(name), *(r[i] for r in t.rows)] for i, name in enumerate(result.columns) if i != k]
     numeric = [False, *([True] * len(heads))]
-    return Table(["", *heads], rows, numeric, len(rows))
+    return Table(["", *heads], rows, numeric)
+
+
+def paged_table(req: Request, report: reports.Report, titles: dict[int, str], offset: int) -> Table:
+    """One page of a report read with page=(offset, REPORT_PAGE + 1): its rows, and links to the pages before and
+    after that keep every input of the request (scope, options) and freeze its as-of time."""
+    rows = report.result.rows
+    more = len(rows) > REPORT_PAGE
+    t = table(sql.Result(report.result.columns, rows[:REPORT_PAGE]), titles)
+    t.start = offset
+
+    def href(at: int) -> str:
+        query = {k: v for k, v in req.query.items() if k not in ("offset", "as_of")}
+        query["as_of"] = [report.as_of.isoformat()]
+        if at:
+            query["offset"] = [str(at)]
+        return req.path + "?" + urlencode(query, doseq=True)
+
+    t.next = href(offset + REPORT_PAGE) if more else None
+    t.prev = href(max(0, offset - REPORT_PAGE)) if offset else None
+    return t
+
+
+def _offset(req: Request) -> int:
+    n = _int(req.arg("offset"), "offset") or 0
+    if n < 0:
+        raise HttpError(400, "offset must not be negative")
+    return n
 
 
 @dataclass
@@ -181,12 +211,12 @@ def _time(text_: str | None, what: str) -> dt.datetime | None:
         raise HttpError(400, str(e)) from None
 
 
-def _scope(req: Request, chats: Sequence[common.Chat]) -> list[int] | None:
+def _scope(req: Request, chats: Sequence[common.Chat], field: str = "chat") -> list[int] | None:
     """The `chat` fields: tracked chat ids, in the order given, no repeats; None = every tracked chat."""
     tracked = {c.id for c in chats if c.tracked}
     out: list[int] = []
-    for raw in req.args("chat"):
-        n = _int(raw, "chat")
+    for raw in req.args(field):
+        n = _int(raw, field)
         if n not in tracked:
             raise HttpError(400, f"chat {raw} is not a tracked chat")
         if n not in out:
@@ -234,10 +264,11 @@ class WebApp:
             ("GET", re.compile(r"/overlap"), self.overlap),
             ("GET", re.compile(r"/overlap/pair"), self.pair),
             ("GET", re.compile(r"/user"), self.user),
+            ("POST", re.compile(r"/user"), self.user),
             ("GET", re.compile(r"/campaigns"), self.campaigns),
             ("POST", re.compile(r"/campaigns"), self.campaign_create),
             ("GET", re.compile(r"/campaigns/(?P<id>[0-9]{1,18})"), self.campaign),
-            ("GET", re.compile(r"/campaigns/(?P<id>[0-9]{1,18})/entrants\.csv"), self.entrants_csv),
+            ("POST", re.compile(r"/campaigns/(?P<id>[0-9]{1,18})/entrants\.csv"), self.entrants_csv),
             ("POST", re.compile(r"/campaigns/(?P<id>[0-9]{1,18})/link"), self.link_create),
             ("GET", re.compile(r"/reports"), self.report_index),
             ("GET", re.compile(r"/reports/asof"), self.asof),
@@ -346,8 +377,9 @@ class WebApp:
             scope = _scope(req, chats)
             report = reports.build_report(conn, "1", as_of=None, scope=scope, params={}, rollup=True,
                                           window=lambda as_of, since: None)
+            published = publication(conn)  # the same snapshot as the matrix
         result = report.result.dicts()
-        generation = result[0]["as_of"] if result else None
+        generation = published[1] if result and published else None
         order = report.scope
         cells = {(r["chat_a"], r["chat_b"]): r for r in result}
         sizes = {a: cells[(a, a)]["size_a"] for a in order if (a, a) in cells}
@@ -363,7 +395,7 @@ class WebApp:
                 j = float(r["jaccard"] or 0)
                 line.append({"shared": r["shared"], "pct_row": r["pct_of_a"], "pct_col": r["pct_of_b"],
                              "jaccard": r["jaccard"], "shade": min(10, max(0, round(j * 10))), "diagonal": a == b,
-                             "href": "/overlap/pair?" + urlencode({"a": a, "b": b, "as_of": generation.isoformat()})
+                             "href": "/overlap/pair?" + urlencode({"a": a, "b": b, "gen": published[0]})
                              if generation else None,
                              "tip": (f"{titles.get(a, a)}: {r['shared']} members" if a == b else
                                      f"{titles.get(a, a)} and {titles.get(b, b)}: {r['shared']} shared, "
@@ -382,38 +414,48 @@ class WebApp:
         side = req.arg("side", "shared")
         if side not in SIDES:
             raise HttpError(400, f"side must be one of {', '.join(SIDES)}")
-        shown = _time(req.arg("as_of"), "as_of")
-        if shown is None:
-            raise HttpError(400, "open a pair from the overlap matrix: the request carries the matrix's as_of")
-        after = _int(req.arg("after"), "after") or 0
+        gen = _int(req.arg("gen"), "gen")
+        if gen is None:
+            raise HttpError(400, "open a pair from the overlap matrix: the request carries the matrix's rollup run")
+        page_no = _int(req.arg("page"), "page") or 0
+        if page_no < 0:
+            raise HttpError(400, "page must not be negative")
         with self.db.read() as conn:
             chats = common.load_chats(conn)
             titles = common.titles_of(chats)
             if not any(c.id == a and c.tracked for c in chats) or not any(c.id == b and c.tracked for c in chats):
                 raise HttpError(400, "both chats of a pair must be tracked")
             # The published generation, in the same snapshot as the counts and the list below.
-            published = conn.execute("SELECT max(as_of) FROM stats.overlap").fetchone()[0]
-            if published != shown:
-                return self.render("stale.html", 409, nav="/overlap", title="Overlap refreshed", shown=shown,
-                                   published=published, back="/overlap?" + urlencode([("chat", a), ("chat", b)]))
+            published = publication(conn)
+            if published is None or published[0] != gen:
+                return self.render("stale.html", 409, nav="/overlap", title="Overlap refreshed",
+                                   published=published[1] if published else None,
+                                   back="/overlap?" + urlencode([("chat", a), ("chat", b)]))
             cell = {(r["chat_a"], r["chat_b"]): r for r in sql.run(conn, "1", scope=[a, b]).dicts()}[(a, b)]
-            page = sql.run(conn, "1b", chat=a, chat_b=b, side=side, after_user=after,
-                           page_size=PAGE_SIZE + 1).dicts()
+            # Paged by position in the generation's list (tg.user_chats changes only with a new R2 publication,
+            # which this request refused above), so a page link carries no user id.
+            page = sql.run_page(conn, "1b", offset=page_no * PAGE_SIZE, limit=PAGE_SIZE + 1, chat=a, chat_b=b,
+                                side=side, after_user=0, page_size=ALL_ROWS).dicts()
         more = len(page) > PAGE_SIZE
         page = page[:PAGE_SIZE]
         counts = {"shared": cell["shared"], "only_a": cell["size_a"] - cell["shared"],
                   "only_b": cell["size_b"] - cell["shared"]}
-        base = {"a": a, "b": b, "as_of": shown.isoformat()}
-        nxt = "/overlap/pair?" + urlencode({**base, "side": side, "after": page[-1]["user_id"]}) if more else None
+        base = {"a": a, "b": b, "gen": gen}
+        nxt = "/overlap/pair?" + urlencode({**base, "side": side, "page": page_no + 1}) if more else None
+        prev = "/overlap/pair?" + urlencode({**base, "side": side, "page": page_no - 1}) if page_no else None
         return self.render("pair.html", nav="/overlap", title="Pair", a=a, b=b, titles=titles, cell=cell,
-                           counts=counts, side=side, sides=SIDES, people=page, base=base, next=nxt,
-                           generation=shown, first=after == 0)
+                           counts=counts, side=side, sides=SIDES, people=page, base=base, next=nxt, prev=prev,
+                           generation=published[1], start=page_no * PAGE_SIZE)
 
     # --------------------------------------------------------------------------------------------------
     # User lookup
     # --------------------------------------------------------------------------------------------------
 
     def user(self, req: Request, _m: dict[str, str]) -> Response:
+        """GET: the empty form. POST: the lookup, rendered from the POST (no redirect): a user id or @name never
+        goes into a URL, where proxy logs and Referers would keep it."""
+        if req.method != "POST" and (req.query.get("q") or req.query.get("as_of")):
+            raise HttpError(400, "a lookup is sent as a form (POST): user ids never go into a URL")
         q = req.arg("q")
         at = _time(req.arg("as_of"), "as_of")
         if q is None:
@@ -486,8 +528,7 @@ class WebApp:
         log.info("web: campaign %d added", campaign_id)
         return redirect(f"/campaigns/{campaign_id}")
 
-    def campaign(self, req: Request, m: dict[str, str], *, made: dict[str, Any] | None = None,
-                 problem: str | None = None, status: int = 200) -> Response:
+    def campaign(self, req: Request, m: dict[str, str], *, problem: str | None = None, status: int = 200) -> Response:
         campaign_id = int(m["id"])
         as_of = _time(req.arg("as_of"), "as_of") if req.method == "GET" else None
         hours = _option("hours", req.arg("hours")) if req.method == "GET" else None
@@ -507,12 +548,12 @@ class WebApp:
                                  "WHERE campaign_id = %s AND made_by_bot ORDER BY invite_link_id",
                                  (campaign_id,)).fetchall()
         titles = common.titles_of(chats)
-        csv_query = urlencode({k: v for k, v in (("as_of", per_chat.as_of.isoformat()), ("hours", hours)) if v is not None})
+        csv_form = {k: v for k, v in (("as_of", per_chat.as_of.isoformat()), ("hours", hours)) if v is not None}
         return self.render("campaign.html", status, nav="/campaigns", title=f"Campaign {campaign_id}", campaign=row,
                            header=header_of(per_chat), per_chat=transposed(per_chat.result, titles, "chat_id"),
                            per_person=transposed(per_person.result, titles, "campaign_id"), links=links, titles=titles,
                            chats=[c for c in chats if c.id in per_chat.scope] or [c for c in chats if c.tracked],
-                           csv_query=csv_query, made=made, problem=problem, name_max=campaigns_cmd.NAME_MAX,
+                           csv_form=csv_form, problem=problem, name_max=campaigns_cmd.NAME_MAX,
                            hours=hours)
 
     def entrants_csv(self, req: Request, m: dict[str, str]) -> Response:
@@ -535,22 +576,24 @@ class WebApp:
                         [("Content-Disposition", f'attachment; filename="campaign-{campaign_id}-entrants-{stamp}.csv"')])
 
     def link_create(self, req: Request, m: dict[str, str]) -> Response:
-        """createChatInviteLink with the link's name; the link is shown once in this response and stored only as
-        its HMAC digest (D8). Never logged, never in a URL (the response to a POST, no redirect)."""
+        """createChatInviteLink with the link's name; the link is shown once and stored only as its HMAC digest (D8).
+        Never logged, never in a URL (the response to a POST, no redirect). Once Telegram has made the link, the
+        page is built only from this request's values, so no later failure (storing it, a report) can hide it."""
         campaign_id = int(m["id"])
         name = (req.arg("name") or "").strip()
         chat_id = _int(req.arg("chat"), "chat")
         if not 1 <= len(name) <= campaigns_cmd.NAME_MAX:
             return self.campaign(req, m, problem=f"the link's name must be 1-{campaigns_cmd.NAME_MAX} characters "
                                                  "(Telegram's limit)", status=400)
-        with self.db.read() as conn:
+        with self.db.read() as conn:  # the lock is released before any other page is built
             chats = common.load_chats(conn)
             chat = next((c for c in chats if c.id == chat_id and c.tracked), None)
-            if chat is None:
-                return self.campaign(req, m, problem="pick a tracked chat for the link", status=400)
-            if conn.execute("SELECT 1 FROM tg.campaign WHERE campaign_id = %s", (campaign_id,)).fetchone() is None:
-                raise HttpError(404, f"no campaign {campaign_id}")
+            row = conn.execute("SELECT name FROM tg.campaign WHERE campaign_id = %s", (campaign_id,)).fetchone()
             state = conn.execute("SELECT bot_id FROM tg.bot_state").fetchone()
+        if row is None:
+            raise HttpError(404, f"no campaign {campaign_id}")
+        if chat is None:
+            return self.campaign(req, m, problem="pick a tracked chat for the link", status=400)
         # No transaction is open during the Bot API call.
         try:
             with self.api_factory(self.cfg) as api:
@@ -560,32 +603,36 @@ class WebApp:
         link = made.get("invite_link") if isinstance(made, dict) else None
         if not isinstance(link, str) or not link:
             return self.campaign(req, m, problem="createChatInviteLink returned no invite_link", status=502)
-        shown = {"link": link, "name": made.get("name") or name, "chat": chat}
+        shown = {"link": link, "name": made.get("name") or name, "chat": chat, "campaign_id": campaign_id,
+                 "campaign": row[0], "id": None, "problem": None}
         try:
             with self.db.write() as conn:
                 shown["id"] = campaigns_cmd.insert_link(conn, self.cfg, chat.id, link, made, name=name,
                                                         campaign_id=campaign_id, bot_id=state[0] if state else None)
-        except psycopg.Error as e:
-            # The link exists at Telegram and cannot be shown again: show it with the failure.
-            return self.campaign(req, m, made=shown, status=500,
-                                 problem="the link was created at Telegram but could not be stored, so joins through "
-                                         f"it will not be attributed: {db_error_line(e)}")
+        except Exception as e:  # the link exists at Telegram and cannot be shown again: show it with the failure
+            if isinstance(e, db.StaleGeneration):
+                self.fatal(1, str(e))
+            reason = e.message if isinstance(e, HttpError) else db_error_line(e)
+            log.error("web: a bot invite link for chat %d was made but not stored: %s", chat.id, type(e).__name__)
+            shown["problem"] = ("the link was created at Telegram but could not be stored, so joins through it will "
+                                f"not be attributed: {reason}")
+            return self.render("link_made.html", 500, nav="/campaigns", title="Invite link", made=shown)
         log.info("web: bot invite link %d made for chat %d, campaign %d", shown["id"], chat.id, campaign_id)
-        return self.campaign(req, m, made=shown)
+        return self.render("link_made.html", nav="/campaigns", title="Invite link", made=shown)
 
     # --------------------------------------------------------------------------------------------------
     # Reports
     # --------------------------------------------------------------------------------------------------
 
     def report_index(self, req: Request, _m: dict[str, str]) -> Response:
-        return self.render("reports.html", nav="/reports", title="Reports", specs=reports.PLAIN,
-                           not_on_web=NOT_ON_WEB)
+        return self.render("reports.html", nav="/reports", title="Reports", specs=reports.PLAIN)
 
     def report(self, req: Request, m: dict[str, str]) -> Response:
         spec = next((s for s in reports.PLAIN if s.name == m["name"]), None)
         if spec is None:
             raise HttpError(404, f"no report {m['name']!r}")
         as_of = _time(req.arg("as_of"), "as_of")
+        offset = _offset(req)
         params = {n: _option(n, req.arg(n)) for n in spec.params}
         params = {k: v for k, v in params.items() if v is not None}
         if "since" in params:
@@ -595,49 +642,55 @@ class WebApp:
             scope = _scope(req, chats)
             try:
                 report = reports.build_report(conn, spec.block, as_of=as_of, scope=scope, params=params,
-                                              rollup=spec.rollup, **reports.header_parts(spec, conn, params))
+                                              rollup=spec.rollup, page=(offset, REPORT_PAGE + 1),
+                                              **reports.header_parts(spec, conn, params))
             except (CliError, ValueError) as e:
                 raise HttpError(400, str(e)) from None
         return self.render("report.html", nav="/reports", title=spec.name, spec=spec, header=header_of(report),
-                           table=table(report.result, common.titles_of(chats)), chats=[c for c in chats if c.tracked],
-                           chosen=set(scope or []), form={n: req.arg(n, "") for n in ("as_of", *spec.params)},
+                           table=paged_table(req, report, common.titles_of(chats), offset),
+                           chats=[c for c in chats if c.tracked], chosen=set(scope or []),
+                           form={n: req.arg(n, "") for n in ("as_of", *spec.params)},
                            options={n: reports.OPTIONS[n][1]["help"] for n in spec.params}, action=f"/reports/{spec.name}")
 
     def asof(self, req: Request, _m: dict[str, str]) -> Response:
+        """Item 16 as the CLI's `asof`: counts (16a), the members (16b), the end-of-day count (16d), or the pair
+        matrix of the `among` chats at that moment (16c, a batch of up to a minute at full scale)."""
         mode = req.arg("mode", "counts")
-        if mode not in ("counts", "list", "eod"):
-            raise HttpError(400, "mode must be counts, list or eod")
+        if mode not in ASOF_MODES:
+            raise HttpError(400, f"mode must be one of {', '.join(ASOF_MODES)}")
+        block = ASOF_MODES[mode]
         chat_id = _int(req.arg("chat"), "chat")
         day = _time(req.arg("date"), "date")
         as_of = _time(req.arg("as_of"), "as_of")
+        offset = _offset(req)
+        form = {"chat": req.arg("chat", ""), "date": req.arg("date", ""), "as_of": req.arg("as_of", ""), "mode": mode}
         with self.db.read() as conn:
             chats = common.load_chats(conn)
             tracked = [c for c in chats if c.tracked]
-            form = {"chat": req.arg("chat", ""), "date": req.arg("date", ""), "as_of": req.arg("as_of", ""),
-                    "mode": mode}
-            if chat_id is None or day is None:
-                return self.render("asof.html", nav="/reports", title="asof", chats=tracked, form=form, header=None,
-                                   table=None, note=NOT_ON_WEB["16c"])
-            if chat_id not in {c.id for c in tracked}:
+            among = _scope(req, chats, "among")
+            page = dict(nav="/reports", title="asof", chats=tracked, form=form, chosen=set(among or []))
+            if day is None or (chat_id is None and mode != "matrix"):
+                return self.render("asof.html", header=None, table=None, **page)
+            if chat_id is not None and chat_id not in {c.id for c in tracked}:
                 raise HttpError(400, f"chat {chat_id} is not a tracked chat")
             params: dict[str, Any] = {"day": day.isoformat()}
             window: Callable[[dt.datetime, dt.datetime], Window | None] = lambda a, s: Window(day, day, point=True)  # noqa: E731
             as_of_notes = None
-            if mode == "eod":
-                block = "16d"
+            scope: list[int] | None = [chat_id] if chat_id is not None else None
+            if mode == "matrix":
+                scope = among  # the CLI's --matrix: the --among chats (default every tracked chat)
+            elif mode == "eod":
                 start = dt.datetime.combine(day.astimezone(UTC).date(), dt.time(), UTC)
                 end = start + dt.timedelta(days=1)
                 window = lambda a, s: Window(start, end)  # noqa: E731
                 as_of_notes = lambda a: () if end <= a else (  # noqa: E731
                     f"{start.date()} has not ended at as_of: no end-of-day count (the day of as_of is left out)",)
             else:
-                block = "16b" if mode == "list" else "16a"
                 params["chat"] = chat_id
-            report = reports.build_report(conn, block, as_of=as_of, scope=[chat_id], params=params, window=window,
-                                          as_of_notes=as_of_notes)
-        return self.render("asof.html", nav="/reports", title="asof", chats=tracked, form=form,
-                           header=header_of(report), table=table(report.result, common.titles_of(chats)),
-                           note=NOT_ON_WEB["16c"])
+            report = reports.build_report(conn, block, as_of=as_of, scope=scope, params=params, window=window,
+                                          as_of_notes=as_of_notes, page=(offset, REPORT_PAGE + 1))
+        return self.render("asof.html", header=header_of(report),
+                           table=paged_table(req, report, common.titles_of(chats), offset), **page)
 
     def coverage(self, req: Request, _m: dict[str, str]) -> Response:
         gaps = req.arg("gaps") is not None
@@ -668,6 +721,14 @@ class WebApp:
                            form={"as_of": req.arg("as_of", ""), "since": req.arg("since", ""), "gaps": gaps},
                            options={"since": "start of the window for the gap flags (default: as of minus 90 days)"},
                            action="/reports/coverage")
+
+
+def publication(conn: psycopg.Connection) -> tuple[int, dt.datetime] | None:
+    """The published audience rollup: its stats.rollup_run row (id, as_of), written by R2 in the transaction that
+    publishes the matrix and tg.user_chats. The id names one publication; two runs with the same as_of differ."""
+    row = conn.execute("SELECT rollup_run_id, as_of FROM stats.rollup_run WHERE rollup = 'audience' "
+                       "ORDER BY finished_at DESC, rollup_run_id DESC LIMIT 1").fetchone()
+    return (int(row[0]), row[1]) if row else None
 
 
 def _ts(conn: psycopg.Connection, value: str) -> dt.datetime:

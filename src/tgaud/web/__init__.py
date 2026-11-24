@@ -18,34 +18,139 @@ forms must come from the request's own host (Origin, or Referer without one).
 
 from __future__ import annotations
 
+import io
 import logging
 import threading
+import time
 from collections.abc import Callable
 from socketserver import ThreadingMixIn
 from typing import Any
-from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
+from urllib.parse import urlsplit
+from wsgiref.simple_server import ServerHandler, WSGIRequestHandler, WSGIServer, make_server
 
 import psycopg
 
 from tgaud.config import Config, Secret
-from tgaud.web.app import WebDb
+from tgaud.web.app import MAX_BODY, WebDb
 from tgaud.web.pages import WebApp
 
 log = logging.getLogger(__name__)
 
 __all__ = ["WebServer", "WebApp", "WebDb"]
 
+MAX_HANDLERS = 16  # requests handled at once; a connection beyond them gets 503 without a thread
+READ_DEADLINE = 10.0  # seconds a client has to send its whole request (line, headers, body)
+WRITE_TIMEOUT = 30.0  # seconds a send of the response may block
+_BUSY = (b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n"
+         b"Content-Length: 5\r\nConnection: close\r\n\r\nbusy\n")
+
 
 class _Server(ThreadingMixIn, WSGIServer):
+    """One daemon thread per request, at most `max_handlers` at once: the slot is taken on the accepting thread
+    before a handler thread exists, and a connection without a free slot is answered 503 and closed there."""
+
     daemon_threads = True
+    max_handlers = MAX_HANDLERS
+
+    def server_activate(self) -> None:
+        super().server_activate()
+        self._slots = threading.BoundedSemaphore(self.max_handlers)
+
+    def process_request(self, request: Any, client_address: Any) -> None:
+        if not self._slots.acquire(blocking=False):
+            try:
+                request.settimeout(1.0)
+                request.sendall(_BUSY)
+            except OSError:
+                pass
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        log.debug("web http: a connection failed", exc_info=True)
+
+
+class _DeadlineReader:
+    """The request's reads, each with the time left until one deadline for the whole request."""
+
+    def __init__(self, raw: Any, sock: Any, deadline: float) -> None:
+        self.raw, self.sock, self.deadline = raw, sock, deadline
+
+    def _arm(self) -> None:
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            raise TimeoutError("the request was not sent in time")
+        self.sock.settimeout(left)
+
+    def readline(self, size: int = -1) -> bytes:
+        self._arm()
+        return self.raw.readline(size)
+
+    def read(self, size: int = -1) -> bytes:
+        self._arm()
+        return self.raw.read(size)
 
 
 class _Handler(WSGIRequestHandler):
+    """Reads the whole request within READ_DEADLINE before the app runs (a slow or idle client cannot hold a
+    handler), and logs method, path without the query, and status only: queries carry user ids and @names."""
+
     server_version = "tgaud"
     sys_version = ""
+    read_deadline = READ_DEADLINE
+
+    def handle(self) -> None:
+        self.rfile = _DeadlineReader(self.rfile, self.connection, time.monotonic() + self.read_deadline)
+        try:
+            self.raw_requestline = self.rfile.readline(65537)
+            if not self.raw_requestline:
+                return
+            if len(self.raw_requestline) > 65536:
+                self.requestline, self.request_version, self.command = "", "", ""
+                self.send_error(414)
+                return
+            if not self.parse_request():
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self.send_error(400, "bad Content-Length")
+                return
+            if length < 0 or length > MAX_BODY:
+                self.send_error(413)
+                return
+            body = self.rfile.read(length) if length else b""
+            if len(body) < length:
+                return  # the client went away
+        except (TimeoutError, OSError):
+            self.close_connection = True
+            return
+        self.connection.settimeout(WRITE_TIMEOUT)
+        handler = ServerHandler(io.BytesIO(body), self.wfile, self.get_stderr(), self.get_environ(),
+                                multithread=True)
+        handler.request_handler = self
+        handler.run(self.server.get_app())
+
+    def log_request(self, code: Any = "-", size: Any = "-") -> None:
+        path = urlsplit(getattr(self, "path", "") or "").path
+        log.debug("web http: %s %s %s", getattr(self, "command", "") or "-", path or "-", code)
+
+    def log_error(self, format: str, *args: Any) -> None:  # noqa: A002
+        log.debug("web http: a malformed request was refused")
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
-        log.debug("web http: " + format, *args)
+        log.debug("web http: a server note (not logged: it can hold the request line)")
 
 
 class WebServer:

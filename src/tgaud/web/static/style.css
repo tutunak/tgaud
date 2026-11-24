@@ -224,3 +224,11 @@ code.link { display: block; font-size: 1.05rem; padding: 0.4rem 0.5rem; backgrou
 @media (max-width: 640px) {
   .data.measures th, .data.measures td { padding: 0.25rem 0.4rem; font-size: 0.85rem; }
 }
+
+/* a link to a person is a small POST form: user ids never go into a URL */
+.inline-form { display: inline; margin: 0; }
+button.linkish {
+  background: none; border: 0; padding: 0; margin: 0; font: inherit; font-weight: normal; color: var(--accent);
+  text-decoration: underline; cursor: pointer; border-radius: 0;
+}
+form.download { display: inline-block; margin: 1rem 0.5rem 0.5rem 0; }

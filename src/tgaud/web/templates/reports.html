@@ -6,8 +6,7 @@
 {% for s in specs %}
   <li><a href="/reports/{{ s.name }}">{{ s.name }}</a> <span>{{ s.help }}</span></li>
 {% endfor %}
-  <li><a href="/reports/asof">asof</a> <span>who was in a chat at a moment: counts, the list, or the end-of-day count (item 16)</span></li>
+  <li><a href="/reports/asof">asof</a> <span>who was in a chat at a moment: counts, the list, the end-of-day count, or the overlap matrix at that moment (item 16)</span></li>
   <li><a href="/reports/coverage">coverage</a> <span>per chat: when the bot was admin, Telegram's count against ours, suspect spells, gaps</span></li>
 </ul>
-{% for block, why in not_on_web.items() %}<p class="hint">Not here: {{ why }}.</p>{% endfor %}
 {% endblock %}

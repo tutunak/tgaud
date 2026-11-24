@@ -9,6 +9,7 @@ list except `all`: `2a` is one block, `2` is 2a and 2b together.
     run(conn, id, **params)   -> Result            fills defaults and derived values like the header, runs the
                                                    block in the caller's transaction, returns the last
                                                    statement that produced rows (all_results=True: each one)
+    run_page(conn, id, offset=, limit=, **params)  one page of the last statement's rows (LIMIT/OFFSET)
 
 psql variables become psycopg named parameters, one per occurrence: `:'name'` is bound as a str with no type
 (the server infers it, like psql's quoted literal), `:name` is bound with the type of that parameter
@@ -465,6 +466,29 @@ def run(conn: psycopg.Connection, block_id: str, *, explain: str = "", all_resul
     if not results:
         return Result([], [])
     return results[-1]
+
+
+def run_page(conn: psycopg.Connection, block_id: str, *, offset: int, limit: int, qf: QueryFile | None = None,
+             **params: Any) -> Result:
+    """One page of a block's rows: run() with its last statement wrapped in `LIMIT limit OFFSET offset`, so a page
+    never fetches more than `limit` rows (the web UI's report pages). The block's own ORDER BY gives the order;
+    a block that picks a branch at run time (R1, R2) is refused."""
+    qf = qf or load()
+    if offset < 0 or limit < 1:
+        raise ValueError("offset must be >= 0 and limit >= 1")
+    blocks = qf.blocks_for(block_id)
+    if len(blocks) != 1 or blocks[0].branching:
+        raise BranchingBlock(f"block {block_id} cannot be paged (one block without run-time branches only)")
+    stmts = [s for s in blocks[0].items if isinstance(s, Statement) and not _is_txn_control(s)]
+    vals = values(conn, qf, **params)
+    for s in stmts[:-1]:
+        conn.execute(s.query(), s.bind(vals))
+    last = stmts[-1]
+    query = f"SELECT * FROM (\n{last.query()}\n) AS page LIMIT %(page_limit)s OFFSET %(page_offset)s"
+    cur = conn.execute(query, {**last.bind(vals), "page_limit": Int8(limit), "page_offset": Int8(offset)})
+    if cur.description is None:
+        raise ValueError(f"the last statement of block {block_id} returns no rows")
+    return Result([d.name for d in cur.description], cur.fetchall())
 
 
 def _exec_items(conn: psycopg.Connection, items: Sequence[Statement | If], vals: dict[str, str], explain: str,

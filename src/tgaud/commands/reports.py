@@ -125,9 +125,11 @@ def build_report(conn: psycopg.Connection, block: str, *, as_of: dt.datetime | N
                  params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
                  rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
                  header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None,
-                 as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None) -> Report:
+                 as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None,
+                 page: tuple[int, int] | None = None) -> Report:
     """Header data, then the block: both in the caller's transaction, with one as-of time and one scope;
-    `as_of_notes` adds header lines that depend on the frozen as-of time."""
+    `as_of_notes` adds header lines that depend on the frozen as-of time; `page` = (offset, limit) reads one
+    page of the block's rows (sql.run_page) instead of all of them."""
     params = dict(params)
     if as_of is not None:
         params["as_of"] = as_of.isoformat()
@@ -145,7 +147,10 @@ def build_report(conn: psycopg.Connection, block: str, *, as_of: dt.datetime | N
         notes = (*notes, *as_of_notes(as_of_ts))
     win = window(as_of_ts, since)
     coverage = common.coverage_rows(conn, in_scope, as_of_ts, win)
-    result = sql.run(conn, block, **params)
+    if page is None:
+        result = sql.run(conn, block, **params)
+    else:
+        result = sql.run_page(conn, block, offset=page[0], limit=page[1], **params)
     return Report(title or sql.title(block), block, as_of_ts, since, in_scope, win, rollup, ra, tuple(notes), coverage,
                   result)
 

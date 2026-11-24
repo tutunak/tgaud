@@ -11,13 +11,6 @@
   {% if campaign[8] %}<div><dt>Note</dt><dd>{{ campaign[8] }}</dd></div>{% endif %}
 </dl>
 {% if problem %}<p class="problem">{{ problem }}</p>{% endif %}
-{% if made %}
-<section class="once">
-  <h2>Invite link "{{ made.name }}" for {{ made.chat.title }}</h2>
-  <p><code class="link">{{ made.link }}</code></p>
-  <p><strong>Copy it now: this is the only time it is shown.</strong> Only its HMAC digest and name are stored{% if made.id is defined %} (invite link {{ made.id }}){% endif %}.</p>
-</section>
-{% endif %}
 {{ report_header(header) }}
 <form method="get" action="/campaigns/{{ campaign[0] }}" class="controls inline">
   <label>As of <input type="text" name="as_of" value="" placeholder="now"></label>
@@ -28,8 +21,11 @@
 {{ data_table(per_chat, "No entrant yet.", cards=false, count=false) }}
 <h2>Per person</h2>
 {{ data_table(per_person, "No entrant yet.", cards=false, count=false) }}
-<p><a class="button" href="/campaigns/{{ campaign[0] }}/entrants.csv?{{ csv_query }}">Download the entrants (CSV)</a>
-<span class="hint">One row per chat and person, with user ids: for the owner only.</span></p>
+<form method="post" action="/campaigns/{{ campaign[0] }}/entrants.csv" class="inline-form download">
+  {% for k, v in csv_form.items() %}<input type="hidden" name="{{ k }}" value="{{ v }}">{% endfor %}
+  <button type="submit">Download the entrants (CSV)</button>
+</form>
+<span class="hint">One row per chat and person, with user ids: for the owner only.</span>
 <h2 id="link">Make a named bot invite link</h2>
 <form method="post" action="/campaigns/{{ campaign[0] }}/link" class="stack">
   <div class="row">

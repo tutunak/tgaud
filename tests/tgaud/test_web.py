@@ -105,6 +105,7 @@ class Client:
                         "CONTENT_TYPE": "application/x-www-form-urlencoded"})
         if token is not None:
             environ["HTTP_X_TGAUD_PROXY_TOKEN"] = token
+        environ["HTTP_X_FORWARDED_PROTO"] = "https"  # Caddy terminates TLS and says so
         for k, v in (headers or {}).items():
             environ["HTTP_" + k.upper().replace("-", "_")] = v
         got: dict = {}
@@ -244,11 +245,10 @@ def q_titles(web):
 
 
 def pair_link(page: Page, a: int, b: int) -> dict[str, str]:
-    m = re.search(r'href="/overlap/pair\?a=' + re.escape(str(a)) + r"&amp;b=" + re.escape(str(b)) + r'&amp;as_of=([^"]+)"',
+    m = re.search(r'href="/overlap/pair\?a=' + re.escape(str(a)) + r"&amp;b=" + re.escape(str(b)) + r'&amp;gen=(\d+)"',
                   page.text)
     assert m, page.text
-    from urllib.parse import unquote
-    return {"a": str(a), "b": str(b), "as_of": unquote(m.group(1))}
+    return {"a": str(a), "b": str(b), "gen": m.group(1)}
 
 
 def people(page: Page) -> list[str]:
@@ -263,7 +263,7 @@ def test_pair_drill_down_lists_exactly_the_people_of_its_cell(web):
     assert len(people(page)) == 4
     assert len(people(ok(web.get("/overlap/pair", **link, side="only_a")))) == 6
     assert len(people(ok(web.get("/overlap/pair", **link, side="only_b")))) == 2
-    diag = ok(web.get("/overlap/pair", a=str(A), b=str(A), as_of=link["as_of"]))
+    diag = ok(web.get("/overlap/pair", a=str(A), b=str(A), gen=link["gen"]))
     assert len(people(diag)) == 10
     # the list is block 1b over tg.user_chats: the same people as a direct read of the snapshot
     with web.app.db.read() as conn:
@@ -271,7 +271,7 @@ def test_pair_drill_down_lists_exactly_the_people_of_its_cell(web):
             "SELECT user_id FROM tg.user_chats WHERE chat_ids @> %s::bigint[]", ([A, B],)))
     assert sorted(people(page)) == want
     assert web.get("/overlap/pair", **link, side="nobody").status == 400
-    assert web.get("/overlap/pair", a=str(A), b=str(B)).status == 400  # no as_of: not from a matrix page
+    assert web.get("/overlap/pair", a=str(A), b=str(B)).status == 400  # no gen: not from a matrix page
 
 
 def follow(web, href: str) -> Page:
@@ -294,7 +294,7 @@ def test_a_join_after_the_refresh_changes_neither_cell_nor_list_until_the_next_o
     assert m[("Alpha news", next(k[1] for k in m if k[1] != "Alpha news"))].startswith("4 ")
     again = ok(web.get("/overlap/pair", **link))
     assert people(again) == people(first) and "in both <b>4</b>" in again.text
-    nxt = re.search(r'href="(/overlap/pair\?[^"]+after=[^"]+)"', first.text).group(1).replace("&amp;", "&")
+    nxt = re.search(r'href="(/overlap/pair\?[^"]+page=1)"', first.text).group(1).replace("&amp;", "&")
     second = ok(follow(web, nxt))
     assert len(people(second)) == 1 and "8801" not in second.text
     # an R2 publish between the matrix and the click, and between two pages: no answer from the new population
@@ -305,29 +305,50 @@ def test_a_join_after_the_refresh_changes_neither_cell_nor_list_until_the_next_o
     stale_next = follow(web, nxt)
     assert stale_next.status == 409
     fresh_link = pair_link(ok(web.get("/overlap", chat=[str(A), str(B)])), A, B)
-    assert fresh_link["as_of"] != link["as_of"]
+    assert fresh_link["gen"] != link["gen"]
     now = ok(web.get("/overlap/pair", **fresh_link))
     assert "in both <b>5</b>" in now.text
 
 
+def test_a_new_publication_at_the_same_as_of_is_a_new_generation(fresh_web, monkeypatch):
+    """Two stays dated before the cutoff, then R2 again at the same as_of: the old links are not answered from it."""
+    web = fresh_web
+    monkeypatch.setattr(pages, "PAGE_SIZE", 3)
+    link = pair_link(ok(web.get("/overlap", chat=[str(A), str(B)])), A, B)
+    first = ok(web.get("/overlap/pair", **link))
+    nxt = re.search(r'href="(/overlap/pair\?[^"]+page=1)"', first.text).group(1).replace("&amp;", "&")
+    with psycopg.connect(web.dsn) as c:
+        b = Builder(c)
+        b.stay(A, 8802, ts("2026-11-20T10:00:00"), update_id=880300)
+        b.stay(B, 8802, ts("2026-11-20T10:05:00"), update_id=880400)
+        c.commit()
+        audience.refresh(c, NOW)  # the same cutoff as the published run
+    for href in ("/overlap/pair?" + urlencode(link), nxt):
+        stale = follow(web, href)
+        assert stale.status == 409 and "8802" not in stale.text, stale.text
+    fresh = pair_link(ok(web.get("/overlap", chat=[str(A), str(B)])), A, B)
+    assert int(fresh["gen"]) > int(link["gen"])
+    assert "in both <b>5</b>" in ok(web.get("/overlap/pair", **fresh)).text
+
+
 def test_user_lookup_shows_chats_stays_campaigns_and_activity(web):
-    page = ok(web.get("/user", q="1001"))
+    page = ok(web.post("/user", {"q": "1001"}))
     assert "In now: 4 chats" in page.text
     assert len(page.table_with("start_source")) == 4
-    page = ok(web.get("/user", q="1006"))
+    page = ok(web.post("/user", {"q": "1006"}))
     stays = page.table_with("start_source")
     assert len([r for r in stays if r["chat_id"] == str(A)]) == 2
     with web.app.db.read() as conn:
         entrant = sql.run(conn, "4c", as_of=NOW_ARG, campaign=1).dicts()[0]
         writer = conn.execute("SELECT user_id, sum(messages) FROM tg.activity_daily GROUP BY user_id "
                               "ORDER BY user_id LIMIT 1").fetchone()
-    page = ok(web.get("/user", q=str(entrant["user_id"])))
+    page = ok(web.post("/user", {"q": str(entrant["user_id"])}))
     entered = page.table_with("campaign")
     assert any(r["campaign_id"] == "1" and r["joined_at"] == entrant["joined_at"].strftime("%Y-%m-%d %H:%M:%S")
                for r in entered)
-    page = ok(web.get("/user", q=str(writer[0])))
+    page = ok(web.post("/user", {"q": str(writer[0])}))
     assert sum(int(r["messages"]) for r in page.table_with("days_active")) == writer[1]
-    missing = web.get("/user", q="@nobody_here")
+    missing = web.post("/user", {"q": "@nobody_here"})
     assert missing.status == 404 and "no user with username" in missing.text
 
 
@@ -343,7 +364,7 @@ def test_campaign_page_has_item_4_per_chat_and_per_person_and_the_entrant_csv(we
     assert "Gap flags" in page.text and "2026-11-01" in page.text  # the header: coverage, flags, the window
     listed = ok(web.get("/campaigns"))
     assert len(listed.table_with("campaign_id")) == 2  # G1 (owner), G2 (Telegram)
-    csv_page = ok(web.get("/campaigns/1/entrants.csv", as_of=NOW_ARG))
+    csv_page = ok(web.post("/campaigns/1/entrants.csv", {"as_of": NOW_ARG}))
     assert csv_page.headers["Content-Type"].startswith("text/csv")
     assert "attachment" in csv_page.headers["Content-Disposition"]
     lines = csv_page.text.strip().splitlines()
@@ -428,7 +449,11 @@ def test_post_from_another_origin_is_refused(fresh_web):
     before = q(web.dsn, "SELECT count(*) FROM tg.campaign")[0][0]
     for origin, referer in (("https://evil.example", None), ("null", None), (None, None),
                             (None, "https://evil.example/campaigns"), (f"https://{HOST}.evil.example", None),
-                            ("http://evil.example", f"https://{HOST}/campaigns")):
+                            ("http://evil.example", f"https://{HOST}/campaigns"),
+                            # the same host, another origin: the scheme or the effective port differs
+                            (f"http://{HOST}", None), (f"http://{HOST}:443", None), (f"https://{HOST}:80", None),
+                            (f"https://{HOST}:8443", None), (None, f"http://{HOST}/campaigns"),
+                            (f"https://user@{HOST}", None), (f"ftp://{HOST}", None)):
         headers = {"Referer": referer} if referer else {}
         resp = web.post("/campaigns", campaign_form(), origin=origin, headers=headers)
         assert resp.status == 403 and "cross-site" in resp.text, (origin, referer)
@@ -439,6 +464,11 @@ def test_post_from_another_origin_is_refused(fresh_web):
     assert web.post("/campaigns", campaign_form(), origin=f"https://{HOST}:443").status == 303
     assert web.post("/campaigns", campaign_form(), origin=None,
                     headers={"Referer": f"https://{HOST}/campaigns"}).status == 303
+    # a site the proxy serves over plain http (X-Forwarded-Proto: http): only http origins match
+    plain = {"X-Forwarded-Proto": "http"}
+    assert web.post("/campaigns", campaign_form(), origin=f"http://{HOST}", headers=plain).status == 303
+    assert web.post("/campaigns", campaign_form(), origin=f"https://{HOST}", headers=plain).status == 403
+    assert q(web.dsn, "SELECT count(*) FROM tg.campaign")[0][0] == before + 3
 
 
 def test_link_page_shows_the_link_once_and_stores_only_its_digest(fresh_web, caplog):
@@ -515,15 +545,15 @@ def test_telegram_text_is_escaped_everywhere(fresh_web):
         c.execute("UPDATE tg.tg_user SET first_name = %s, username = 'u1001' WHERE user_id = 1001", (evil,))
         c.commit()
     escaped = "&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt;&amp;&lt;b&gt;"
-    for page in (web.get("/", as_of=NOW_ARG), web.get("/overlap"), web.get("/user", q="1001"),
-                 web.get("/user", q="@u1001"), web.get("/campaigns"), web.get("/campaigns/1", as_of=NOW_ARG),
+    for page in (web.get("/", as_of=NOW_ARG), web.get("/overlap"), web.post("/user", {"q": "1001"}),
+                 web.post("/user", {"q": "@u1001"}), web.get("/campaigns"), web.get("/campaigns/1", as_of=NOW_ARG),
                  web.get("/reports/unique", as_of=NOW_ARG), web.get("/reports/asof", chat=str(A), date="2026-11-07")):
         ok(page)
         assert "<script" not in page.text and escaped in page.text, page.text
     link = pair_link(ok(web.get("/overlap")), A, B)
     page = ok(web.get("/overlap/pair", **link))
     assert "<script" not in page.text and escaped in page.text
-    bad = web.get("/user", q="<script>")
+    bad = web.post("/user", {"q": "<script>"})
     assert "<script>" not in bad.text and "&lt;script&gt;" in bad.text
 
 
@@ -591,12 +621,246 @@ def test_serve_without_the_proxy_token_refuses_to_start_the_web_ui(pg, migrated_
 def test_every_page_renders_on_an_empty_database(pg, migrated_dsn):
     client, database, _ = make_client(pg, migrated_dsn)
     try:
-        for path, params in (("/", {}), ("/overlap", {}), ("/user", {}), ("/user", {"q": "1"}), ("/campaigns", {}),
+        for path, params in (("/", {}), ("/overlap", {}), ("/user", {}),  ("/campaigns", {}),
                              ("/reports", {}), ("/reports/coverage", {}), ("/reports/asof", {}),
                              *((f"/reports/{s.name}", {}) for s in pages.reports.PLAIN)):
             page = client.get(path, **params)
             assert page.status == 200, (path, page.text)
-        assert client.get("/overlap/pair", a="1", b="2", as_of=NOW_ARG).status == 400
+        assert client.get("/overlap/pair", a="1", b="2", gen="1").status == 400
         assert client.get("/campaigns/1").status == 404
     finally:
         database.close()
+
+
+# ------------------------------------------------------------------------------------------------------
+# Review round 1
+# ------------------------------------------------------------------------------------------------------
+
+
+def urls(page: Page) -> list[str]:
+    return [html.unescape(u) for u in re.findall(r'(?:href|action)="([^"]*)"', page.text)]
+
+
+def test_no_user_id_ever_goes_into_a_url(web, monkeypatch):
+    """Proxy logs and Referers keep URLs: a person is looked up by POST, a link to a person is a POST form, the pair
+    list pages by position, the entrant CSV is a POST."""
+    monkeypatch.setattr(pages, "PAGE_SIZE", 2)
+    with web.app.db.read() as conn:
+        users = {str(r[0]) for r in conn.execute("SELECT user_id FROM tg.tg_user")}
+    assert users and min(int(u) for u in users) > 100  # no clash with campaign ids, page numbers, generations
+    overlap = ok(web.get("/overlap", chat=[str(c) for c in AD]))
+    link = pair_link(overlap, A, B)
+    shown = [ok(web.get("/", as_of=NOW_ARG)), overlap, ok(web.get("/campaigns")), ok(web.get("/campaigns/1", as_of=NOW_ARG)),
+             ok(web.post("/user", {"q": "1001"})), ok(web.post("/user", {"q": "1019", "as_of": NOW_ARG})),
+             ok(web.get("/reports/asof", chat=str(B), date="2026-11-07", mode="list", as_of=NOW_ARG)),
+             ok(web.get("/reports/coverage", as_of=NOW_ARG))]
+    for side in pages.SIDES:
+        first = ok(web.get("/overlap/pair", **link, side=side))
+        shown.append(first)
+        for href in urls(first):
+            if href.startswith("/overlap/pair?") and "page=" in href:
+                shown.append(ok(follow(web, href)))
+    for spec in pages.reports.PLAIN:
+        shown.append(ok(web.get(f"/reports/{spec.name}", as_of=NOW_ARG, since="2026-08-01", burst_users="2")))
+    found = [(u, n) for page in shown for u in urls(page) for n in re.findall(r"\d+", u) if n in users]
+    assert not found, found
+    assert any('action="/user"' in p.text for p in shown)  # people are still one click away
+    assert 'action="/campaigns/1/entrants.csv"' in shown[3].text
+    for path, params in (("/user", {"q": "1001"}), ("/user", {"q": "@user1001"}), ("/user", {"as_of": NOW_ARG})):
+        refused = web.get(path, **params)
+        assert refused.status == 400 and "1001" not in refused.text, refused.text
+    assert ok(web.get("/user")).text.count('method="post" action="/user"') == 1
+    assert web.get("/campaigns/1/entrants.csv").status == 405
+
+
+def test_report_pages_reach_every_row_and_keep_scope_and_as_of(web, monkeypatch):
+    monkeypatch.setattr(pages, "REPORT_PAGE", 3)
+    with web.app.db.read() as conn:
+        want = [str(r["user_id"]) for r in sql.run(conn, "16b", as_of=NOW_ARG, chat=B, day="2026-11-07").dicts()]
+    assert len(want) == 7
+    page = ok(web.get("/reports/asof", chat=str(B), date="2026-11-07", mode="list"))  # as_of: now, then frozen
+    got, seen = [], 0
+    while True:
+        rows = page.table_with("user_id")
+        got += [r["user_id"] for r in rows]
+        seen += 1
+        nxt = [u for u in urls(page) if "offset=" in u and "Next page" in page.text]
+        nxt = [u for u in nxt if f"offset={len(got)}" in u]
+        if not nxt:
+            break
+        query = dict(parse_qsl(nxt[0].partition("?")[2]))
+        assert query["chat"] == str(B) and query["mode"] == "list" and query["date"] == "2026-11-07"
+        assert dt.datetime.fromisoformat(query["as_of"]) > NOW  # the first page's now, frozen for the next ones
+        page = ok(follow(web, nxt[0]))
+    assert seen == 3 and got == want
+    assert "rows 7–7" in page.text and "Previous page" in page.text
+    # a plain report the same way, with its scope
+    page = ok(web.get("/reports/sources", chat=str(A), since="2026-08-01", as_of=NOW_ARG))
+    nxt = [u for u in urls(page) if "offset=3" in u]
+    assert nxt and f"chat={A}" in nxt[0].replace("%2D", "-") and "since=2026-08-01" in nxt[0]
+    assert len(ok(follow(web, nxt[0])).table_with("join_route")) == 3
+    assert web.get("/reports/sources", offset="-1").status == 400
+
+
+def test_the_past_date_matrix_is_an_asof_mode(web):
+    page = ok(web.get("/reports/asof", mode="matrix", date="2026-11-07", among=[str(c) for c in AD], as_of=NOW_ARG))
+    rows = page.table_with("shared")
+    cell = {frozenset((r["chat_a"].split()[-1], r["chat_b"].split()[-1])): r["shared"] for r in rows}  # one row per pair
+    assert len(rows) == 10
+    a, b, c, d = (str(x) for x in AD)
+
+    def at(x, y):
+        return cell[frozenset((x, y))]
+
+    assert [at(a, a), at(b, b), at(c, c), at(d, d)] == ["11", "6", "5", "4"]
+    assert [at(a, b), at(a, c), at(b, c), at(a, d), at(b, d), at(c, d)] == ["4", "2", "3", "1", "1", "1"]
+    assert "Chats in scope" in page.text and "2026-11-07 00:00:00 UTC" in page.text
+
+
+def test_a_link_form_for_an_untracked_chat_answers_without_waiting(fresh_web):
+    web = fresh_web
+    web.db._lock_wait = 2.0  # a second lock on the same thread would wait this long, then 503
+    with psycopg.connect(web.dsn) as c:
+        c.execute("UPDATE tg.chat SET tracked = false WHERE chat_id = %s", (C,))
+        c.commit()
+    import time
+
+    started = time.monotonic()
+    page = web.post("/campaigns/1/link", {"chat": str(C), "name": "late"})
+    assert page.status == 400 and "pick a tracked chat" in page.text, page.text
+    assert time.monotonic() - started < 1.5
+    assert not web.fake.calls_of("createChatInviteLink")
+
+
+def made_link(web, link: str) -> None:
+    web.fake.ok("createChatInviteLink", {"invite_link": link, "name": "web-x",
+                                         "creator": {"id": 5000, "is_bot": True, "first_name": "bot"},
+                                         "creates_join_request": False, "is_primary": False, "is_revoked": False})
+
+
+def test_the_made_link_is_shown_whatever_fails_after_telegram_made_it(fresh_web, monkeypatch):
+    web = fresh_web
+
+    def broken(*args, **kwargs):
+        raise psycopg.errors.QueryCanceled("canceling statement due to statement timeout")
+
+    # a report after the link is not needed: the page is built from the POST
+    monkeypatch.setattr(pages.campaigns_cmd, "campaign_report", broken)
+    made_link(web, SECRET_LINK + "1")
+    page = web.post("/campaigns/1/link", {"chat": str(A), "name": "web-x"})
+    assert page.status == 200 and page.text.count(SECRET_LINK + "1") == 1 and "only time it is shown" in page.text
+    monkeypatch.undo()
+    # storing fails: the link is still shown, with the failure
+    monkeypatch.setattr(pages.campaigns_cmd, "insert_link", broken)
+    made_link(web, SECRET_LINK + "2")
+    page = web.post("/campaigns/1/link", {"chat": str(A), "name": "web-x"})
+    assert page.status == 500 and page.text.count(SECRET_LINK + "2") == 1 and "could not be stored" in page.text
+    # the connection is busy: the same
+    monkeypatch.undo()
+    made_link(web, SECRET_LINK + "3")
+    real_write = web.db.write
+
+    def busy():
+        raise pages.HttpError(503, "the database connection is busy with another request; try again")
+
+    monkeypatch.setattr(web.db, "write", busy)
+    page = web.post("/campaigns/1/link", {"chat": str(A), "name": "web-x"})
+    assert page.status == 500 and page.text.count(SECRET_LINK + "3") == 1 and "busy" in page.text
+    monkeypatch.setattr(web.db, "write", real_write)
+    assert q(web.dsn, "SELECT count(*) FROM tg.invite_link WHERE name = 'web-x'") == [(1,)]
+
+
+# ------------------------------------------------------------------------------------------------------
+# The listener
+# ------------------------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def listener(pg, report_db):
+    import dataclasses
+
+    from tgaud import web as web_pkg
+
+    cfg = make_config(pg, report_db)
+    cfg = dataclasses.replace(cfg, web_listen=config.Listen("127.0.0.1", 0))
+
+    def start(patch=None):
+        for (obj, name), value in (patch or {}).items():
+            setattr(obj, name, value)
+        server = web_pkg.WebServer(cfg, cfg.web_proxy_token, lambda: psycopg.connect(cfg.dsn("web"), autocommit=False))
+        servers.append(server.start())
+        return server
+
+    servers: list = []
+    yield start
+    for s in servers:
+        s.close()
+
+
+def raw(port: int, method: str, path: str, body: bytes = b"", headers: dict[str, str] | None = None) -> tuple[int, bytes]:
+    import http.client
+
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    hdrs = {"X-Tgaud-Proxy-Token": PROXY_TOKEN, "Host": f"127.0.0.1:{port}", **(headers or {})}
+    if body:
+        hdrs["Content-Type"] = "application/x-www-form-urlencoded"
+    conn.request(method, path, body=body, headers=hdrs)
+    r = conn.getresponse()
+    out = (r.status, r.read())
+    conn.close()
+    return out
+
+
+def test_access_logs_carry_no_query_and_no_user_value(listener, caplog):
+    server = listener()
+    port = server.port
+    with caplog.at_level(logging.DEBUG, logger="tgaud.web"):
+        status, body = raw(port, "POST", "/user", b"q=1001", {"Origin": f"http://127.0.0.1:{port}"})
+        assert status == 200 and b"In now: 4 chats" in body
+        assert raw(port, "GET", "/user?q=1001")[0] == 400
+        assert raw(port, "GET", "/reports/asof?chat=-1001000000002&date=2026-11-07&mode=list&as_of=x1001")[0] == 400
+        import socket
+
+        with socket.create_connection(("127.0.0.1", port)) as s:  # a malformed request line with a user value
+            s.sendall(b"GET /user?q=1001 BOGUS/9\r\n\r\n")
+            s.recv(1000)
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "web http: POST /user 200" in text and "web http: GET /user 400" in text
+    assert "1001" not in text and "q=" not in text, text
+
+
+def test_connections_are_bounded_and_an_idle_one_is_dropped_at_the_deadline(listener):
+    import socket
+    import time
+
+    from tgaud import web as web_pkg
+
+    server = listener({(web_pkg._Server, "max_handlers"): 2, (web_pkg._Handler, "read_deadline"): 1.0})
+    port = server.port
+    try:
+        idle = [socket.create_connection(("127.0.0.1", port)) for _ in range(2)]  # hold both handler slots
+        time.sleep(0.2)
+        started = time.monotonic()
+        status, body = raw(port, "GET", "/healthz")
+        assert (status, body) == (503, b"busy\n") and time.monotonic() - started < 1.0
+        for s in idle:  # nothing sent: the handler gives up at the deadline and closes the connection
+            s.settimeout(5)
+            assert s.recv(100) == b""
+        time.sleep(0.2)
+        assert raw(port, "GET", "/healthz")[0] == 200
+        slow = socket.create_connection(("127.0.0.1", port))  # a request trickled slower than the deadline
+        slow.settimeout(5)
+        slow.sendall(b"GET /healthz HTTP/1.0\r\n")
+        time.sleep(0.6)
+        slow.sendall(b"X-A: 1\r\n")
+        time.sleep(0.6)
+        try:
+            slow.sendall(b"\r\n")
+            assert slow.recv(100) == b""
+        except OSError:
+            pass  # reset by the server: also a refusal
+        for s in (*idle, slow):
+            s.close()
+    finally:
+        web_pkg._Server.max_handlers = web_pkg.MAX_HANDLERS
+        web_pkg._Handler.read_deadline = web_pkg.READ_DEADLINE

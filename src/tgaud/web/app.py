@@ -115,29 +115,48 @@ def token_ok(request_environ: dict[str, Any], token: bytes) -> bool:
     return hmac.compare_digest(sent.encode("latin-1", "replace"), token)
 
 
-def _netloc(value: str) -> str:
-    host = value.strip().lower()
-    for port in (":80", ":443"):
-        if host.endswith(port):
-            host = host[: -len(port)]
-    return host
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin(scheme: str, netloc: str) -> tuple[str, str, int] | None:
+    """(scheme, host, effective port) of an origin, or None when it is not a plain http(s) origin."""
+    scheme = scheme.strip().lower()
+    if scheme not in _DEFAULT_PORTS or not netloc or "@" in netloc:
+        return None
+    parts = urlsplit(f"{scheme}://{netloc.strip()}")
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if not parts.hostname:
+        return None
+    return scheme, parts.hostname.lower(), port if port is not None else _DEFAULT_PORTS[scheme]
+
+
+def public_origin(req: Request) -> tuple[str, str, int] | None:
+    """The origin the browser used: the scheme the proxy forwarded (X-Forwarded-Proto; the request passed the proxy
+    token, so the header is the proxy's) or the listener's own, and the Host header with its effective port."""
+    host = req.header("Host")
+    if not host:
+        return None
+    forwarded = (req.header("X-Forwarded-Proto") or "").split(",")[0].strip().lower()
+    scheme = forwarded if forwarded in _DEFAULT_PORTS else str(req.environ.get("wsgi.url_scheme", "http"))
+    return _origin(scheme, host)
 
 
 def same_origin(req: Request) -> bool:
-    """A POST must come from a page of this host: its Origin (or, without one, its Referer) names the Host the
-    request was sent to. Neither header, or `Origin: null`, is refused (basic auth alone does not stop a
-    cross-site form)."""
-    host = req.header("Host")
-    if not host:
+    """A POST must come from a page of this site: its Origin (or, without one, its Referer) has the scheme, host and
+    effective port of public_origin. Neither header, `Origin: null` or anything else is refused (basic auth alone
+    does not stop a cross-site form)."""
+    own = public_origin(req)
+    if own is None:
         return False
     origin = req.header("Origin")
     source = origin if origin is not None else req.header("Referer")
     if not source or source.strip() == "null":
         return False
     parts = urlsplit(source.strip())
-    if parts.scheme not in ("http", "https") or not parts.netloc:
-        return False
-    return _netloc(parts.netloc) == _netloc(host)
+    return _origin(parts.scheme, parts.netloc) == own
 
 
 class WebDb:

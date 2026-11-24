@@ -2,7 +2,7 @@
 {% from "_macros.html" import data_table %}
 {% block main %}
 <h1>User lookup</h1>
-<form method="get" action="/user" class="controls inline">
+<form method="post" action="/user" class="controls inline">
   <label>User id or @username <input type="search" name="q" value="{{ q }}" required autocomplete="off"></label>
   <button type="submit">Look up</button>
 </form>

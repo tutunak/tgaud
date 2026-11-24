@@ -1,3 +1,5 @@
+{% macro user_button(user_id, label=none) %}<form method="post" action="/user" class="inline-form"><input type="hidden" name="q" value="{{ user_id }}"><button type="submit" class="linkish">{{ label if label is not none else user_id }}</button></form>{% endmacro %}
+
 {% macro data_table(t, empty="No rows.", cards=true, count=true) %}
 {% if not t.rows %}
 <p class="empty">{{ empty }}</p>
@@ -7,13 +9,14 @@
   <thead><tr>{% for c in t.columns %}<th data-col="{{ c }}"{% if t.numeric[loop.index0] %} class="num"{% endif %}>{{ c|replace("_", " ") }}</th>{% endfor %}</tr></thead>
   <tbody>
   {% for row in t.rows %}
-    <tr>{% for cell in row %}<td{% if t.numeric[loop.index0] %} class="num"{% endif %} data-label="{{ t.columns[loop.index0]|replace('_', ' ') }}">{% if cell.href %}<a href="{{ cell.href }}">{{ cell.text }}</a>{% elif cell.time %}{% for part in cell.text.split(" ") %}<span class="nw">{{ part }}</span>{{ " " if not loop.last }}{% endfor %}{% elif cell.sub %}<span>{{ cell.text }} <span class="id">{{ cell.sub }}</span></span>{% else %}{{ cell.text }}{% endif %}</td>{% endfor %}</tr>
+    <tr>{% for cell in row %}<td{% if t.numeric[loop.index0] %} class="num"{% endif %} data-label="{{ t.columns[loop.index0]|replace('_', ' ') }}">{% if cell.user %}{{ user_button(cell.text) }}{% elif cell.href %}<a href="{{ cell.href }}">{{ cell.text }}</a>{% elif cell.time %}<span>{% for part in cell.text.split(" ") %}<span class="nw">{{ part }}</span>{{ " " if not loop.last }}{% endfor %}</span>{% elif cell.sub %}<span>{{ cell.text }} <span class="id">{{ cell.sub }}</span></span>{% else %}{{ cell.text }}{% endif %}</td>{% endfor %}</tr>
   {% endfor %}
   </tbody>
 </table>
 </div>
-{% if count %}<p class="count">{{ t.total }} row{{ "" if t.total == 1 else "s" }}{% if t.cut %}; the first {{ t.rows|length }} are shown (the CLI's <code>--csv</code> has them all){% endif %}</p>{% endif %}
+{% if count %}<p class="count">{% if t.paged %}rows {{ t.start + 1 }}–{{ t.start + t.rows|length }}{% else %}{{ t.rows|length }} row{{ "" if t.rows|length == 1 else "s" }}{% endif %}</p>{% endif %}
 {% endif %}
+{% if t.paged %}<p class="pager">{% if t.prev %}<a href="{{ t.prev }}">‹ Previous page</a>{% endif %}{% if t.next %}<a href="{{ t.next }}">Next page ›</a>{% endif %}</p>{% endif %}
 {% endmacro %}
 
 {% macro window_text(w) %}{% if w %}{% if w.point %}{{ w.start|when }}{% else %}{{ w.start|when }} .. {{ w.end|when }}{% endif %}{% else %}none (current state){% endif %}{% endmacro %}

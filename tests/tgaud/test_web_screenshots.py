@@ -65,6 +65,8 @@ def test_screenshots_of_every_page(pg, fresh_db):
         ("report-sources", "/reports/sources?" + urlencode([("chat", A), ("since", "2026-08-01"), ("as_of", NOW_ARG)])),
         ("report-coverage", "/reports/coverage?" + urlencode({"as_of": NOW_ARG, "since": "2026-08-01", "gaps": "1"})),
         ("asof", "/reports/asof?" + urlencode({"chat": B, "date": "2026-11-07", "mode": "list", "as_of": NOW_ARG})),
+        ("asof-matrix", "/reports/asof?" + urlencode([("mode", "matrix"), ("date", "2026-11-07"), ("as_of", NOW_ARG),
+                                                       *(("among", c) for c in AD)])),
         ("stale", None),  # a pair after a newer R2 publish
     ]
     with psycopg.connect(fresh_db) as c:
@@ -85,8 +87,10 @@ def test_screenshots_of_every_page(pg, fresh_db):
                         page.goto(base + "/overlap?" + urlencode(ad))
                         page.locator("table.matrix tbody tr").nth(0).locator("td a").nth(1).click()
                         pair_url = page.url
-                    elif name == "user":
-                        page.goto(base + "/user?" + urlencode({"q": entrant, "as_of": NOW_ARG}))
+                    elif name == "user":  # a lookup is a POST form: no user id in any URL
+                        page.goto(base + "/user")
+                        page.fill("input[name=q]", str(entrant))
+                        page.click("form[action='/user'] button")
                     elif name == "link-made":
                         page.goto(base + "/campaigns/1")
                         page.fill("input[name=name]", "dec-promo")

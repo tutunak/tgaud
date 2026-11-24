@@ -1,0 +1,13 @@
+{% extends "base.html" %}
+{% block main %}
+<p class="crumbs"><a href="/campaigns">Campaigns</a> › <a href="/campaigns/{{ made.campaign_id }}">{{ made.campaign }}</a> › invite link</p>
+<h1>Invite link "{{ made.name }}"</h1>
+{% if made.problem %}<p class="problem">{{ made.problem }}</p>{% endif %}
+<section class="once">
+  <p>For {{ made.chat.title }} <span class="id">{{ made.chat.id }}</span>, campaign {{ made.campaign_id }}.</p>
+  <p><code class="link">{{ made.link }}</code></p>
+  <p><strong>Copy it now: this is the only time it is shown.</strong>
+  {% if made.id is not none %}Only its HMAC digest and name are stored (invite link {{ made.id }}).{% endif %}</p>
+</section>
+<p><a href="/campaigns/{{ made.campaign_id }}">Back to the campaign</a></p>
+{% endblock %}
