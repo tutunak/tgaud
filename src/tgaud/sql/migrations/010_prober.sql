@@ -5,7 +5,8 @@
 -- the queue order of design.md 6: manual, conflict, outage by the pair's open spell (newest first; a pair without
 -- an open spell after those with one), snapshot_absent, sample; ties by queued_at, probe_id. Only probes whose
 -- retry deadline has passed are taken. The two columns below make that order and that deadline part of the row, so
--- one index range per chat returns its heads in order.
+-- one index range per chat returns its heads in order: a probe in backoff is outside that index until the prober
+-- clears its deadline once it has passed.
 
 ------------------------------------------------------------------------------------------------------------
 -- Retry deadline
@@ -13,9 +14,11 @@
 
 ALTER TABLE tg.probe ADD COLUMN next_attempt_at timestamptz;
 COMMENT ON COLUMN tg.probe.next_attempt_at IS
-  'A pending probe is not asked before this time; NULL = now. The prober sets it with every failure (1 min, 10 min '
-  'and 1 h after the 1st, 2nd and 3rd: tgaud.jobs.prober.BACKOFF) and to the next second after an answer that '
-  'straddled an event of the pair (not an attempt). A probe queued again or raised in place keeps it.';
+  'A pending probe is not asked before this time; NULL = now (the probes the prober reads, index probe_ready). The '
+  'prober sets it with every failure (1 min, 10 min and 1 h after the 1st, 2nd and 3rd: tgaud.jobs.prober.BACKOFF; '
+  'a write of attempts or last_attempt_at that leaves it as it was, such as an older image''s, gets it from the '
+  'trigger probe_next_attempt) and to the next second after an answer that straddled an event of the pair (not an '
+  'attempt); it clears it once passed, before its read. A probe queued again or raised in place keeps it.';
 
 -- the deadlines of probes that failed before this migration (the backoff of their attempts, as the prober had it)
 UPDATE tg.probe
@@ -24,7 +27,25 @@ WHERE outcome = 'pending' AND attempts > 0 AND last_attempt_at IS NOT NULL;
 
 CREATE INDEX probe_retry_due ON tg.probe (next_attempt_at) WHERE outcome = 'pending' AND next_attempt_at IS NOT NULL;
 COMMENT ON INDEX tg.probe_retry_due IS
-  'the earliest retry deadline: when the prober has nothing ready, it reads the queue again then';
+  'the deadlines that have passed (the prober clears them before each read) and the earliest one ahead (when it has '
+  'nothing ready, it reads the queue again then)';
+
+CREATE FUNCTION tg.probe_next_attempt() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF NEW.outcome = 'pending' AND NEW.attempts > 0 AND NEW.last_attempt_at IS NOT NULL
+     AND NEW.next_attempt_at IS NOT DISTINCT FROM OLD.next_attempt_at
+     AND (NEW.attempts, NEW.last_attempt_at) IS DISTINCT FROM (OLD.attempts, OLD.last_attempt_at) THEN
+    NEW.next_attempt_at := NEW.last_attempt_at
+                           + make_interval(secs => (ARRAY[60, 600, 3600])[least(NEW.attempts, 3)]);
+  END IF;
+  RETURN NEW;
+END $$;
+COMMENT ON FUNCTION tg.probe_next_attempt() IS
+  'BEFORE UPDATE of attempts or last_attempt_at on tg.probe: a failure recorded without its deadline (the previous '
+  'image''s UPDATE, before a restart or after a rollback) gets the backoff of its attempts (1 min, 10 min, 1 h: '
+  'tgaud.jobs.prober.BACKOFF). A deadline the writer sets in the same UPDATE is kept.';
+CREATE TRIGGER probe_next_attempt BEFORE UPDATE OF attempts, last_attempt_at ON tg.probe
+  FOR EACH ROW EXECUTE FUNCTION tg.probe_next_attempt();
 
 ------------------------------------------------------------------------------------------------------------
 -- An outage probe's place: its pair's open spell
@@ -86,7 +107,7 @@ CREATE TRIGGER membership_probe_spell_from_del AFTER DELETE ON tg.membership
 ------------------------------------------------------------------------------------------------------------
 
 CREATE INDEX probe_ready ON tg.probe (chat_id, tg.probe_rank(reason), spell_from DESC NULLS LAST, queued_at, probe_id)
-  INCLUDE (user_id, reason, next_attempt_at) WHERE outcome = 'pending';
+  INCLUDE (user_id, reason) WHERE outcome = 'pending' AND next_attempt_at IS NULL;
 COMMENT ON INDEX tg.probe_ready IS
-  'each chat''s pending probes in the prober''s queue order: its read takes the first ready ones of every chat from '
-  'one range each (tgaud.jobs.prober._HEADS)';
+  'each chat''s ready probes (no deadline ahead) in the prober''s queue order: its read takes the first ones of every '
+  'chat from one range each (tgaud.jobs.prober._HEADS), however many of the chat''s probes wait in backoff';

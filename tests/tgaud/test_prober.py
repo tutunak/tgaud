@@ -1051,6 +1051,125 @@ def test_a_retry_deadline_is_kept_while_nothing_else_is_ready(env):
     assert asked(e)[1] == (CHAT, 77) and e.clock() - t <= prober.IDLE_REFRESH + 0.2
 
 
+# --- prober-simplify review 1 -----------------------------------------------------------------------------------------
+
+def test_a_status_that_is_not_a_string_is_a_failure_and_the_queue_moves_on(env):
+    """review 1, finding 3: the chat's first probe gets a list as its status on every call. Each answer is a failure
+    with its backoff (not an exception that rolls the step back), so the next probe is asked."""
+    e = env
+    first, second = queue(e, 1, queued=START - timedelta(hours=2)), queue(e, 2)
+    e.w.c.commit()
+    e.fake.respond("getChatMember", lambda params: {"status": ["member"]} if params["user_id"] == 1
+                   else {"status": "member"})
+    e.run(prober.make(e.ctx), 2.0)
+    assert asked(e) == [(CHAT, 1), (CHAT, 2)]
+    row = probe_row(e, first)
+    assert (row["outcome"], row["attempts"]) == ("pending", 1)
+    assert row["next_attempt_at"] == row["last_attempt_at"] + timedelta(seconds=prober.BACKOFF[0])
+    assert probe_row(e, second)["outcome"] == "in"
+
+
+def test_a_failure_written_without_its_deadline_gets_the_backoff_of_its_attempts(env):
+    """review 1, finding 2: the previous image records a second failure with its own UPDATE (attempts and
+    last_attempt_at, no next_attempt_at): the trigger gives it the ten-minute deadline, and the prober waits for it. A
+    deadline set in the same UPDATE (this prober's) is kept, and one set alone (the straddle delay) is not touched."""
+    e = env
+    pid = queue(e, 1)
+    e.w.c.commit()
+    with psycopg.connect(e.dsn) as c:  # the previous image's failure write
+        c.execute("UPDATE tg.probe SET attempts = %s, last_attempt_at = %s WHERE probe_id = %s", (2, START, pid))
+    assert probe_row(e, pid)["next_attempt_at"] == START + timedelta(seconds=prober.BACKOFF[1])
+    with psycopg.connect(e.dsn) as c:  # the SQL schedule is the job's, for every attempt count
+        for n, backoff in enumerate(prober.BACKOFF + (prober.BACKOFF[-1],), 1):
+            c.execute("UPDATE tg.probe SET attempts = %s, next_attempt_at = NULL WHERE probe_id = %s", (n, pid))
+            c.execute("UPDATE tg.probe SET last_attempt_at = %s WHERE probe_id = %s", (START + timedelta(n), pid))
+            assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == \
+                START + timedelta(n) + timedelta(seconds=backoff)
+        explicit = START + timedelta(seconds=7)
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), explicit, pid))
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == explicit
+        c.execute("UPDATE tg.probe SET next_attempt_at = %s WHERE probe_id = %s", (START, pid))  # the straddle delay
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == START
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), pid))  # the same values again: nothing to derive
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == START
+        c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = NULL, next_attempt_at = NULL "
+                  "WHERE probe_id = %s", (pid,))
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), pid))  # the old image's second failure, a second before the job
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 598.0, dt=1.0)
+    assert asked(e) == []
+    e.run(p, 3.0, dt=0.1)
+    assert asked(e) == [(CHAT, 1)] and probe_row(e, pid)["outcome"] == "in"
+
+
+def test_a_locked_probe_past_its_deadline_does_not_hold_up_the_step(env):
+    """Clearing passed deadlines skips rows another transaction holds (the reconciler raising one in place, the CLI
+    cancelling it): the step neither waits nor fails, the other probes are asked, and the held one becomes ready by a
+    later step once the lock is gone, at its place."""
+    e = env
+    held = queue(e, 1, queued=START - timedelta(hours=3))
+    for u in (2, 3):
+        queue(e, u)
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(minutes=1), START, held))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    other = psycopg.connect(e.dsn)
+    try:
+        other.execute("SELECT 1 FROM tg.probe WHERE probe_id = %s FOR UPDATE", (held,))
+        t = _step_in_thread(e, p)
+        t.join(10)
+        assert not t.is_alive() and not t.errors
+        assert asked(e) == [(CHAT, 2), (CHAT, 3)]
+        assert probe_row(e, held)["next_attempt_at"] == START  # not cleared: someone else holds it
+    finally:
+        other.close()  # its transaction ends without a change
+    e.clock.advance(1.0)
+    e.run(p, 1.0)
+    assert asked(e)[2:] == [(CHAT, 1)] and probe_row(e, held)["outcome"] == "in"
+
+
+def test_a_step_interrupted_after_clearing_deadlines_leaves_them_for_the_next(env):
+    """The clearing commits with the read: a step that fails before it commits (a lost connection, a stale
+    generation) leaves the deadlines as they were, and the next step clears them again and asks the probe."""
+    e = env
+    pid = queue(e, 1)
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(minutes=1), START, pid))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.ctx.fence(e.conn)
+    assert [c.probe_id for c in p.heads(e.conn, e.clock())] == [pid]
+    e.conn.rollback()  # the step failed before its commit
+    assert probe_row(e, pid)["next_attempt_at"] == START
+    e.run(p, 1.0)
+    assert asked(e) == [(CHAT, 1)] and probe_row(e, pid)["outcome"] == "in"
+
+
+def test_passed_deadlines_beyond_one_steps_share_are_cleared_by_the_next_steps(env, monkeypatch):
+    """After a long stop every deadline has passed: a step clears RELEASE_PER_STEP of them (the earliest first) and
+    the job reads again at once, without the idle wait, until all are cleared; every probe is asked once."""
+    e = env
+    monkeypatch.setattr(prober, "RELEASE_PER_STEP", 3)
+    ids = [queue(e, u) for u in range(1, 11)]
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s - (probe_id * "
+                  "interval '1 second') WHERE probe_id = ANY(%s)", (START - timedelta(hours=1), START, ids))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.tick(p)
+    assert p.backlog and p.next_read <= e.clock() and len(asked(e)) == 3
+    assert sorted(u for _, u in asked(e)) == [8, 9, 10]  # the earliest deadlines (the highest ids)
+    e.run(p, 3.0)
+    assert sorted(u for _, u in asked(e)) == list(range(1, 11)) and not p.backlog
+
+
 def test_no_transaction_is_open_during_the_call(env):
     e = env
     queue(e, 1)

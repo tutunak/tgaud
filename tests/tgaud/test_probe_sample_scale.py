@@ -187,3 +187,44 @@ def test_prober_sees_raised_probes_and_a_rebuilt_spell_with_100k_pending(scale_d
     record_property("prober_read_respelled_seconds", respelled)
     assert first == [(2, "manual"), (3, "manual"), (86399, "outage"), (172799, "outage")]
     assert outage[0] == 1 and raised < 0.05 and respelled < 0.05
+
+
+def test_prober_read_with_the_big_chat_in_backoff(scale_dsn, record_property):
+    """prober-simplify review 1: every pending probe of the big chat but one (99 999) waits in backoff, as does every
+    probe of the other chats, and one new manual probe is ready. The read skips the waiting ones by index (they hold no
+    place in probe_ready) and stays under 50 ms. When all their deadlines have passed at once (after a long stop), each
+    step clears RELEASE_PER_STEP of them, the earliest first, well inside a step."""
+    p = prober.Prober(_ctx(), rate=5)
+    later = datetime.fromtimestamp(NOW.timestamp() + 600, timezone.utc)
+    with psycopg.connect(scale_dsn) as c:
+        c.execute("""UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s
+                     WHERE outcome = 'pending' AND NOT (chat_id = %s AND user_id = 1)""", (NOW, later, BIG))
+        c.execute("UPDATE tg.probe SET next_attempt_at = %s WHERE chat_id = %s AND user_id = 1", (NOW, BIG))
+        manual = c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, 999, 'manual') "
+                           "RETURNING probe_id", (BIG - 1,)).fetchone()[0]
+        c.commit()
+    try:
+        with psycopg.connect(scale_dsn, autocommit=True) as c:
+            c.execute("VACUUM ANALYZE tg.probe")  # what autovacuum does after the failures came in, one by one
+        with psycopg.connect(scale_dsn) as c:
+            heads, took = _timed_heads(p, c, NOW.timestamp())
+            plan = "\n".join(r[0] for r in c.execute("EXPLAIN (ANALYZE, BUFFERS) " + prober._HEADS,  # noqa: SLF001
+                                                       {"per_chat": prober.PER_CHAT}))
+            t = time.perf_counter()
+            p.heads(c, later.timestamp())  # every deadline has passed: the first RELEASE_PER_STEP are cleared
+            cleared = time.perf_counter() - t
+            backlog = p.backlog
+            c.rollback()
+    finally:
+        with psycopg.connect(scale_dsn) as c:  # the fixture as it was, for the tests after this one
+            c.execute("DELETE FROM tg.probe WHERE probe_id = %s", (manual,))
+            c.execute("UPDATE tg.probe SET attempts = 0, last_attempt_at = NULL, next_attempt_at = NULL "
+                      "WHERE outcome = 'pending'")
+        with psycopg.connect(scale_dsn, autocommit=True) as c:
+            c.execute("VACUUM ANALYZE tg.probe")
+    print(f"prober read, 100 994 probes in backoff and 2 ready: {took * 1000:.1f} ms\n{plan}\nall deadlines passed: "
+          f"{prober.RELEASE_PER_STEP} cleared in {cleared:.2f} s (one step)")
+    record_property("prober_read_backoff_seconds", took)
+    record_property("prober_release_step_seconds", cleared)
+    assert [(h.chat_id, h.reason) for h in heads] == [(BIG - 1, "manual"), (BIG, "outage")]
+    assert took < 0.05 and backlog and cleared < 1.0

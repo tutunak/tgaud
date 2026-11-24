@@ -3,10 +3,14 @@
 Queue order: `manual` (the CLI) first, then `conflict`, `outage` (by the pair's open spell, the newest first; a pair
 without an open spell after those with one), `snapshot_absent`, `sample`; ties by queued_at, probe_id. Only probes
 that are ready are taken: never tried, or past their `next_attempt_at` (the end of the backoff of their last failure).
-Nothing is cached: every step that may make a call first reads the heads of the queue from the database (_HEADS:
-per chat its first PER_CHAT ready probes, from one range of the index probe_ready, migration 010) and commits. The
-order key of an outage probe (tg.probe.spell_from) is kept by triggers in the transactions that queue the probe or
-rebuild the pair's spells, so the read sees every committed change, and what it misses is at most one step old.
+Nothing is cached: every step that may make a call first clears the deadlines that have passed (_RELEASE, at most
+RELEASE_PER_STEP, the earliest first, so a backlog after a long stop is cleared over several steps; rows another
+transaction has locked are skipped and cleared by a later step, so the step never waits), then reads the heads of the
+queue from the database (_HEADS: per chat its first PER_CHAT probes without a deadline, from one range of the index
+probe_ready, migration 010, which holds no probe in backoff) and commits. The order key of an outage probe
+(tg.probe.spell_from) is kept by triggers in the transactions that queue the probe or rebuild the pair's spells, so
+the read sees every committed change, and what it misses is at most one step old. A backlog of passed deadlines may
+let a lower-ranked retry go before a higher-ranked one still waiting to be cleared, for those few steps.
 
 Budget: one global token bucket at `config.probe_rate` calls/s (TGAUD_PROBE_RATE, default 5; burst one second's
 worth). While other chats have ready probes, one chat gets at most half of the rate (its own bucket at rate/2);
@@ -58,7 +62,17 @@ IDLE_REFRESH = 5.0  # seconds between reads while nothing is ready (sooner when 
 PER_STEP = 20  # probes per step
 PER_CHAT = PER_STEP  # heads read per chat: one chat may fill a whole step
 STEP_SECONDS = 3.0  # and at most this long (wall time) per step
+RELEASE_PER_STEP = 5000  # passed deadlines cleared per step (0.1 s at scale); more by the next steps
 STATUSES = frozenset({"creator", "administrator", "member", "restricted", "left", "kicked"})
+
+# The deadlines that have passed, cleared: those probes are ready again (probe_retry_due; never waits for a row lock)
+_RELEASE = """
+WITH due AS MATERIALIZED (
+  SELECT q.probe_id FROM tg.probe q
+  WHERE q.outcome = 'pending' AND q.next_attempt_at <= %(now)s
+  ORDER BY q.next_attempt_at LIMIT %(limit)s FOR UPDATE SKIP LOCKED)
+UPDATE tg.probe p SET next_attempt_at = NULL FROM due
+WHERE p.probe_id = due.probe_id AND p.outcome = 'pending' AND p.next_attempt_at <= %(now)s"""
 
 # The first ready probes of every chat in queue order (one range of probe_ready each), then all of them in that order
 _HEADS = """
@@ -67,7 +81,7 @@ FROM tg.chat c
 CROSS JOIN LATERAL (
   SELECT p.probe_id, p.chat_id, p.user_id, p.reason, tg.probe_rank(p.reason) AS rank, p.spell_from, p.queued_at
   FROM tg.probe p
-  WHERE p.chat_id = c.chat_id AND p.outcome = 'pending' AND (p.next_attempt_at IS NULL OR p.next_attempt_at <= %(now)s)
+  WHERE p.chat_id = c.chat_id AND p.outcome = 'pending' AND p.next_attempt_at IS NULL
   ORDER BY tg.probe_rank(p.reason), p.spell_from DESC NULLS LAST, p.queued_at, p.probe_id
   LIMIT %(per_chat)s) h
 ORDER BY h.rank, h.spell_from DESC NULLS LAST, h.queued_at, h.probe_id"""
@@ -141,6 +155,7 @@ class Prober:
         self.bucket = TokenBucket(self.rate, now)
         self.chat_buckets: dict[int, TokenBucket] = {}
         self.next_read = now  # the next read of the queue (sooner never makes a call)
+        self.backlog = False  # the last read left passed deadlines to clear
 
     # --- scheduling --------------------------------------------------------------------------------------------
 
@@ -175,8 +190,11 @@ class Prober:
     # --- the step -----------------------------------------------------------------------------------------------
 
     def heads(self, conn: psycopg.Connection, now: float) -> list[Candidate]:
-        """The first ready probes of every chat (PER_CHAT each), in queue order."""
-        return [Candidate(*r) for r in conn.execute(_HEADS, {"now": _utc(now), "per_chat": PER_CHAT})]
+        """The first ready probes of every chat (PER_CHAT each), in queue order, once the deadlines up to `now` are
+        cleared (the caller commits)."""
+        released = conn.execute(_RELEASE, {"now": _utc(now), "limit": RELEASE_PER_STEP}).rowcount
+        self.backlog = released >= RELEASE_PER_STEP
+        return [Candidate(*r) for r in conn.execute(_HEADS, {"per_chat": PER_CHAT})]
 
     def step(self, conn: psycopg.Connection) -> None:
         read_at = self.ctx.clock()
@@ -196,12 +214,12 @@ class Prober:
             self.probe(conn, cand)
             done += 1
         now = self.ctx.clock()
-        if done == 0 and not heads:  # nothing ready: read again after a while, or when a retry falls due
-            self.next_read = min(read_at + IDLE_REFRESH, retry if retry is not None else math.inf)
-        elif heads:  # what is left waits for the global bucket (due() checks it) or its chat's share
+        if heads:  # what is left waits for the global bucket (due() checks it) or its chat's share
             alone = len({c.chat_id for c in heads}) == 1
             self.next_read = now + min(self._share_wait(c, alone, now) for c in heads)
-        else:  # every head read was asked: there may be more
+        elif done == 0 and not self.backlog:  # nothing ready: read again after a while, or when a retry falls due
+            self.next_read = min(read_at + IDLE_REFRESH, retry if retry is not None else math.inf)
+        else:  # every head read was asked, or deadlines are left to clear: there may be more
             self.next_read = now
 
     def _forget_idle(self, chats: set[int], now: float) -> None:
@@ -227,6 +245,7 @@ class Prober:
             return "429"  # still pending and ready: the first read after the pause takes it again
 
         status = member.get("status") if isinstance(member, dict) else None
+        status = status if isinstance(status, str) else None  # a list or an object is no status either
         if error is None and status not in STATUSES:
             error = ApiError("getChatMember", "other", "an answer without a known status")
 
