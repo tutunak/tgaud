@@ -168,7 +168,7 @@ def test_net_events_across_two_samples_and_a_late_join_gives_residual_zero(env):
     e.clock.advance(60)
     refresh(e, job)
     assert value("tgaud_chat_members_reported", CHAT) == 10  # the latest finalized sample
-    assert value("tgaud_chat_drift_residual_24h", CHAT) == 0
+    assert value("tgaud_chat_drift_residual_24h", CHAT) is None  # no comparison yet: no series, not a zero
 
     # ingest commits the updates, dated before the sample, then catches up past it
     w.join(4, t1 + timedelta(minutes=2))
@@ -466,7 +466,7 @@ def test_a_join_inside_the_count_call_withholds_the_residuals_on_both_sides(env,
         assert [r["residual"] for r in res] == [None, None, None]
     e.clock.set(t3 + timedelta(minutes=1))
     refresh(e, job)
-    assert value("tgaud_chat_drift_residual_24h", CHAT) == 0  # no false +1 (or -1): both residuals withheld
+    assert value("tgaud_chat_drift_residual_24h", CHAT) is None  # no false +1 (or -1), and no false zero
     assert value("tgaud_chat_members_reported", CHAT) == 11
 
 
@@ -540,3 +540,61 @@ def test_finalizing_a_sample_of_an_earlier_day_marks_the_chat_dirty_from_that_da
     e.conn.commit()
     with psycopg.connect(e.dsn) as c:
         assert c.execute("SELECT count(*) FROM tg.rollup_dirty").fetchone()[0] == 0
+
+
+def test_a_sample_waits_for_ingest_to_pass_the_end_of_its_call(env):
+    """The count included a join made 2 s after the send; ingest's watermark first passes only the send."""
+    e = env
+    w = e.w
+    job = sampler.make(e.ctx)
+    e.tick(job)
+    t1 = datetime.fromtimestamp(job.schedule[CHAT], timezone.utc)
+    counts(e, {CHAT: 10})
+    sample_at(e, job, t1)
+    t2 = t1 + timedelta(seconds=INTERVAL)
+    join_at = t2.replace(microsecond=0) + timedelta(seconds=2)
+
+    def compute(params):
+        e.clock.advance(2.5)  # the reply, which counts the join, comes 2.5 s after the send
+        return 11
+    e.fake.respond("getChatMemberCount", compute)
+    sample_at(e, job, t2)
+    caught_up(e, t2 + timedelta(milliseconds=100))  # past the send, not past the reply
+    sampler.finalize(e.conn)
+    e.conn.commit()
+    assert [r[4] for r in samples(e)] == [0, None]  # still pending
+    w.join(2, join_at)  # ingest commits the join, then catches up past the reply
+    w.rebuild()
+    w.c.commit()
+    caught_up(e, t2 + timedelta(seconds=3))
+    sampler.finalize(e.conn)
+    e.conn.commit()
+    with psycopg.connect(e.dsn) as c:
+        assert c.execute("SELECT residual, straddled FROM stats.v_drift WHERE chat_id = %s AND sampled_at = %s",
+                         (CHAT, t2)).fetchone() == (None, True)
+        res = sql.run(c, "9b", as_of=t2 + timedelta(minutes=1), scope=[CHAT]).dicts()
+        assert [r["residual"] for r in res] == [None, None]
+    e.clock.set(t2 + timedelta(minutes=1))
+    refresh(e, job)
+    assert value("tgaud_chat_drift_residual_24h", CHAT) is None
+
+
+def test_the_residual_gauge_is_zero_only_for_a_measured_zero(env):
+    e = env
+    w = e.w
+    w.add_chat(B)
+    rows = [(CHAT, 3, 10, False), (CHAT, 2, 11, True),   # CHAT: the only comparison is withheld
+            (B, 3, 20, False), (B, 2, 20, False)]        # B: one valid comparison, residual 0
+    for chat, h, rep, straddled in rows:
+        w.c.execute("""INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events, straddled)
+                       VALUES (%s, %s, %s, 0, 0, %s)""", (chat, START - timedelta(hours=h), rep, straddled))
+    w.c.commit()
+    job = sampler.make(e.ctx)
+    refresh(e, job)
+    assert value("tgaud_chat_drift_residual_24h", CHAT) is None
+    assert value("tgaud_chat_drift_residual_24h", B) == 0
+    assert value("tgaud_chat_members_reported", CHAT) == 11  # the count itself is still published
+    with psycopg.connect(e.dsn) as c:  # the series goes when a later refresh has no comparison any more
+        c.execute("UPDATE tg.count_sample SET straddled = true WHERE chat_id = %s", (B,))
+    refresh(e, job)
+    assert value("tgaud_chat_drift_residual_24h", B) is None

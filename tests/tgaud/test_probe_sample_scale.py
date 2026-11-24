@@ -111,18 +111,18 @@ def test_prober_queue_read_with_100k_pending(scale_dsn, record_property):
         t = time.perf_counter()
         p._read(c, NOW.timestamp())  # noqa: SLF001
         took = time.perf_counter() - t
+        full = len(p.queue)
         c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, 999, 'manual')", (BIG - 1,))
         t = time.perf_counter()
         p._read_heads(c, NOW.timestamp() + 1)  # noqa: SLF001
         heads = time.perf_counter() - t
         c.rollback()
-    print(f"prober full queue read, 100 995 pending: {took:.2f} s, {len(p.queue) - 1} candidates "
+    print(f"prober full queue read, 100 995 pending: {took:.2f} s, {full} candidates "
           f"(every {prober.FULL_REFRESH:.0f} s); head read: {heads * 1000:.0f} ms (every step)")
     record_property("prober_read_seconds", took)
     record_property("prober_head_read_seconds", heads)
     assert p.queue[0].reason == "manual" and heads < 0.2
     p.queue.pop(0)
     assert p.queue[0].reason == "conflict"
-    full = [c for c in p.queue if c.key[1] == 0]
-    assert len(full) == 199 * 5 + prober.PER_CHAT
+    assert full == 199 * 5 + prober.PER_CHAT
     assert took < 5.0

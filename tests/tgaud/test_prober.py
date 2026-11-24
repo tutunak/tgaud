@@ -479,33 +479,104 @@ def test_out_committed_before_a_join_inside_its_call_is_ignored_and_asked_again(
     assert s.end_source is None and s.last_confirmed_at == probe_row(e, again[0][0])["answered_at"]
 
 
-def test_the_requeue_trigger_keeps_one_pending_probe_and_rolls_back_with_the_event(env):
+def _pending(dsn: str) -> list[tuple]:
+    with psycopg.connect(dsn) as c:
+        return c.execute("SELECT user_id, reason, attempts FROM tg.probe WHERE outcome = 'pending' ORDER BY user_id"
+                         ).fetchall()
+
+
+def test_the_requeue_trigger_keeps_one_pending_probe_at_the_higher_priority_and_rolls_back(env):
     e = env
     w = e.w
-    w.user(1)
-    w.user(2)
+    for u in (1, 2, 3):
+        w.user(u)
     sent = START - timedelta(seconds=10)
     old1 = w.probe(1, sent + timedelta(seconds=2), "out", sent=sent, reason="outage")
     w.probe(2, sent + timedelta(seconds=2), "in", sent=sent, reason="manual")
-    pending2 = queue(e, 2, "sample")  # a probe of the pair is already pending: it asks the question
+    w.probe(3, sent + timedelta(seconds=2), "out", sent=sent, reason="outage")
+    low2 = queue(e, 2, "sample")  # pending below the manual answer, in backoff after a failure
+    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s", (START, low2))
+    high3 = queue(e, 3, "conflict")  # pending above the outage answer: it already asks the question
     w.c.commit()
-    with psycopg.connect(e.dsn) as c:  # an event inside both calls whose transaction rolls back: nothing queued
+    before = [(2, "sample", 1), (3, "conflict", 0)]
+    assert _pending(e.dsn) == before
+    with psycopg.connect(e.dsn) as c:  # events inside the calls whose transaction rolls back: nothing changes
         history.lock_chats(c, [CHAT])
-        for u, upd in ((1, 920001), (2, 920002)):
+        for u, upd in ((1, 920001), (2, 920002), (3, 920003)):
             c.execute("""INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status)
                          VALUES (%s, %s, %s, %s, 'left', 'member')""", (CHAT, u, sent + timedelta(seconds=1), upd))
-        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending'").fetchone()[0] == 2
+        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending'").fetchone()[0] == 3
         c.rollback()
+    assert _pending(e.dsn) == before and probe_row(e, low2)["outcome"] == "pending"
+    for u, upd in ((1, 920011), (2, 920012), (3, 920013)):
+        _ingest_join(e.dsn, u, sent + timedelta(seconds=1), upd)
+    _ingest_join(e.dsn, 1, sent + timedelta(seconds=5), 920014)  # outside the call: no new question
+    # 1: requeued; 2: the manual question takes the sample's place, fresh (no attempts, no backoff); 3: unchanged
+    assert _pending(e.dsn) == [(1, "outage", 0), (2, "manual", 0), (3, "conflict", 0)]
+    assert probe_row(e, low2)["outcome"] == "cancelled" and probe_row(e, high3)["outcome"] == "pending"
+    assert probe_row(e, old1)["outcome"] == "out"
+
+
+def test_a_straddled_manual_answer_outranks_a_pending_probe_in_backoff(env):
+    e = env
+    e.w.user(1)
+    pid = queue(e, 1, "manual")
+    e.w.c.commit()
+    sent, go = _held(e, "left")
+    p = prober.make(e.ctx)
+    t = _step_in_thread(e, p)
+    assert sent.wait(10)
+    e.clock.advance(3)
+    go.set()
+    t.join(10)
+    assert not t.errors and probe_row(e, pid)["outcome"] == "out"  # the answer commits first
+    low = queue(e, 1, "sample")  # later a routine probe of the pair fails once: in backoff for a minute
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s", (e.clock.now, low))
+    e.w.c.commit()
+    _ingest_join(e.dsn, 1, START.replace(microsecond=0) + timedelta(seconds=1), 930001)  # dated inside the call
+    assert _pending(e.dsn) == [(1, "manual", 0)]
+    e.fake.respond("getChatMember", lambda params: {"status": "member"})
+    e.clock.advance(1)
+    e.run(p, 1)  # well inside the sample's backoff
+    assert len(asked(e)) == 2
     with psycopg.connect(e.dsn) as c:
-        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending'").fetchone()[0] == 1
-    _ingest_join(e.dsn, 1, sent + timedelta(seconds=1), 920003)
-    _ingest_join(e.dsn, 2, sent + timedelta(seconds=1), 920004)
-    _ingest_join(e.dsn, 1, sent + timedelta(seconds=5), 920005)  # outside the call: no new question
-    with psycopg.connect(e.dsn) as c:
-        rows = c.execute("SELECT user_id, reason, outcome FROM tg.probe WHERE outcome = 'pending' ORDER BY user_id"
-                         ).fetchall()
-    assert rows == [(1, "outage", "pending"), (2, "sample", "pending")]
-    assert probe_row(e, old1)["outcome"] == "out" and probe_row(e, pending2)["outcome"] == "pending"
+        assert c.execute("SELECT reason, outcome FROM tg.probe WHERE chat_id = %s AND user_id = 1 ORDER BY probe_id",
+                         (CHAT,)).fetchall() == [("manual", "out"), ("sample", "cancelled"), ("manual", "in")]
+
+
+def test_a_cached_probe_raised_to_conflict_in_place_is_asked_next(env):
+    e = env
+    ids = [queue(e, u, "sample") for u in range(1, 201)]
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)  # cached and draining
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:  # the reconciler raises a cached routine probe in place
+        c.execute("UPDATE tg.probe SET reason = 'conflict' WHERE probe_id = %s", (ids[150],))
+    e.run(p, 0.3)
+    assert asked(e)[n] == (CHAT, 151)
+
+
+def test_a_new_outage_probe_of_a_newer_spell_goes_before_cached_older_ones(env):
+    e = env
+    w = e.w
+    for u in range(1, 101):
+        w.join(u, at(u))  # spell u starts at minute u
+    w.join(500, at(1000))  # the newest spell
+    w.rebuild()
+    for u in range(1, 101):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+    w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    assert [u for _, u in asked(e)][:5] == [100, 99, 98, 97, 96]  # newest spell first
+    n = len(asked(e))
+    queue(e, 500, "outage", queued=START)
+    e.w.c.commit()
+    e.run(p, 0.3)
+    assert asked(e)[n] == (CHAT, 500)
 
 
 def test_a_conflict_of_another_chat_queued_during_a_backlog_is_asked_next(env):

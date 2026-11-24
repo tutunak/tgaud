@@ -12,7 +12,8 @@ ALTER TABLE tg.count_sample ALTER COLUMN net_events DROP NOT NULL;
 COMMENT ON COLUMN tg.count_sample.net_events IS
   'Exact joins minus exact exits of spells (joined_at, and left_at of an event end, all accounts) in (previous '
   'sample, this sample]; 0 for a chat''s first sample. NULL = pending: the sampler fills it only once '
-  'tg.bot_state.caught_up_at is later than sampled_at, so every update dated before the sample is committed; '
+  'tg.bot_state.caught_up_at is later than the end of the count call (sampled_at + request_ms), so every update '
+  'dated up to the count is committed; '
   'the residual (stats.v_drift, block 9b, the metrics) reads finalized samples only. Written by the sampler.';
 
 CREATE INDEX count_sample_pending ON tg.count_sample (sampled_at) WHERE net_events IS NULL;
@@ -60,20 +61,40 @@ COMMENT ON INDEX tg.probe_pending_reason IS
 -- An answer committed before an event dated inside its call ([sent_at, answered_at], the rebuild ignores it): the
 -- question is asked again. Ingest inserts the event under lock_chats(chat), so this runs under the same lock.
 CREATE FUNCTION tg.probe_requeue_straddled() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+  -- the prober's queue order (tgaud.jobs.prober.PRIORITY)
+  v_order constant text[] := ARRAY['manual', 'conflict', 'outage', 'snapshot_absent', 'sample'];
+  v_asked tg.probe;
+  v_pending tg.probe;
 BEGIN
-  INSERT INTO tg.probe (chat_id, user_id, reason, snapshot_id, absent_since, queued_at)
-  SELECT p.chat_id, p.user_id, p.reason, p.snapshot_id, p.absent_since, p.queued_at
-  FROM tg.probe p
+  SELECT * INTO v_asked FROM tg.probe p
   WHERE p.chat_id = NEW.chat_id AND p.user_id = NEW.user_id AND p.outcome IN ('in', 'out')
     AND coalesce(p.sent_at, p.answered_at) <= NEW.event_at AND NEW.event_at <= p.answered_at
-  ORDER BY p.answered_at DESC, p.probe_id DESC
-  LIMIT 1
-  ON CONFLICT DO NOTHING;  -- probe_one_pending: a pending probe of the pair already asks the question
+  ORDER BY array_position(v_order, p.reason), p.answered_at DESC, p.probe_id DESC
+  LIMIT 1;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+  SELECT * INTO v_pending FROM tg.probe p
+  WHERE p.chat_id = NEW.chat_id AND p.user_id = NEW.user_id AND p.outcome = 'pending'
+  FOR UPDATE;
+  IF FOUND THEN
+    IF array_position(v_order, v_pending.reason) <= array_position(v_order, v_asked.reason) THEN
+      RETURN NULL;  -- a pending probe of the pair asks the question at the same or a higher priority
+    END IF;
+    -- the invalidated request outranks it: it takes its place (the CLI's rule for a manual probe), fresh, without
+    -- the lower probe's attempts and backoff
+    UPDATE tg.probe SET outcome = 'cancelled' WHERE probe_id = v_pending.probe_id;
+  END IF;
+  INSERT INTO tg.probe (chat_id, user_id, reason, snapshot_id, absent_since, queued_at)
+  VALUES (v_asked.chat_id, v_asked.user_id, v_asked.reason, v_asked.snapshot_id, v_asked.absent_since,
+          v_asked.queued_at);
   RETURN NULL;
 END $$;
 COMMENT ON FUNCTION tg.probe_requeue_straddled() IS
   'AFTER INSERT on tg.member_event: when an in/out answer of the pair straddles the new event, queue the same '
-  'question again (same reason, snapshot and queued_at, so a manual probe keeps the top priority) unless a probe of '
-  'the pair is pending. The answered row stays as it was: history''s rule ignores it.';
+  'question again (same reason, snapshot and queued_at, no attempts), so a manual probe keeps the top priority. A '
+  'pending probe of the pair at the same or a higher priority already asks it; a lower one is cancelled (row kept) '
+  'and replaced, as the CLI does for a manual probe. The answered row stays as it was: history''s rule ignores it.';
 CREATE TRIGGER probe_requeue_straddled AFTER INSERT ON tg.member_event
   FOR EACH ROW EXECUTE FUNCTION tg.probe_requeue_straddled();

@@ -7,7 +7,8 @@ sample (after a longer stop, at the first slot after now, so a restart does not 
 `reported`, `known_open` (open spells, all accounts: an index-only count) and `suspect_open` at once, and
 `net_events` NULL: the sample is pending. sampled_at is the send time of getChatMemberCount and request_ms the
 call's length (job clock). Every step finalizes the pending samples that ingest has caught up past
-(tg.bot_state.caught_up_at > sampled_at, so every update dated before the sample is committed): net_events =
+(tg.bot_state.caught_up_at later than the end of the call, sampled_at + request_ms, so every update dated up to
+the count is committed): net_events =
 exact joins minus exact exits of spells in (previous sample, this sample] (0 for a chat's first sample), the
 definition R1's sample_net uses; `straddled` = an exact transition lies inside the call (from sampled_at floored to
 the second, like event dates, to sampled_at + request_ms), so the count may or may not include it and the residuals
@@ -23,7 +24,7 @@ tgaud_chat_join_requests_total{outcome="unknown"}; a later approval found by ing
 
 Values set: tgaud_chat_members_reported/_known/_suspect, tgaud_chat_drift_mismatch (reported - known_open of the
 latest finalized sample), tgaud_chat_drift_residual_24h (the sum of the delta residuals of the finalized samples of
-the last 24 h, each against the previous finalized sample, as stats.v_drift; withheld residuals count as nothing), tgaud_chat_gap_open,
+the last 24 h, each against the previous finalized sample, as stats.v_drift; withheld residuals count as nothing, and no series without a comparison that is not withheld), tgaud_chat_gap_open,
 tgaud_chat_join_requests_pending, tgaud_snapshot_age_seconds (since the last good snapshot finished; no series
 without one), tgaud_chat_info, tgaud_lost_seconds_total (confirmed service_down gaps that have ended; the counter
 only grows), tgaud_probe_queue and tgaud_probe_oldest_age_seconds (0 for an empty queue).
@@ -77,7 +78,10 @@ WITH fin AS (
                  date_trunc('second', x.sampled_at) AS call_from,
                  x.sampled_at + make_interval(secs => coalesce(x.request_ms, 0) / 1000.0) AS call_to
           FROM tg.count_sample x
-          WHERE x.net_events IS NULL AND x.sampled_at < (SELECT max(b.caught_up_at) FROM tg.bot_state b)) p
+          WHERE x.net_events IS NULL
+            -- caught up past the end of the call: every update dated inside it (the straddle test) is committed
+            AND x.sampled_at + make_interval(secs => coalesce(x.request_ms, 0) / 1000.0)
+                < (SELECT max(b.caught_up_at) FROM tg.bot_state b)) p
   ) n
   WHERE s.chat_id = n.chat_id AND s.sampled_at = n.sampled_at AND s.net_events IS NULL
   RETURNING s.chat_id, s.sampled_at
@@ -120,7 +124,8 @@ GROUP BY m.chat_id"""
 
 # The latest finalized sample (reported, mismatch) and the 24 h residual: the sum of the delta residuals of the
 # window's finalized samples, each against the previous finalized sample (the one before the window for the first),
-# without the withheld ones (a straddled count on either side), as stats.v_drift computes them.
+# without the withheld ones (a straddled count on either side), as stats.v_drift computes them; NULL (no series)
+# when the window has no comparison that is not withheld.
 _Q_DRIFT = """
 SELECT c.chat_id, l.reported, l.reported - l.known_open AS mismatch, w.residual
 FROM unnest(%(chats)s::bigint[]) AS c(chat_id)
@@ -129,7 +134,7 @@ LEFT JOIN LATERAL (
   WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at <= %(now)s
   ORDER BY s.sampled_at DESC LIMIT 1) l ON true
 LEFT JOIN LATERAL (
-  SELECT coalesce(sum(d.residual), 0) AS residual FROM (
+  SELECT sum(d.residual) AS residual FROM (
     SELECT x.sampled_at,
            CASE WHEN x.straddled OR lag(x.straddled) OVER o THEN NULL
                 ELSE (x.reported - lag(x.reported) OVER o) - x.net_events END AS residual
@@ -141,8 +146,7 @@ LEFT JOIN LATERAL (
            WHERE s.chat_id = c.chat_id AND s.net_events IS NOT NULL AND s.sampled_at <= %(since)s
            ORDER BY s.sampled_at DESC LIMIT 1)) x
     WINDOW o AS (ORDER BY x.sampled_at)) d
-  WHERE d.sampled_at > %(since)s
-  HAVING count(*) > 0) w ON true"""
+  WHERE d.sampled_at > %(since)s) w ON true"""
 
 _Q_GAP_OPEN = """
 SELECT c.chat_id FROM unnest(%(chats)s::bigint[]) AS c(chat_id)

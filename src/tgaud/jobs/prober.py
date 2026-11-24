@@ -3,9 +3,10 @@
 Queue order: `manual` (the CLI) first, then `conflict`, `outage` (the newest open spell first), `snapshot_absent`,
 `sample`; ties by queued_at. Only probes that are ready are taken: never tried, or past the backoff of their
 last failure. The candidates are cached: a full read every FULL_REFRESH seconds or when the cache runs out. Between
-full reads, every step first reads the heads of the queue (the oldest ready probes of each chat and reason, by the
-index probe_pending_reason) into the cache, after the cached ones of the same reason: a conflict or manual probe
-queued meanwhile, or a chat that starts waiting, is seen before the next tokens are spent.
+full reads, every step first reads the heads of the queue (per chat and reason the oldest ready probes, and for
+outage the newest queued ones, by the index probe_pending_reason) into the cache at their place in the same order:
+a conflict or manual probe queued or raised in place meanwhile, a new outage probe of a newer spell, or a chat that
+starts waiting, is seen before the next tokens are spent.
 
 Budget: one global token bucket at `config.probe_rate` calls/s (TGAUD_PROBE_RATE, default 5; burst one second's
 worth). While other chats have ready probes, one chat gets at most half of the rate (its own bucket at rate/2);
@@ -78,22 +79,34 @@ WITH ready AS (
                                  ORDER BY r.prio, r.spell_from DESC NULLS LAST, r.queued_at, r.probe_id) AS rn
   FROM ready r
 )
-SELECT prio, probe_id, chat_id, user_id, reason FROM ranked WHERE rn <= %(per_chat)s
+SELECT prio, extract(epoch FROM spell_from)::float8, extract(epoch FROM queued_at)::float8, probe_id, chat_id,
+       user_id, reason
+FROM ranked WHERE rn <= %(per_chat)s
 ORDER BY prio, spell_from DESC NULLS LAST, queued_at, probe_id"""
 
-# the heads: per chat and reason the oldest ready probes (one short index range each)
-_HEADS = """
-SELECT r.prio::int, h.probe_id, h.chat_id, h.user_id, r.reason
+_READY = """
+    AND (p.attempts = 0 OR p.last_attempt_at IS NULL
+         OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)])
+            <= %(now)s)"""
+
+# The heads, per chat and reason (short index ranges of probe_pending_reason): the oldest ready probes (first-come
+# reasons, so also a row whose reason was raised in place), and for outage the newest queued ones (a probe queued
+# after the full read, for a spell newer than the cached ones). Same columns and order key as _CANDIDATES.
+_HEADS = f"""
+SELECT r.prio::int, extract(epoch FROM h.spell_from)::float8, extract(epoch FROM h.queued_at)::float8, h.probe_id,
+       h.chat_id, h.user_id, r.reason
 FROM tg.chat c
 CROSS JOIN unnest(%(priority)s::text[]) WITH ORDINALITY AS r(reason, prio)
 CROSS JOIN LATERAL (
-  SELECT p.probe_id, p.chat_id, p.user_id FROM tg.probe p
-  WHERE p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending'
-    AND (p.attempts = 0 OR p.last_attempt_at IS NULL
-         OR p.last_attempt_at + make_interval(secs => (%(backoff)s::float8[])[least(p.attempts, %(steps)s)])
-            <= %(now)s)
-  ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s) h
-ORDER BY r.prio, h.chat_id, h.probe_id"""
+  (SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at, NULL::timestamptz AS spell_from FROM tg.probe p
+   WHERE r.reason <> 'outage' AND p.chat_id = c.chat_id AND p.reason = r.reason AND p.outcome = 'pending' {_READY}
+   ORDER BY p.queued_at, p.probe_id LIMIT %(per_head)s)
+  UNION ALL
+  (SELECT p.probe_id, p.chat_id, p.user_id, p.queued_at,
+          (SELECT max(m.known_from) FROM tg.membership m WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id)
+   FROM tg.probe p
+   WHERE r.reason = 'outage' AND p.chat_id = c.chat_id AND p.reason = 'outage' AND p.outcome = 'pending' {_READY}
+   ORDER BY p.queued_at DESC, p.probe_id DESC LIMIT %(per_head)s)) h"""
 
 
 class TokenBucket:
@@ -138,7 +151,7 @@ class TokenBucket:
 
 @dataclass(frozen=True)
 class Candidate:
-    key: tuple[int, int, int]  # queue order: (priority, 0 full read | 1 head read, position in that read)
+    key: tuple[int, float, float, int]  # queue order: priority, newest spell first (outage), queued_at, probe_id
     probe_id: int
     chat_id: int
     user_id: int
@@ -147,6 +160,13 @@ class Candidate:
 
 def _utc(t: float) -> datetime:
     return datetime.fromtimestamp(t, timezone.utc)
+
+
+def _candidate(prio: int, spell_from: float | None, queued_at: float, probe_id: int, chat_id: int, user_id: int,
+               reason: str) -> Candidate:
+    """A row of _CANDIDATES or _HEADS, keyed like their ORDER BY (spell_from DESC NULLS LAST)."""
+    spell = -spell_from if spell_from is not None else math.inf
+    return Candidate((prio, spell, queued_at, probe_id), probe_id, chat_id, user_id, reason)
 
 
 class Prober:
@@ -160,7 +180,6 @@ class Prober:
         self.chat_buckets: dict[int, TokenBucket] = {}
         self.queue: list[Candidate] = []
         self.next_read = now  # the full read
-        self._heads = 0  # positions of head-read candidates
 
     # --- scheduling --------------------------------------------------------------------------------------------
 
@@ -220,21 +239,26 @@ class Prober:
     def _read(self, conn: psycopg.Connection, now: float) -> None:
         rows = conn.execute(_CANDIDATES, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
                                           "steps": len(BACKOFF), "now": _utc(now), "per_chat": PER_CHAT}).fetchall()
-        self.queue = [Candidate((r[0], 0, i), *r[1:]) for i, r in enumerate(rows)]
+        self.queue = [_candidate(*r) for r in rows]
         self.next_read = now + (FULL_REFRESH if self.queue else IDLE_REFRESH)
         known = {c.chat_id for c in self.queue}
         for chat_id in [c for c in self.chat_buckets if c not in known]:
             del self.chat_buckets[chat_id]  # idle chats start again with a full share
 
     def _read_heads(self, conn: psycopg.Connection, now: float) -> None:
-        """Ready probes queued since the full read (and chats that started waiting), each after the cached probes
-        of its reason."""
-        have = {c.probe_id for c in self.queue}
-        for prio, *rest in conn.execute(_HEADS, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
-                                                 "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD}):
-            if rest[0] not in have:
-                self._heads += 1
-                self._requeue(Candidate((prio, 1, self._heads), *rest))
+        """Ready probes queued since the full read (and chats that started waiting) into the cache at their place in
+        the queue order; a cached probe whose reason was raised in place moves to its new place."""
+        cached = {c.probe_id: c for c in self.queue}
+        for row in conn.execute(_HEADS, {"priority": list(PRIORITY), "backoff": list(BACKOFF),
+                                         "steps": len(BACKOFF), "now": _utc(now), "per_head": PER_HEAD}):
+            cand = _candidate(*row)
+            old = cached.get(cand.probe_id)
+            if old is not None and old.key[0] <= cand.key[0]:
+                continue  # cached at its place (or higher: the full read's spell order stays)
+            if old is not None:
+                self.queue.remove(old)
+            self._requeue(cand)
+            cached[cand.probe_id] = cand
 
     def probe(self, conn: psycopg.Connection, cand: Candidate) -> str:
         """Ask once and record the result; returns what happened (in, out, retry, error, late, dropped, 429)."""
