@@ -96,10 +96,20 @@ def main(host_alias: str) -> int:
         if not admin_dsn:
             port = _free_port()
             password = secrets.token_hex(12)
-            container = f"tgaud-e2e-pg-{tag}"
-            subprocess.run(["podman", "run", "-d", "--rm", "--name", container, "-e", f"POSTGRES_PASSWORD={password}",
-                            "-p", f"127.0.0.1:{port}:5432", "--memory", "512m", IMAGE, *SERVER_SETTINGS],
-                           check=True, capture_output=True, text=True)
+            # podman writes the id of the container it created into a private file, even when the start then
+            # fails: cleanup removes exactly that container, never one of the same name made by another run
+            cidfile = Path(tempfile.mkdtemp(prefix="tgaud-e2e-cid-")) / "cid"
+            try:
+                # no --rm: podman's own removal of a failed start could drop the cidfile and leave storage;
+                # this helper removes the container itself. --image-volume=ignore: no anonymous data volume
+                subprocess.run(["podman", "run", "-d", "--image-volume=ignore", "--cidfile", str(cidfile), "--name",
+                                f"tgaud-e2e-pg-{tag}", "-e", f"POSTGRES_PASSWORD={password}",
+                                "-p", f"127.0.0.1:{port}:5432", "--memory", "512m", IMAGE, *SERVER_SETTINGS],
+                               check=True, capture_output=True, text=True)
+            finally:
+                container = cidfile.read_text().strip() if cidfile.exists() else None
+                cidfile.unlink(missing_ok=True)
+                cidfile.parent.rmdir()
             admin_dsn = f"postgresql://postgres:{password}@127.0.0.1:{port}/postgres"
         with tempfile.TemporaryDirectory(prefix="tgaud-e2e-") as workdir:
             server = PgServer(admin_dsn, f"tgaud_e2e_{tag}", secrets.token_hex(16), Path(workdir), container)
@@ -110,7 +120,11 @@ def main(host_alias: str) -> int:
         failures.append(f"{type(e).__name__}: {e}")
     finally:
         if container:
-            subprocess.run(["podman", "rm", "-f", container], capture_output=True)
+            # --volumes as well, in case a volume exists despite --image-volume=ignore
+            removed = subprocess.run(["podman", "rm", "-f", "--volumes", container], capture_output=True, text=True)
+            if removed.returncode != 0:
+                failures.append(f"podman rm of the test database {container[:12]} failed ({removed.returncode}): "
+                                f"{removed.stderr.strip()}")
     for f in failures:
         print(f"container-e2e: {f}", file=sys.stderr)
     return 1 if failures else 0
