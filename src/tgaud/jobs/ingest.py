@@ -8,10 +8,11 @@ serve calls, in this order, with the service lock held:
                         records both. It leaves exactly one tg.bot_state row and commits or rolls back.
                         No other writes here: a refused start must not change the database, not even the
                         serve generation, which serve claims only after this returns.
-    startup(ctx, conn)  once, after the claim: partitions, allowed_updates, and the rights check of every
-                        tracked chat (getChatMember(chat, bot) -> bot_status, coverage, not_admin / rights_lost
-                        gaps, the chat gauges); queues a getChat metadata fetch for each. Every transaction
-                        starts with ctx.fence(conn).
+    startup(ctx, conn)  once, after the claim: partitions; allowed_updates (an updates_not_allowed gap when
+                        the stored list lacked chat_member, closed by the first poll); the rights check of
+                        every tracked chat except the old group of a migration (getChatMember(chat, bot) ->
+                        bot_status, coverage, not_admin / rights_lost gaps, the chat gauges); queues a getChat
+                        metadata fetch for each. Every transaction starts with ctx.fence(conn).
     run(ctx, conn)      the long-polling loop until ctx.stop is set.
 
 The loop. Before every getUpdates: when tg.bot_state.last_update_at is older than 6 days (or unset), the offset
@@ -28,11 +29,20 @@ is recorded in the transaction that advances last_poll_ok_at when the previous d
 passed 20 h; the open stays of the affected chats are left to the reconciler (G1). Metrics and health marks
 happen only after a commit.
 
-Failures: a body that does not parse goes through the malformed path in one transaction (a receipt with
-update_type 'malformed' dated at the receive time, the redacted payload in tg.raw_update when it is a
-membership update with a known chat id, the offset), counted as tgaud_ingest_failures_total{stage="parse"};
-the loop never wedges on one bad update. A database error rolls back and retries the same update with backoff
-(stage "db") and never advances the offset; a lost connection ends ingest (serve exits 1).
+Failures: input that does not validate (parse_update checks every field the bodies write, bigint ranges
+included) goes through the malformed path in one transaction (a receipt with update_type 'malformed' dated at
+the receive time, the redacted payload in tg.raw_update when it is a membership update with a known chat id,
+the offset), counted as tgaud_ingest_failures_total{stage="parse"}; the loop never wedges on one bad update. A
+database error rolls back and retries the same update with backoff (stage "db") and never advances the
+offset; a lost connection ends ingest (serve exits 1). Any other exception (a program error in a body or a
+rebuild) rolls back and ends ingest, so the restarted service retries the valid update rather than
+acknowledging it without its data.
+
+Bot rights: my_chat_member events and rights checks set the bot's status as of their time. A queued event
+older than the last check (processed after the startup check) is replayed at its own time for coverage and
+gaps, and the check's observation is applied again from the check's time, so the interval in between keeps its
+history. A failed check stays due (tg.chat.rights_due_at, with backoff) and marks the chat with a suspected
+not_admin gap (confirmed false) until a check or a newer event resolves it.
 
 Privacy (design.md 11): never bio, user_chat_id or message text; a full invite link made by this bot is stored
 only as HMAC-SHA256 with TGAUD_LINK_HMAC_KEY (tg.invite_link.link_digest, and a digest marker in raw payloads);
@@ -47,9 +57,9 @@ not tracked) routes nothing. Migrations (migrate_to_chat_id in the old group, mi
 supergroup, in either order and repeated) record the alias once; M1 (tg.move_chat_history, then a rebuild of the
 moved pairs) runs when the new chat is tracked, now or when it becomes tracked later; until then M2 holds.
 
-getChat metadata is fetched between polls for chats whose tg.chat.metadata_due_at has passed (first seen,
-became tracked, every tracked chat at startup), retried with backoff until it succeeds; the update that queued
-it never waits for it.
+getChat metadata and due rights checks are fetched between polls (tg.chat.metadata_due_at, rights_due_at: first
+seen, became tracked, every tracked chat at startup), retried with backoff until they succeed; the update that
+queued them never waits for them.
 """
 
 from __future__ import annotations
@@ -103,6 +113,7 @@ SERVICE_KEYS = frozenset((
     "suggested_post_paid", "suggested_post_refunded", "suggested_post_approval_failed",
 ))
 DIGEST_MARK = "hmac-sha256:"
+USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
 
 
 class Malformed(ValueError):
@@ -125,10 +136,33 @@ def _clean(v: Any) -> Any:
     return v
 
 
-def _int(v: Any, what: str) -> int:
+BIGINT = (-(2 ** 63), 2 ** 63 - 1)
+INT4 = (-(2 ** 31), 2 ** 31 - 1)
+
+
+def _int(v: Any, what: str, bounds: tuple[int, int] = BIGINT) -> int:
+    """An integer that fits the database column (bigint unless said otherwise)."""
     if isinstance(v, bool) or not isinstance(v, int):
         raise Malformed(f"{what} is not an integer")
+    if not bounds[0] <= v <= bounds[1]:
+        raise Malformed(f"{what} is out of range")
     return v
+
+
+def _opt_int(v: Any, bounds: tuple[int, int] = INT4) -> int | None:
+    """An optional integer; one that is absent, not an integer or out of range is None."""
+    if isinstance(v, bool) or not isinstance(v, int) or not bounds[0] <= v <= bounds[1]:
+        return None
+    return v
+
+
+def _id_at(obj: Any, *path: str) -> int | None:
+    """The id found at `path` inside a (possibly malformed) payload, when it is a valid bigint."""
+    for key in path:
+        if not isinstance(obj, dict):
+            return None
+        obj = obj.get(key)
+    return _opt_int(obj, BIGINT)
 
 
 def _opt_str(v: Any) -> str | None:
@@ -211,6 +245,27 @@ class Parsed:
     link: Link | None = None
     via_join_request: bool = False
     via_folder: bool = False
+    message_id: int | None = None
+    migration: tuple[int, int] | None = None  # (old chat id, new chat id) of a migration service message
+    giveaway: Giveaway | None = None
+
+
+@dataclass(frozen=True)
+class Giveaway:
+    draw_at: dt.datetime
+    winner_count: int | None
+    only_new_members: bool
+    chats: tuple[int, ...]
+
+
+def parse_giveaway(v: Any) -> Giveaway:
+    g = _dict(v, "giveaway")
+    chats = g.get("chats") or []
+    if not isinstance(chats, list):
+        raise Malformed("giveaway.chats is not a list")
+    return Giveaway(draw_at=_ts(g.get("winners_selection_date"), "giveaway.winners_selection_date"),
+                    winner_count=_opt_int(g.get("winner_count")), only_new_members=g.get("only_new_members") is True,
+                    chats=tuple(_int(_dict(c, "giveaway.chats[]").get("id"), "giveaway.chats[].id") for c in chats))
 
 
 def parse_user(v: Any, what: str = "user") -> User:
@@ -242,18 +297,22 @@ def parse_member(v: Any, what: str) -> Member:
                   can_restrict_members=_opt_bool(d.get("can_restrict_members")))
 
 
-def parse_link(v: Any) -> Link | None:
+def parse_link(v: Any, bot_id: int) -> Link | None:
+    """A ChatInviteLink. Its creator is required (Bot API); a link this bot did not make must be masked by
+    Telegram, so an unmasked one of another creator is refused rather than stored as text."""
     if v is None:
         return None
     d = _dict(v, "invite_link")
     text = d.get("invite_link")
     if not isinstance(text, str) or not text:
         raise Malformed("invite_link.invite_link is missing")
-    price = d.get("subscription_price")
-    return Link(invite_link=text, creator=parse_user(d["creator"], "invite_link.creator") if "creator" in d else None,
-                name=_opt_str(d.get("name")), is_primary=_opt_bool(d.get("is_primary")),
+    creator = parse_user(d.get("creator"), "invite_link.creator")
+    if creator.id != bot_id and not is_masked(text):
+        raise Malformed("invite_link of another creator is not masked")
+    return Link(invite_link=text, creator=creator, name=_opt_str(d.get("name")),
+                is_primary=_opt_bool(d.get("is_primary")),
                 creates_join_request=_opt_bool(d.get("creates_join_request")),
-                subscription_price=price if isinstance(price, int) and not isinstance(price, bool) else None)
+                subscription_price=_opt_int(d.get("subscription_price")))
 
 
 def update_type_of(raw: dict) -> str | None:
@@ -261,9 +320,10 @@ def update_type_of(raw: dict) -> str | None:
     return keys[0] if len(keys) == 1 and isinstance(keys[0], str) else None
 
 
-def parse_update(raw: dict, received: dt.datetime) -> Parsed:
-    """The update's fields this service uses; raises Malformed (or a TypeError/KeyError on odd shapes).
-    `received` dates an update of a type that was not asked for and has no date."""
+def parse_update(raw: dict, received: dt.datetime, bot_id: int) -> Parsed:
+    """The update's fields this service uses, validated for the database; raises Malformed (or a
+    TypeError/KeyError on odd shapes). `received` dates an update of a type that was not asked for and has no
+    date. Everything the bodies write is checked here, so a body fails only on a database or program error."""
     update_id = _int(raw.get("update_id"), "update_id")
     kind = update_type_of(raw)
     if kind is None:
@@ -276,7 +336,7 @@ def parse_update(raw: dict, received: dt.datetime) -> Parsed:
                    sender=parse_user(inner.get("from"), "from"),
                    member=parse_member(inner.get("new_chat_member"), "new_chat_member"),
                    old=parse_member(inner.get("old_chat_member"), "old_chat_member"),
-                   link=parse_link(inner.get("invite_link")),
+                   link=parse_link(inner.get("invite_link"), bot_id),
                    via_join_request=inner.get("via_join_request") is True,
                    via_folder=inner.get("via_chat_folder_invite_link") is True)
         if p.member.user.id != p.old.user.id:
@@ -284,12 +344,19 @@ def parse_update(raw: dict, received: dt.datetime) -> Parsed:
         return p
     if kind == "chat_join_request":
         return Parsed(update_id, kind, _ts(inner.get("date"), "date"), parse_chat(inner.get("chat")), inner,
-                      sender=parse_user(inner.get("from"), "from"), link=parse_link(inner.get("invite_link")))
+                      sender=parse_user(inner.get("from"), "from"),
+                      link=parse_link(inner.get("invite_link"), bot_id))
     if kind in ("message", "channel_post"):
         sender = parse_user(inner["from"], "from") if "from" in inner else None
-        _int(inner.get("message_id"), "message_id")
-        return Parsed(update_id, kind, _ts(inner.get("date"), "date"), parse_chat(inner.get("chat")), inner,
-                      sender=sender)
+        chat = parse_chat(inner.get("chat"))
+        migration = None
+        if "migrate_to_chat_id" in inner:
+            migration = chat.id, _int(inner["migrate_to_chat_id"], "migrate_to_chat_id")
+        elif "migrate_from_chat_id" in inner:
+            migration = _int(inner["migrate_from_chat_id"], "migrate_from_chat_id"), chat.id
+        return Parsed(update_id, kind, _ts(inner.get("date"), "date"), chat, inner, sender=sender,
+                      message_id=_int(inner.get("message_id"), "message_id"), migration=migration,
+                      giveaway=parse_giveaway(inner["giveaway"]) if "giveaway" in inner else None)
     # a type that was not asked for: only its date, when it has one
     date = inner.get("date")
     chat = inner.get("chat")
@@ -386,6 +453,7 @@ class Ingest:
         self.backoff_base = 1.0  # first wait after a failed poll or database error (seconds); doubles
         self.min_empty_poll = MIN_EMPTY_POLL
         self._poll_backoff = self.backoff_base
+        self._updates_gap_open = False  # an updates_not_allowed gap waits for the first poll with the full list
         # test hook: called inside each update (or empty poll) transaction just before the commit, with the
         # update id (None for an empty poll)
         self.before_commit: Callable[[int | None], None] | None = None
@@ -463,45 +531,98 @@ class Ingest:
         bot_id = self._bot_id()
         now = self.now()
 
-        def prepare(fx: Effects) -> list[int]:
-            self.conn.execute("SELECT * FROM tg.maintain_partitions(%s)", (now,))
-            self.conn.execute("UPDATE tg.bot_state SET allowed_updates = %s, updated_at = now() WHERE bot_id = %s",
-                              (list(ALLOWED_UPDATES), bot_id))
-            rows = self.conn.execute("SELECT chat_id FROM tg.chat WHERE tracked ORDER BY chat_id").fetchall()
-            return [r[0] for r in rows]
+        def prepare(fx: Effects) -> None:
+            conn = self.conn
+            conn.execute("SELECT * FROM tg.maintain_partitions(%s)", (now,))
+            allowed, last_poll = conn.execute("SELECT allowed_updates, last_poll_ok_at FROM tg.bot_state "
+                                              "WHERE bot_id = %s FOR NO KEY UPDATE", (bot_id,)).fetchone()
+            if "chat_member" not in (allowed or []):
+                # updates sent before this start lacked chat_member: those joins and leaves are lost (D6). The
+                # gap runs from the first coverage (or the last poll) until the first poll with the full list.
+                open_gap = conn.execute("""SELECT 1 FROM tg.gap WHERE chat_id IS NULL AND reason = 'updates_not_allowed'
+                                           AND upper_inf(period)""").fetchone()
+                if open_gap is None:
+                    conn.execute(
+                        """INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                           SELECT NULL, tstzrange(least(coalesce(min(lower(period)), %(last)s, %(now)s), %(now)s), NULL),
+                                  'updates_not_allowed', true, %(now)s, %(note)s FROM tg.coverage""",
+                        dict(last=last_poll, now=now, note=f"allowed_updates was {allowed}: chat_member missing"))
+            conn.execute("UPDATE tg.bot_state SET allowed_updates = %s, updated_at = now() WHERE bot_id = %s",
+                         (list(ALLOWED_UPDATES), bot_id))
+            # every tracked chat except the old group of a migration: a rights check now, then getChat
+            conn.execute("""UPDATE tg.chat c SET rights_due_at = %(now)s, metadata_due_at = %(now)s
+                            WHERE c.tracked AND NOT EXISTS (SELECT 1 FROM tg.chat_alias a
+                                                            WHERE a.old_chat_id = c.chat_id)""", dict(now=now))
+            self._updates_gap_open = conn.execute(
+                """SELECT EXISTS (SELECT 1 FROM tg.gap WHERE chat_id IS NULL AND reason = 'updates_not_allowed'
+                                  AND upper_inf(period))""").fetchone()[0]
 
-        chats = self._transaction(prepare)
-        if chats is None or chats is True:
-            chats = []
-        for chat_id in chats:
+        self._transaction(prepare)
+        self.refresh_rights(limit=None)
+
+    def refresh_rights(self, limit: int | None = METADATA_BATCH) -> int:
+        """The rights check of chats whose tg.chat.rights_due_at has passed (startup, first seen, a failed
+        check's retry); returns how many succeeded."""
+        if self.ctx.api is None:
+            return 0
+        due = self.conn.execute(
+            """SELECT c.chat_id, c.rights_attempts FROM tg.chat c
+               WHERE c.rights_due_at <= %s AND NOT EXISTS (SELECT 1 FROM tg.chat_alias a WHERE a.old_chat_id = c.chat_id)
+               ORDER BY c.rights_due_at, c.chat_id LIMIT %s""", (self.now(), limit)).fetchall()
+        self.conn.rollback()
+        ok = 0
+        for chat_id, attempts in due:
             if self.ctx.stop.is_set():
-                return
-            self.check_rights(chat_id)
+                break
+            ok += bool(self.check_rights(chat_id, attempts))
+        return ok
 
-        def queue(fx: Effects) -> None:
-            self.conn.execute("UPDATE tg.chat SET metadata_due_at = %s WHERE tracked", (now,))
-
-        self._transaction(queue)
-
-    def check_rights(self, chat_id: int) -> None:
-        """getChatMember(chat, bot) -> bot status, rights, coverage and gaps of one chat."""
+    def check_rights(self, chat_id: int, attempts: int = 0) -> bool:
+        """getChatMember(chat, bot) -> bot status, rights, coverage and gaps of one chat. A transient failure
+        keeps the check due (with backoff) and marks the chat's admin status unknown with a suspected gap until a
+        check or a newer event resolves it."""
         assert self.ctx.api is not None
         bot_id = self._bot_id()
+        member: Member | None = None
+        failure = None
         try:
-            m = self.ctx.api.get_chat_member(chat_id, bot_id)
-            member = parse_member(m, "chat_member")
+            member = parse_member(self.ctx.api.get_chat_member(chat_id, bot_id), "chat_member")
         except ApiError as e:
-            if e.outcome not in ("400", "403"):
-                log.warning("ingest: rights check of chat %s failed (%s); left as it was", chat_id, e.outcome)
-                return
-            # chat not found, bot kicked or not a member: the bot is not admin there
-            kicked = "kick" in (e.description or "").lower()
-            member = Member("kicked" if kicked else "left", User(bot_id, True, None, None, None, None, None),
-                            None, None, None, None)
+            text = (e.description or "").lower()
+            if e.outcome in ("400", "403") and "upgraded" not in text:
+                # chat not found, bot kicked or not a member: the bot is not admin there
+                member = Member("kicked" if "kick" in text else "left", User(bot_id, True, None, None, None, None, None),
+                                None, None, None, None)
+            elif "upgraded" in text:
+                failure = "the group was upgraded to a supergroup (its migration message decides)"
+            else:
+                failure = e.outcome
         except (Malformed, KeyError, TypeError) as e:
-            log.warning("ingest: rights check of chat %s returned an unexpected member (%s)", chat_id, e)
-            return
+            failure = f"unexpected member ({e})"
         at = self.now()
+        if member is None:
+            log.warning("ingest: rights check of chat %s failed (%s); retried later", chat_id, failure)
+            wait = METADATA_BACKOFF[min(attempts, len(METADATA_BACKOFF) - 1)]
+
+            def later(fx: Effects) -> None:
+                history.lock_chats(self.conn, [chat_id])
+                row = self.conn.execute(
+                    """UPDATE tg.chat SET rights_due_at = %s, rights_attempts = rights_attempts + 1
+                       WHERE chat_id = %s RETURNING tracked""", (at + dt.timedelta(seconds=wait), chat_id)).fetchone()
+                if row is None or not row[0]:
+                    return
+                covered = self.conn.execute(
+                    """SELECT 1 FROM tg.gap WHERE chat_id = %(c)s AND reason IN ('not_admin', 'rights_lost')
+                       AND lower(period) <= %(at)s AND (upper_inf(period) OR upper(period) > %(at)s)""",
+                    dict(c=chat_id, at=at)).fetchone()
+                if covered is None:
+                    self.conn.execute(
+                        """INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                           VALUES (%s, tstzrange(%s, NULL), 'not_admin', false, %s, %s)""",
+                        (chat_id, at, at, f"rights check failed ({failure}): admin status unknown"))
+
+            self._transaction(later)
+            return False
 
         def body(fx: Effects) -> None:
             pending = self._pending_aliases(chat_id)
@@ -509,15 +630,19 @@ class Ingest:
             if self.conn.execute("SELECT 1 FROM tg.chat WHERE chat_id = %s", (chat_id,)).fetchone() is None:
                 return
             self._set_bot_state(chat_id, at, member, "rights_check", fx)
+            self.conn.execute("UPDATE tg.chat SET rights_due_at = NULL, rights_attempts = 0 WHERE chat_id = %s",
+                              (chat_id,))
             self._move_pending(chat_id, pending)
 
         self._transaction(body)
+        return True
 
     # -- the loop ----------------------------------------------------------------------------------------
 
     def run(self) -> None:
         self._bot_id()
         while not self.ctx.stop.is_set():
+            self.refresh_rights()
             self.refresh_metadata()
             if self.ctx.stop.is_set():
                 return
@@ -588,23 +713,21 @@ class Ingest:
 
     def handle(self, raw: Any, received: dt.datetime, caught_up: dt.datetime | None) -> bool:
         """Process one update in one transaction; True when it committed."""
-        if not isinstance(raw, dict) or isinstance(raw.get("update_id"), bool) \
-                or not isinstance(raw.get("update_id"), int):
+        if not isinstance(raw, dict) or _opt_int(raw.get("update_id"), BIGINT) is None:
             metrics.INGEST_FAILURES.labels("parse").inc()
             log.error("ingest: an update without a valid update_id was skipped")
             return False
         raw = _clean(raw)
         try:
-            parsed = parse_update(raw, received)
+            parsed = parse_update(raw, received, self._bot_id())
         except (Malformed, KeyError, TypeError, ValueError, AttributeError) as e:
             return self._malformed(raw, received, caught_up, f"{type(e).__name__}: {e}")
         try:
             ok = self._transaction(lambda fx: self._apply(fx, parsed, raw, received, caught_up))
-        except (db.StaleGeneration, psycopg.Error):
-            raise
-        except Exception as e:  # a body this code cannot handle is a parse failure, not a wedge
-            log.exception("ingest: update %s could not be processed", parsed.update_id)
+        except Malformed as e:  # input the parser let through (rolled back): recorded, never a wedge
             return self._malformed(raw, received, caught_up, f"{type(e).__name__}: {e}")
+        # Anything else (a program error in a body or a rebuild) propagates after the rollback: ingest ends and
+        # the restarted service retries the valid update, instead of acknowledging it without its data.
         return ok is not None
 
     def _malformed(self, raw: dict, received: dt.datetime, caught_up: dt.datetime | None, why: str) -> bool:
@@ -612,10 +735,9 @@ class Ingest:
         kind = update_type_of(raw)
         inner = raw.get(kind) if kind else None
         chat_id = None
-        if isinstance(inner, dict) and isinstance(inner.get("chat"), dict):
-            cid = inner["chat"].get("id")
-            if isinstance(cid, int) and not isinstance(cid, bool) and inner["chat"].get("type") in AUDIENCE_CHATS:
-                chat_id = cid
+        if isinstance(inner, dict) and isinstance(inner.get("chat"), dict) \
+                and inner["chat"].get("type") in AUDIENCE_CHATS:
+            chat_id = _id_at(inner, "chat", "id")
         log.error("ingest: update %s (%s) does not parse (%s): recorded as malformed", update_id, kind, why)
 
         def body(fx: Effects) -> None:
@@ -625,9 +747,14 @@ class Ingest:
                               (update_id, received, chat_id, received))
             if kind in MEMBERSHIP_TYPES and chat_id is not None and isinstance(inner, dict):
                 subject = _subject_id(kind, inner)
-                # the payload's date is unknown: anyone ever erased is left out
-                if not self._erased([subject], dt.datetime(1970, 1, 1, tzinfo=dt.UTC)):
-                    self._raw_update(update_id, received, kind, chat_id, subject, inner, received, erased=set())
+                # the erasure cutoff by the payload's date; when that is unusable, anyone ever erased counts
+                try:
+                    dated = _ts(inner.get("date"), "date")
+                except Malformed:
+                    dated = dt.datetime(1970, 1, 1, tzinfo=dt.UTC)
+                erased = self._erased(_payload_user_ids(inner), dated)
+                if subject not in erased:
+                    self._raw_update(update_id, received, kind, chat_id, subject, inner, received, erased)
             self._advance(fx, received, update_id=update_id, update_date=received, caught_up=caught_up)
             fx.add(lambda: metrics.INGEST_FAILURES.labels("parse").inc())
             fx.add(lambda: metrics.UPDATES.labels("malformed").inc())
@@ -679,6 +806,11 @@ class Ingest:
                    WHERE bot_id = %(bot)s RETURNING (SELECT last_poll_ok_at FROM old)""",
                 dict(bot=bot_id, id=update_id, date=update_date, recv=received, cu=caught_up)).fetchone()
         previous = row[0] if row else None
+        if self._updates_gap_open:  # this poll sent the full allowed_updates
+            self.conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %s))
+                                 WHERE chat_id IS NULL AND reason = 'updates_not_allowed' AND upper_inf(period)""",
+                              (received,))
+            fx.add(lambda: setattr(self, "_updates_gap_open", False))
         if previous is not None and received - previous > SERVICE_DOWN:
             self.conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
                                  VALUES (NULL, tstzrange(%s, %s), 'service_down', true, %s, %s)""",
@@ -722,7 +854,7 @@ class Ingest:
             return  # evidence from before the person's erasure: the receipt only
         # writers of evidence lock every chat the transaction touches, once, in ascending order
         raw_chat = p.chat.id
-        migration = self._migration_of(p)
+        migration = p.migration
         pending: list[tuple[int, dt.datetime]] = []
         if p.type == "my_chat_member":
             pending = self._pending_aliases(raw_chat)
@@ -741,7 +873,7 @@ class Ingest:
         elif p.type == "chat_join_request":
             self._join_request(fx, p, chat_id, raw_chat, erased, received)
         elif p.type == "message":
-            self._message(fx, p, chat_id, raw_chat, migration, received)
+            self._message(fx, p, chat_id, erased, received)
         elif p.type == "channel_post":
             self._channel_post(fx, p, chat_id)
 
@@ -765,30 +897,20 @@ class Ingest:
             return p.member.user.id
         if p.type == "chat_join_request" and p.sender:
             return p.sender.id
-        if p.type == "message" and p.sender and _attribution(p.inner or {}, p.chat) is None:
-            return p.sender.id
-        return None
-
-    def _migration_of(self, p: Parsed) -> tuple[int, int] | None:
-        """(old chat id, new chat id) of a migration service message."""
-        if p.type != "message" or p.inner is None or p.chat is None:
-            return None
-        if "migrate_to_chat_id" in p.inner:
-            return p.chat.id, _int(p.inner["migrate_to_chat_id"], "migrate_to_chat_id")
-        if "migrate_from_chat_id" in p.inner:
-            return _int(p.inner["migrate_from_chat_id"], "migrate_from_chat_id"), p.chat.id
+        # a message's sender is not its subject: an erased sender loses only the activity count
+        # (_message), while chat-level evidence (a migration, a giveaway) stores no sender and stays
         return None
 
     def _upsert_chat(self, chat: Chat, received: dt.datetime) -> None:
         title = chat.title or str(chat.id)
         self.conn.execute(
-            """INSERT INTO tg.chat AS c (chat_id, chat_type, title, username, metadata_due_at)
-               VALUES (%s, %s, %s, %s, %s)
+            """INSERT INTO tg.chat AS c (chat_id, chat_type, title, username, metadata_due_at, rights_due_at)
+               VALUES (%s, %s, %s, %s, %s, %s)
                ON CONFLICT (chat_id) DO UPDATE SET chat_type = excluded.chat_type, title = excluded.title,
                       username = excluded.username, updated_at = now()
                WHERE (c.chat_type, c.title, c.username) IS DISTINCT FROM
                      (excluded.chat_type, excluded.title, excluded.username)""",
-            (chat.id, chat.type, title, chat.username, received))
+            (chat.id, chat.type, title, chat.username, received, received))
 
     def _upsert_user(self, u: User, at: dt.datetime) -> None:
         names = (u.username, u.first_name, u.last_name) if self.store_names else (None, None, None)
@@ -858,38 +980,41 @@ class Ingest:
                                             invite_link_id, via_join_request, via_folder_link, old_until_date,
                                             new_until_date, source_chat_id)
                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-               ON CONFLICT (update_id, event_at) DO NOTHING RETURNING kind""",
+               ON CONFLICT (update_id, event_at) DO NOTHING RETURNING event_id, kind""",
             (chat_id, user.id, p.date, p.update_id, received, p.old.status, p.old.is_member, p.member.status,
              p.member.is_member, actor_id, actor_is_other, link_id, p.via_join_request, p.via_folder,
              p.old.until_date, p.member.until_date, raw_chat if raw_chat != chat_id else None)).fetchone()
         if row is not None:
-            kind = row[0]
+            event_id, kind = row
             label = kind if kind in EVENT_LABELS else "role"
             chat = str(chat_id)
             at = p.date.timestamp()
             fx.add(lambda: metrics.CHAT_EVENTS.labels(chat, label).inc())
             fx.add(lambda: metrics.LAST_TRANSITION.labels(chat).set(at))
-            if kind in EXIT_KINDS:
-                prev = conn.execute(
-                    """SELECT kind, event_at FROM tg.member_event
-                       WHERE chat_id = %s AND user_id = %s AND kind IN ('join', 'leave', 'kick', 'restrict_out')
-                         AND (event_at, update_id) < (%s, %s)
-                       ORDER BY event_at DESC, update_id DESC LIMIT 1""",
-                    (chat_id, user.id, p.date, p.update_id)).fetchone()
-                if prev is not None and prev[0] == "join" and p.date - prev[1] <= SHORT_STAY:
-                    fx.add(lambda: metrics.CHAT_SHORT_STAYS.labels(chat).inc())
-            if kind == "join" and p.via_join_request:
+            # An approved request: a direct one (via_join_request, no link) or one through a link that needs
+            # approval (the join carries that link). A pending request for another link stays pending.
+            if kind == "join" and (p.via_join_request or link_id is not None):
                 resolver = p.sender.id if actor_is_other and p.sender.id not in erased else None
                 hit = conn.execute(
                     """UPDATE tg.join_request SET outcome = 'approved', resolved_at = %s, resolved_by = %s
                        WHERE join_request_id = (SELECT join_request_id FROM tg.join_request
                                                 WHERE chat_id = %s AND user_id = %s AND outcome IS NULL
                                                   AND requested_at <= %s
+                                                  AND invite_link_id IS NOT DISTINCT FROM %s
                                                 ORDER BY requested_at DESC LIMIT 1)
-                       RETURNING 1""", (p.date, resolver, chat_id, user.id, p.date)).fetchone()
+                       RETURNING 1""",
+                    (p.date, resolver, chat_id, user.id, p.date, None if p.via_join_request else link_id)).fetchone()
                 if hit is not None:
                     fx.add(lambda: metrics.CHAT_JOIN_REQUESTS.labels(chat, "approved").inc())
             history.rebuild_pairs(conn, [(chat_id, user.id)])
+            if kind in EXIT_KINDS:
+                # a short stay is the rebuilt spell this exit closed, from its exact join (a migration echo
+                # absorbed by E3 is not a join)
+                spell = conn.execute("""SELECT joined_at FROM tg.membership
+                                        WHERE chat_id = %s AND user_id = %s AND left_event_id = %s""",
+                                     (chat_id, user.id, event_id)).fetchone()
+                if spell is not None and spell[0] is not None and p.date - spell[0] <= SHORT_STAY:
+                    fx.add(lambda: metrics.CHAT_SHORT_STAYS.labels(chat).inc())
         self._raw_update(p.update_id, p.date, p.type, raw_chat, user.id, p.inner, received, erased)
 
     def _my_chat_member(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int,
@@ -909,60 +1034,91 @@ class Ingest:
         self._raw_update(p.update_id, p.date, p.type, raw_chat, subject, p.inner, received, erased)
 
     def _set_bot_state(self, chat_id: int, at: dt.datetime, member: Member, source: str, fx: Effects) -> bool:
-        """The bot's status and rights in one chat as of `at`: tg.chat, coverage, not_admin / rights_lost gaps.
-        Older news than the chat's last rights check changes nothing. Returns True when the chat became
-        tracked."""
+        """The bot's status and rights in one chat as of `at` (an event's date or a check's time): tg.chat,
+        coverage, not_admin / rights_lost gaps. News older than the chat's last observation (a queued update
+        processed after the startup check) is replayed at its own time for coverage and gaps, and the newer
+        observation is then applied again from its time: the current state stays the observed one and the
+        history keeps what happened in between. The old group of a migration is left as the migration closed
+        it. Returns True when the chat became tracked."""
         conn = self.conn
-        row = conn.execute("SELECT tracked, rights_checked_at FROM tg.chat WHERE chat_id = %s FOR UPDATE",
-                           (chat_id,)).fetchone()
-        if row is None:
+        row = conn.execute(
+            """SELECT c.tracked, c.rights_checked_at, c.bot_status, c.can_invite_users, c.can_restrict_members,
+                      EXISTS (SELECT 1 FROM tg.chat_alias a WHERE a.old_chat_id = c.chat_id)
+               FROM tg.chat c WHERE c.chat_id = %s FOR UPDATE""", (chat_id,)).fetchone()
+        if row is None or row[5]:
             return False
-        was_tracked, checked_at = row
-        if checked_at is not None and at < checked_at:
-            return False
+        was_tracked, checked_at, cur_status, cur_invite, cur_restrict, _ = row
         status = member.status
         admin = status in ADMIN
         can_invite = True if status == "creator" else (bool(member.can_invite_users) if admin else None)
         can_restrict = True if status == "creator" else (bool(member.can_restrict_members) if admin else None)
         tracked = bool(was_tracked or admin)
-        conn.execute("""UPDATE tg.chat SET bot_status = %s, can_invite_users = %s, can_restrict_members = %s,
-                               rights_checked_at = %s, tracked = %s, updated_at = now() WHERE chat_id = %s""",
-                     (status, can_invite, can_restrict, at, tracked, chat_id))
-        # coverage: an open period while admin
+        if checked_at is None or at >= checked_at:
+            conn.execute("""UPDATE tg.chat SET bot_status = %s, can_invite_users = %s, can_restrict_members = %s,
+                                   rights_checked_at = %s, tracked = %s, rights_due_at = NULL, rights_attempts = 0,
+                                   updated_at = now() WHERE chat_id = %s""",
+                         (status, can_invite, can_restrict, at, tracked, chat_id))
+            self._rights_history(chat_id, at, status, can_invite, can_restrict, tracked, source)
+            chat = str(chat_id)
+            fx.add(lambda: metrics.CHAT_BOT_ADMIN.labels(chat).set(1 if admin else 0))
+            fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "invite_users").set(1 if can_invite else 0))
+            fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "restrict_members").set(1 if can_restrict else 0))
+        else:
+            conn.execute("UPDATE tg.chat SET tracked = %s, updated_at = now() WHERE chat_id = %s", (tracked, chat_id))
+            self._rights_history(chat_id, at, status, can_invite, can_restrict, tracked, source)
+            self._rights_history(chat_id, checked_at, cur_status, cur_invite, cur_restrict, tracked, "rights_check")
+        return tracked and not was_tracked
+
+    def _rights_history(self, chat_id: int, at: dt.datetime, status: str, can_invite: bool | None,
+                        can_restrict: bool | None, tracked: bool, source: str) -> None:
+        """Coverage and rights gaps from `at` on, for a bot in `status` with these rights."""
+        conn = self.conn
+        admin = status in ADMIN
         if admin:
-            open_period = conn.execute("SELECT 1 FROM tg.coverage WHERE chat_id = %s AND upper_inf(period)",
-                                       (chat_id,)).fetchone()
-            if open_period is None:
+            open_from = conn.execute("SELECT lower(period) FROM tg.coverage WHERE chat_id = %s AND upper_inf(period)",
+                                     (chat_id,)).fetchone()
+            if open_from is None:
                 conn.execute("""INSERT INTO tg.coverage (chat_id, period, source)
                                 SELECT %(c)s, tstzrange(greatest(%(at)s, max(upper(period))), NULL), %(s)s
                                 FROM tg.coverage WHERE chat_id = %(c)s""", dict(c=chat_id, at=at, s=source))
-        else:
+            elif open_from[0] > at:  # admin since earlier than the open period says (a replayed event)
+                conn.execute("""UPDATE tg.coverage SET period = tstzrange(greatest(%(at)s,
+                                    (SELECT max(upper(x.period)) FROM tg.coverage x
+                                     WHERE x.chat_id = %(c)s AND NOT upper_inf(x.period))), NULL)
+                                WHERE chat_id = %(c)s AND upper_inf(period)""", dict(c=chat_id, at=at))
+        else:  # not admin from `at`: a period covering it ends there (also one a replay's re-check closed later)
             conn.execute("DELETE FROM tg.coverage WHERE chat_id = %s AND upper_inf(period) AND lower(period) >= %s",
                          (chat_id, at))
-            conn.execute("""UPDATE tg.coverage SET period = tstzrange(lower(period), %s)
-                            WHERE chat_id = %s AND upper_inf(period)""", (at, chat_id))
-        # gaps of a tracked chat: not_admin, or rights_lost while admin without a needed right
-        if tracked:
-            want = None if (admin and can_invite and can_restrict) else ("rights_lost" if admin else "not_admin")
-            conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %s))
-                            WHERE chat_id = %s AND upper_inf(period) AND reason IN ('not_admin', 'rights_lost')
-                              AND reason IS DISTINCT FROM %s""", (at, chat_id, want))
-            if want is not None:
-                have = conn.execute("""SELECT 1 FROM tg.gap WHERE chat_id = %s AND reason = %s
-                                       AND upper_inf(period)""", (chat_id, want)).fetchone()
-                if have is None:
-                    missing = [r for r, ok in (("can_invite_users", can_invite),
-                                               ("can_restrict_members", can_restrict)) if not ok]
-                    note = (f"{source}: bot is {status}" if want == "not_admin"
-                            else f"{source}: missing {', '.join(missing)}")
-                    conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
-                                    VALUES (%s, tstzrange(%s, NULL), %s, true, %s, %s)""",
-                                 (chat_id, at, want, self.now(), note))
-        chat = str(chat_id)
-        fx.add(lambda: metrics.CHAT_BOT_ADMIN.labels(chat).set(1 if admin else 0))
-        fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "invite_users").set(1 if can_invite else 0))
-        fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "restrict_members").set(1 if can_restrict else 0))
-        return tracked and not was_tracked
+            conn.execute("""UPDATE tg.coverage SET period = tstzrange(lower(period), %(at)s)
+                            WHERE chat_id = %(c)s AND lower(period) < %(at)s
+                              AND (upper_inf(period) OR upper(period) > %(at)s)""", dict(c=chat_id, at=at))
+        if not tracked:
+            return
+        want = None if (admin and can_invite and can_restrict) else ("rights_lost" if admin else "not_admin")
+        # what no longer holds at `at` ends there: rights gaps of another reason, and every suspected one
+        conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %(at)s))
+                        WHERE chat_id = %(c)s AND reason IN ('not_admin', 'rights_lost')
+                          AND lower(period) <= %(at)s AND (upper_inf(period) OR upper(period) > %(at)s)
+                          AND (reason IS DISTINCT FROM %(want)s OR NOT confirmed)""",
+                     dict(c=chat_id, at=at, want=want))
+        if want is None:
+            return
+        held = conn.execute("""SELECT 1 FROM tg.gap WHERE chat_id = %(c)s AND reason = %(want)s AND confirmed
+                               AND lower(period) <= %(at)s AND (upper_inf(period) OR upper(period) > %(at)s)""",
+                            dict(c=chat_id, at=at, want=want)).fetchone()
+        if held is not None:
+            return
+        # a replayed event: the same gap observed later started here
+        later = conn.execute("""SELECT gap_id FROM tg.gap WHERE chat_id = %s AND reason = %s AND confirmed
+                                AND lower(period) > %s ORDER BY lower(period) LIMIT 1""",
+                             (chat_id, want, at)).fetchone()
+        if later is not None:
+            conn.execute("UPDATE tg.gap SET period = tstzrange(%s, upper(period)) WHERE gap_id = %s", (at, later[0]))
+            return
+        missing = [r for r, ok in (("can_invite_users", can_invite), ("can_restrict_members", can_restrict)) if not ok]
+        note = f"{source}: bot is {status}" if want == "not_admin" else f"{source}: missing {', '.join(missing)}"
+        conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                        VALUES (%s, tstzrange(%s, NULL), %s, true, %s, %s)""", (chat_id, at, want, self.now(), note))
 
     def _join_request(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int, erased: set[int],
                       received: dt.datetime) -> None:
@@ -978,17 +1134,16 @@ class Ingest:
             fx.add(lambda: metrics.CHAT_JOIN_REQUESTS.labels(chat, "received").inc())
         self._raw_update(p.update_id, p.date, p.type, raw_chat, p.sender.id, p.inner, received, erased)
 
-    def _message(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int,
-                 migration: tuple[int, int] | None, received: dt.datetime) -> None:
+    def _message(self, fx: Effects, p: Parsed, chat_id: int, erased: set[int], received: dt.datetime) -> None:
         msg = p.inner
         assert msg is not None and p.chat is not None
-        if migration is not None:
-            self._migrate(migration[0], migration[1], p.date, p.chat, received)
+        if p.migration is not None:
+            self._migrate(p.migration[0], p.migration[1], p.date, p.chat, received)
             return
         if p.chat.type not in ("group", "supergroup"):
             return
-        if "giveaway" in msg:
-            self._giveaway(chat_id, msg, p.date)
+        if p.giveaway is not None:
+            self._giveaway(chat_id, p)
         if SERVICE_KEYS.intersection(msg):
             return
         day = p.date.date()
@@ -998,7 +1153,7 @@ class Ingest:
                 """INSERT INTO tg.unattributed_daily AS a (chat_id, day, sender_kind, messages) VALUES (%s, %s, %s, 1)
                    ON CONFLICT (chat_id, day, sender_kind) DO UPDATE SET messages = a.messages + 1""",
                 (chat_id, day, kind))
-        elif p.sender is not None:
+        elif p.sender is not None and p.sender.id not in erased:  # an erased writer: dated before the erasure
             self._upsert_user(p.sender, p.date)
             self.conn.execute(
                 """INSERT INTO tg.activity_daily AS a (chat_id, user_id, day, messages) VALUES (%s, %s, %s, 1)
@@ -1010,34 +1165,30 @@ class Ingest:
         assert msg is not None and p.chat is not None
         if p.chat.type != "channel":
             return
-        if "giveaway" in msg:
-            self._giveaway(chat_id, msg, p.date)
+        if p.giveaway is not None:
+            self._giveaway(chat_id, p)
         if SERVICE_KEYS.intersection(msg):
             return
         self.conn.execute("""INSERT INTO tg.post (chat_id, message_id, posted_at, kind) VALUES (%s, %s, %s, %s)
                              ON CONFLICT (chat_id, message_id) DO NOTHING""",
-                          (chat_id, _int(msg.get("message_id"), "message_id"), p.date, post_kind(msg)))
+                          (chat_id, p.message_id, p.date, post_kind(msg)))
 
-    def _giveaway(self, chat_id: int, msg: dict, at: dt.datetime) -> None:
-        g = _dict(msg.get("giveaway"), "giveaway")
-        draw = _ts(g.get("winners_selection_date"), "giveaway.winners_selection_date")
-        if draw <= at:
+    def _giveaway(self, chat_id: int, p: Parsed) -> None:
+        g = p.giveaway
+        assert g is not None
+        if g.draw_at <= p.date:
             log.warning("ingest: giveaway in chat %s draws before it starts; not recorded", chat_id)
             return
-        winners = g.get("winner_count")
-        winners = winners if isinstance(winners, int) and not isinstance(winners, bool) else None
-        message_id = _int(msg.get("message_id"), "message_id")
-        chats = [_int(_dict(c, "giveaway.chats[]").get("id"), "giveaway.chats[].id") for c in g.get("chats") or []]
         row = self.conn.execute(
             """INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at, only_new_members, winner_count,
                                         post_chat_id, post_message_id)
                VALUES (%s, 'tg_giveaway', 'observation', %s, %s, %s, %s, %s, %s)
                ON CONFLICT (post_chat_id, post_message_id) DO NOTHING RETURNING campaign_id""",
-            (f"Telegram giveaway {chat_id}/{message_id}", at, draw, g.get("only_new_members") is True, winners,
-             chat_id, message_id)).fetchone()
+            (f"Telegram giveaway {chat_id}/{p.message_id}", p.date, g.draw_at, g.only_new_members, g.winner_count,
+             chat_id, p.message_id)).fetchone()
         if row is None:
             return
-        for c in sorted(set(chats) or {chat_id}):
+        for c in sorted(set(g.chats) or {chat_id}):
             self.conn.execute("INSERT INTO tg.campaign_chat (campaign_id, chat_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                               (row[0], c))
 
@@ -1069,6 +1220,8 @@ class Ingest:
             conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %s))
                             WHERE chat_id = %s AND upper_inf(period) AND reason IN ('not_admin', 'rights_lost')""",
                          (at, old))
+            # and no rights check or getChat asks about it again
+            conn.execute("UPDATE tg.chat SET rights_due_at = NULL, metadata_due_at = NULL WHERE chat_id = %s", (old,))
             log.info("ingest: chat %s migrated to %s", old, new)
         migrated_at = conn.execute("SELECT migrated_at FROM tg.chat_alias WHERE old_chat_id = %s",
                                    (old,)).fetchone()[0]
@@ -1121,13 +1274,15 @@ class Ingest:
                 return [walk(x) for x in v]
             if not isinstance(v, dict):
                 return v
-            if _is_user_dict(v) and v["id"] in erased:
+            # a person: by its position in the payload (even when the object is incomplete) or by its shape
+            person = key in USER_KEYS or _is_user_dict(v)
+            if person and v.get("id") in erased:
                 return {"erased": True}
             out: dict[str, Any] = {}
             for k, x in v.items():
                 if k in ("bio", "user_chat_id"):
                     continue
-                if not self.store_names and _is_user_dict(v) and k in ("first_name", "last_name", "username"):
+                if not self.store_names and person and k in ("first_name", "last_name", "username"):
                     continue
                 out[k] = walk(x, k)
             if key == "invite_link" and isinstance(out.get("invite_link"), str):
@@ -1147,13 +1302,14 @@ class Ingest:
         if self.ctx.api is None:
             return 0
         now = self.now()
-        due = self.conn.execute("""SELECT chat_id, metadata_attempts, rights_checked_at IS NULL FROM tg.chat
-                                   WHERE metadata_due_at <= %s AND (tracked OR rights_checked_at IS NULL)
-                                   ORDER BY metadata_due_at, chat_id LIMIT %s""",
+        due = self.conn.execute("""SELECT c.chat_id, c.metadata_attempts FROM tg.chat c
+                                   WHERE c.metadata_due_at <= %s AND (c.tracked OR c.rights_checked_at IS NULL)
+                                     AND NOT EXISTS (SELECT 1 FROM tg.chat_alias a WHERE a.old_chat_id = c.chat_id)
+                                   ORDER BY c.metadata_due_at, c.chat_id LIMIT %s""",
                                 (now, limit)).fetchall()
         self.conn.rollback()
         ok = 0
-        for chat_id, attempts, unchecked in due:
+        for chat_id, attempts in due:
             if self.ctx.stop.is_set():
                 break
             try:
@@ -1184,8 +1340,6 @@ class Ingest:
                           metadata_due_at = NULL, metadata_attempts = 0, updated_at = now()
                    WHERE chat_id = %(c)s""", f))
             ok += 1
-            if unchecked:
-                self.check_rights(chat_id)
         return ok
 
 
@@ -1201,12 +1355,16 @@ def _attribution(msg: dict, chat: Chat | None) -> str | None:
 
 def _subject_id(kind: str, inner: dict) -> int | None:
     """The subject user id of a (possibly malformed) membership payload, when it can be read."""
-    try:
-        if kind in ("chat_join_request", "my_chat_member"):
-            v = inner["from"]["id"]
-        else:
-            v = inner["new_chat_member"]["user"]["id"]
-    except (KeyError, TypeError):
-        return None
-    return v if isinstance(v, int) and not isinstance(v, bool) else None
+    if kind in ("chat_join_request", "my_chat_member"):
+        return _id_at(inner, "from", "id")
+    return _id_at(inner, "new_chat_member", "user", "id")
+
+
+USER_POSITIONS = (("from",), ("new_chat_member", "user"), ("old_chat_member", "user"), ("invite_link", "creator"))
+
+
+def _payload_user_ids(inner: dict) -> list[int]:
+    """Every person's id at the user positions of a membership payload, read even when it is malformed."""
+    ids = [_id_at(inner, *path, "id") for path in USER_POSITIONS]
+    return [i for i in ids if i is not None]
 

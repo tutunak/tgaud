@@ -832,6 +832,7 @@ DECLARE
   v_events bigint;
   v_old_coverage tstzmultirange;
   v_new_coverage tstzmultirange;
+  v_from_day date;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM tg.chat WHERE chat_id = p_new_chat_id) THEN
     RAISE EXCEPTION 'new chat % must exist before the move', p_new_chat_id;
@@ -839,6 +840,15 @@ BEGIN
   IF EXISTS (SELECT 1 FROM tg.chat_alias WHERE old_chat_id = p_old_chat_id AND moved_at IS NOT NULL) THEN
     RETURN 0;
   END IF;
+  -- the earliest UTC day whose rollup inputs move (events, samples, activity, the old rollups and marker)
+  SELECT least(p_migrated_at::date,
+               (SELECT min(event_at)::date FROM tg.member_event WHERE chat_id = p_old_chat_id),
+               (SELECT min(sampled_at)::date FROM tg.count_sample WHERE chat_id = p_old_chat_id),
+               (SELECT min(day) FROM tg.activity_daily WHERE chat_id = p_old_chat_id),
+               (SELECT min(day) FROM tg.unattributed_daily WHERE chat_id = p_old_chat_id),
+               (SELECT min(day) FROM stats.chat_day WHERE chat_id = p_old_chat_id),
+               (SELECT from_day FROM tg.rollup_dirty WHERE chat_id = p_old_chat_id))
+    INTO v_from_day;
   DELETE FROM tg.membership WHERE chat_id = p_old_chat_id;
   UPDATE tg.member_event SET chat_id = p_new_chat_id, source_chat_id = coalesce(source_chat_id, p_old_chat_id)
    WHERE chat_id = p_old_chat_id;
@@ -866,6 +876,15 @@ BEGIN
             OR (o.link_digest IS NULL AND n.link_digest IS NULL AND n.masked_link = o.masked_link
                 AND n.creator_id IS NOT DISTINCT FROM o.creator_id))
       WHERE o.chat_id = p_old_chat_id;
+    -- what only the old row knows (the owner's campaign, the name, ...) is kept on the retained row
+    UPDATE tg.invite_link n SET campaign_id = coalesce(n.campaign_id, o.campaign_id), name = coalesce(n.name, o.name),
+           is_primary = coalesce(n.is_primary, o.is_primary),
+           creates_join_request = coalesce(n.creates_join_request, o.creates_join_request),
+           subscription_price = coalesce(n.subscription_price, o.subscription_price),
+           creator_id = coalesce(n.creator_id, o.creator_id),
+           first_seen_at = least(n.first_seen_at, o.first_seen_at), last_seen_at = greatest(n.last_seen_at, o.last_seen_at)
+      FROM move_link_map m JOIN tg.invite_link o ON o.invite_link_id = m.old_id
+     WHERE n.invite_link_id = m.new_id;
     UPDATE tg.member_event e SET invite_link_id = m.new_id FROM move_link_map m
      WHERE e.chat_id = p_new_chat_id AND e.invite_link_id = m.old_id;
     UPDATE tg.join_request j SET invite_link_id = m.new_id FROM move_link_map m
@@ -883,6 +902,14 @@ BEGIN
                                              AND n.outcome = 'pending');
   UPDATE tg.probe SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
   UPDATE tg.reconcile_run SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  -- a request both ids hold: the retained row takes the old one's resolution and link when it has none
+  UPDATE tg.join_request n SET outcome = coalesce(n.outcome, o.outcome),
+         resolved_at = CASE WHEN n.outcome IS NULL THEN o.resolved_at ELSE n.resolved_at END,
+         resolved_by = CASE WHEN n.outcome IS NULL THEN o.resolved_by ELSE n.resolved_by END,
+         invite_link_id = coalesce(n.invite_link_id, o.invite_link_id), update_id = coalesce(n.update_id, o.update_id)
+    FROM tg.join_request o
+   WHERE o.chat_id = p_old_chat_id AND n.chat_id = p_new_chat_id AND n.user_id = o.user_id
+     AND n.requested_at = o.requested_at;
   DELETE FROM tg.join_request o WHERE o.chat_id = p_old_chat_id
      AND EXISTS (SELECT 1 FROM tg.join_request n WHERE n.chat_id = p_new_chat_id AND n.user_id = o.user_id
                                                    AND n.requested_at = o.requested_at);
@@ -912,9 +939,7 @@ BEGIN
     VALUES (p_old_chat_id, p_new_chat_id, p_migrated_at, now())
   ON CONFLICT (old_chat_id) DO UPDATE SET chat_id = excluded.chat_id, moved_at = excluded.moved_at;
   DELETE FROM tg.chat WHERE chat_id = p_old_chat_id;
-  INSERT INTO tg.rollup_dirty (chat_id, from_day)
-    SELECT p_new_chat_id, coalesce(min(event_at)::date, p_migrated_at::date) FROM tg.member_event
-     WHERE chat_id = p_new_chat_id
+  INSERT INTO tg.rollup_dirty (chat_id, from_day) VALUES (p_new_chat_id, v_from_day)
   ON CONFLICT (chat_id) DO UPDATE SET from_day = least(tg.rollup_dirty.from_day, excluded.from_day), marked_at = now();
   RETURN v_events;
 END $$;

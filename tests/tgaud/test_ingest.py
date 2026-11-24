@@ -12,7 +12,7 @@ import psycopg
 import pytest
 from botapi_fake import BOT_ID, FakeBotApi
 
-from tgaud import config, db, metrics, sql
+from tgaud import config, db, history, metrics, sql
 from tgaud.jobs import JobContext, StartupError
 from tgaud.jobs import ingest
 
@@ -266,28 +266,64 @@ def test_kick_by_an_admin_restriction_and_folder_join(h):
     assert h.q("SELECT user_id FROM tg.tg_user") == [(42,)]
 
 
-def test_short_stays_are_counted_for_exits_within_48_hours_of_an_exact_join(h):
+def fake_rebuild(conn, pairs):
+    """A stand-in for the history task's rebuild (a stub in this base): one spell per join .. exit from the
+    events, a join while already in absorbed (as E3 absorbs a migration echo)."""
+    for chat, user in pairs:
+        conn.execute("DELETE FROM tg.membership WHERE chat_id = %s AND user_id = %s", (chat, user))
+        start = None
+        for eid, at, kind in conn.execute("""SELECT event_id, event_at, kind FROM tg.member_event
+                                             WHERE chat_id = %s AND user_id = %s ORDER BY event_at, update_id""",
+                                          (chat, user)).fetchall():
+            if kind == "join" and start is None:
+                start = (eid, at)
+            elif kind in ("leave", "kick", "restrict_out") and start is not None:
+                conn.execute(
+                    """INSERT INTO tg.membership (chat_id, user_id, start_source, joined_at, join_event_id, known_from,
+                                                  join_route, last_confirmed_at, end_source, end_reason, left_at,
+                                                  left_event_id, left_after, left_before)
+                       VALUES (%s, %s, 'event', %s, %s, %s, 'unattributed', %s, 'event', 'left', %s, %s, %s, %s)""",
+                    (chat, user, start[1], start[0], start[1], start[1], at, eid, at, at))
+                start = None
+    return history.RebuildResult()
+
+
+def test_short_stays_come_from_the_rebuilt_spell_this_exit_closed(h, monkeypatch):
+    monkeypatch.setattr(history, "rebuild_pairs", fake_rebuild)
     tracked_channel(h)
     chat = str(CHANNEL["id"])
     before = sample("tgaud_chat_short_stays_total", chat=chat)
-    h.poll(chat_member(10, 42, T0 - dt.timedelta(hours=30)), chat_member(11, 42, T0 - dt.timedelta(hours=2), "member", "left"),
+    h.poll(chat_member(10, 42, T0 - dt.timedelta(hours=30)),
+           chat_member(11, 42, T0 - dt.timedelta(hours=2), "member", "left"),
            chat_member(12, 43, T0 - dt.timedelta(hours=1), "member", "left"))  # 43: no join seen
     assert sample("tgaud_chat_short_stays_total", chat=chat) == before + 1
-    assert sample("tgaud_chat_events_total", chat=chat, kind="leave") >= 2
+    # a member of three days with a migration-style echo join 3 h ago: the stay is not short
+    h.poll(chat_member(13, 44, T0 - dt.timedelta(days=3)), chat_member(14, 44, T0 - dt.timedelta(hours=3)),
+           chat_member(15, 44, T0 - dt.timedelta(hours=1), "member", "left"))
+    assert sample("tgaud_chat_short_stays_total", chat=chat) == before + 1
+    assert sample("tgaud_chat_events_total", chat=chat, kind="leave") >= 3
 
 
-def test_join_request_then_its_approval(h):
+def test_join_requests_are_approved_by_the_matching_join(h):
     tracked_channel(h)
     req_at = T0 - dt.timedelta(hours=2)
-    h.poll(join_request(10, 42, req_at, link=masked_link()))
-    jr = h.one("SELECT chat_id, user_id, requested_at, update_id, outcome, invite_link_id IS NOT NULL FROM tg.join_request")
-    assert jr == (CHANNEL["id"], 42, req_at, 10, None, True)
+    approved = T0 - dt.timedelta(hours=1)
+    approval_link = dict(masked_link(), name="approval link", creates_join_request=True)
+    other_link = dict(approval_link, invite_link="https://t.me/+ZzYy…", name="other link")
+    h.poll(join_request(10, 42, req_at),                          # a direct request, no link
+           join_request(11, 43, req_at, link=approval_link),       # through a link that needs approval
+           join_request(12, 44, req_at, link=other_link))
+    rows = h.q("SELECT user_id, outcome, invite_link_id IS NOT NULL FROM tg.join_request ORDER BY user_id")
+    assert rows == [(42, None, False), (43, None, True), (44, None, True)]
     raw = h.one("SELECT payload FROM tg.raw_update WHERE update_id = 10")
     assert "bio" not in raw and "user_chat_id" not in raw
-    approved = T0 - dt.timedelta(hours=1)
-    h.poll(chat_member(11, 42, approved, actor=ADMIN, via_join_request=True, link=masked_link()))
-    assert h.one("SELECT outcome, resolved_at, resolved_by FROM tg.join_request") == ("approved", approved, ADMIN)
-    assert h.one("SELECT via_join_request, actor_is_other FROM tg.member_event") == (True, True)
+    h.poll(chat_member(13, 42, approved, actor=ADMIN, via_join_request=True),   # Telegram: direct, no link
+           chat_member(14, 43, approved, actor=ADMIN, link=approval_link),      # Telegram: the link, no flag
+           chat_member(15, 44, approved, actor=ADMIN, link=approval_link))      # requested via another link
+    assert h.q("SELECT user_id, outcome, resolved_at, resolved_by FROM tg.join_request ORDER BY user_id") == [
+        (42, "approved", approved, ADMIN), (43, "approved", approved, ADMIN), (44, None, None, None)]
+    assert h.q("SELECT user_id, via_join_request, actor_is_other FROM tg.member_event ORDER BY user_id") == [
+        (42, True, True), (43, False, True), (44, False, True)]
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -795,3 +831,247 @@ def test_run_polls_until_the_stop(h):
     assert not t.is_alive()
     assert h.q("SELECT update_id FROM tg.member_event") == [(10,)]
     assert h.ctx.health.check()[0] == 200
+
+
+# ------------------------------------------------------------------------------------------------------------
+# review round 1 regressions
+# ------------------------------------------------------------------------------------------------------------
+
+
+def erase(h: Harness, *ids: int, at: dt.datetime = T0) -> None:
+    with psycopg.connect(h.dsn, autocommit=True) as c:
+        for i in ids:
+            c.execute("INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(%s), %s)", (i, at))
+
+
+def test_malformed_payloads_drop_erased_people_and_names_by_position(make):
+    h = make(store_names=False).start()
+    tracked_channel(h)
+    erase(h, ADMIN, 47)
+    before = T0 - dt.timedelta(minutes=10)
+    # an old member update (bad status) whose actor and link creator are the erased admin, and whose member
+    # object lacks is_bot
+    bad = chat_member(10, 42, before, actor=ADMIN, link=masked_link())
+    bad["chat_member"]["new_chat_member"]["status"] = "banned"
+    del bad["chat_member"]["new_chat_member"]["user"]["is_bot"]
+    # a request without a usable date: every erasure counts (47 is the subject: no raw at all)
+    undated = join_request(11, 47, before)
+    undated["chat_join_request"]["date"] = "soon"
+    undated_other = join_request(12, 48, before, link=masked_link())
+    undated_other["chat_join_request"]["date"] = None
+    h.poll(bad, undated, undated_other)
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "malformed"), (12, "malformed")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id >= 10"))
+    assert set(raw) == {10, 12}
+    assert raw[10]["from"] == {"erased": True} and raw[10]["invite_link"]["creator"] == {"erased": True}
+    assert raw[10]["new_chat_member"]["user"] == {"id": 42, "language_code": "en"}
+    assert raw[12]["invite_link"]["creator"] == {"erased": True}
+    assert "Name48" not in str(raw[12]) and str(USER_CHAT_ID) not in str(raw[12])
+
+
+def test_a_link_without_a_creator_or_an_unmasked_foreign_link_is_malformed(h):
+    tracked_channel(h)
+    no_creator = bot_link()
+    del no_creator["creator"]
+    foreign_full = dict(masked_link(), invite_link="https://t.me/+FOREIGNfulltoken")
+    h.poll(chat_member(10, 42, T0, link=no_creator), chat_member(11, 43, T0, link=foreign_full),
+           chat_member(12, 44, T0))
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "malformed"), (12, "chat_member")]
+    assert h.q("SELECT count(*) FROM tg.invite_link") == [(0,)]
+    dump = str(h.q("SELECT payload FROM tg.raw_update"))
+    assert BOT_LINK not in dump and "FOREIGNfulltoken" not in dump
+    assert h.q("SELECT update_id FROM tg.member_event") == [(12,)]
+
+
+def test_a_program_error_in_a_body_rolls_back_and_propagates(h, monkeypatch):
+    tracked_channel(h)
+
+    def broken(conn, pairs):
+        raise RuntimeError("rebuild bug")
+
+    monkeypatch.setattr(history, "rebuild_pairs", broken)
+    with pytest.raises(RuntimeError, match="rebuild bug"):
+        h.poll(chat_member(10, 42, T0))
+    assert h.q("SELECT count(*) FROM tg.update_receipt WHERE update_id = 10") == [(0,)]
+    assert h.q("SELECT count(*) FROM tg.member_event") == [(0,)]
+    assert h.one("SELECT next_offset FROM tg.bot_state") == 2
+    monkeypatch.undo()
+    h.restart()
+    h.poll(chat_member(10, 42, T0))
+    assert h.q("SELECT update_id FROM tg.member_event") == [(10,)]
+    assert h.q("SELECT update_type FROM tg.update_receipt WHERE update_id = 10") == [("chat_member",)]
+
+
+def test_ids_outside_bigint_are_malformed_not_a_database_wedge(h):
+    tracked_channel(h)
+    huge_chat = chat_member(10, 42, T0, chat=dict(CHANNEL, id=-(2 ** 70)))
+    huge_user = chat_member(11, 2 ** 64, T0)
+    h.poll(huge_chat, huge_user, chat_member(12, 44, T0))
+    assert h.q("SELECT update_id, update_type, chat_id FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed", None), (11, "malformed", CHANNEL["id"]), (12, "chat_member", CHANNEL["id"])]
+    assert h.q("SELECT update_id FROM tg.member_event") == [(12,)]
+    assert h.one("SELECT next_offset FROM tg.bot_state") == 13
+
+
+def window_flags(h: Harness, chat: int, lo: dt.datetime, hi: dt.datetime):
+    return h.one("SELECT tg.window_flags(%s, tstzrange(%s, %s))", chat, lo, hi)
+
+
+@pytest.mark.parametrize("crash_between", [False, True])
+def test_queued_rights_changes_replay_at_their_times_after_the_startup_check(h, crash_between):
+    start = T0 - dt.timedelta(hours=2)
+    tracked_channel(h, at=start)
+    e1, e2 = T0 + dt.timedelta(minutes=1), T0 + dt.timedelta(minutes=3)
+    # the service stops; meanwhile the bot loses admin (e1) and gets it back (e2); the restart checks at T0+6m
+    h.clock.advance(minutes=6)
+    check = h.clock.now
+    h.fake.ok("getChatMember", member(BOT_ID, "administrator", **admin_rights()))
+    h.restart()
+    demoted = my_chat_member(2, e1, "member", "administrator")
+    promoted = my_chat_member(3, e2, "administrator", "member")
+    if crash_between:
+        h.ing.before_commit = lambda update_id: (_ for _ in ()).throw(Crash()) if update_id == 3 else None
+        with pytest.raises(Crash):
+            h.poll(demoted, promoted)
+        h.clock.advance(minutes=1)
+        h.fake.ok("getChatMember", member(BOT_ID, "administrator", **admin_rights()))
+        h.restart()
+        h.poll(promoted)
+    else:
+        h.poll(demoted, promoted)
+    assert h.q("SELECT lower(period), upper(period) FROM tg.coverage ORDER BY lower(period)") == [
+        (start, e1), (e2, None)]
+    assert h.q("SELECT reason, confirmed, lower(period), upper(period) FROM tg.gap") == [
+        ("not_admin", True, e1, e2)]
+    assert window_flags(h, CHANNEL["id"], e1, e2) is not None
+    assert window_flags(h, CHANNEL["id"], e2, check) is None
+    assert h.one("SELECT bot_status, rights_checked_at >= %s FROM tg.chat", check) == ("administrator", True)
+
+
+def test_a_promotion_and_demotion_while_stopped_replay_after_a_not_admin_check(h):
+    start = T0 - dt.timedelta(hours=2)
+    removed = T0 - dt.timedelta(hours=1)
+    tracked_channel(h, at=start)
+    h.poll(my_chat_member(2, removed, "member", "administrator"))
+    e1, e2 = T0 + dt.timedelta(minutes=1), T0 + dt.timedelta(minutes=3)
+    h.clock.advance(minutes=6)
+    check = h.clock.now
+    h.fake.ok("getChatMember", member(BOT_ID, "member"))
+    h.restart()
+    h.poll(my_chat_member(3, e1, "administrator", "member"), my_chat_member(4, e2, "member", "administrator"))
+    assert h.q("SELECT lower(period), upper(period) FROM tg.coverage ORDER BY lower(period)") == [
+        (start, removed), (e1, e2)]
+    assert h.q("SELECT reason, lower(period), upper(period) FROM tg.gap ORDER BY lower(period)") == [
+        ("not_admin", removed, e1), ("not_admin", e2, None)]
+    assert h.one("SELECT bot_status, rights_checked_at FROM tg.chat") == ("member", check)
+
+
+def test_a_failed_startup_check_is_retried_and_doubted_until_resolved(make):
+    h = make().start()
+    tracked_channel(h)
+    h.clock.advance(hours=25)  # an outage: the bot was removed meanwhile, the update is gone
+    h.fake.error("getChatMember", 500, "Internal Server Error")
+    h.restart()
+    failed_at = h.clock.now
+    assert h.one("SELECT bot_status, rights_attempts, rights_due_at > %s FROM tg.chat", failed_at) == (
+        "administrator", 1, True)
+    assert h.q("SELECT reason, confirmed, lower(period), upper(period) FROM tg.gap WHERE chat_id IS NOT NULL") == [
+        ("not_admin", False, failed_at, None)]
+    h.poll()
+    assert window_flags(h, CHANNEL["id"], failed_at, failed_at + dt.timedelta(seconds=10)) is not None
+    assert h.ing.refresh_rights() == 0  # not due yet
+    h.clock.advance(seconds=31)
+    h.fake.error("getChatMember", 403, "Forbidden: bot was kicked from the channel chat")
+    assert h.ing.refresh_rights() == 1
+    resolved = h.clock.now
+    assert h.one("SELECT bot_status, rights_due_at, rights_attempts FROM tg.chat") == ("kicked", None, 0)
+    assert h.q("""SELECT reason, confirmed, lower(period), upper(period) FROM tg.gap WHERE chat_id IS NOT NULL
+                  ORDER BY lower(period)""") == [
+        ("not_admin", False, failed_at, resolved), ("not_admin", True, resolved, None)]
+    assert h.q("SELECT upper(period) FROM tg.coverage") == [(resolved,)]
+
+
+def test_a_previous_list_without_chat_member_records_updates_not_allowed(make):
+    h = make().start()
+    tracked_channel(h, at=T0 - dt.timedelta(days=3))
+    with psycopg.connect(h.dsn, autocommit=True) as c:
+        c.execute("UPDATE tg.bot_state SET allowed_updates = '{message,my_chat_member}'")
+    h.clock.advance(hours=1)
+    h.restart()
+    assert h.q("SELECT chat_id, reason, lower(period), upper(period) FROM tg.gap "
+               "WHERE reason = 'updates_not_allowed'") == [(None, "updates_not_allowed", T0 - dt.timedelta(days=3), None)]
+    assert h.one("SELECT allowed_updates FROM tg.bot_state") == list(ingest.ALLOWED_UPDATES)
+    h.clock.advance(seconds=5)
+    h.poll()
+    assert h.q("SELECT upper(period) FROM tg.gap WHERE reason = 'updates_not_allowed'") == [(h.clock.now,)]
+    h.restart()  # the full list is stored now: no new gap
+    h.poll()
+    assert h.q("SELECT count(*) FROM tg.gap WHERE reason = 'updates_not_allowed'") == [(1,)]
+
+
+def test_m2_restart_never_checks_the_old_group_and_m1_moves_no_open_gap(h):
+    t = T0 - dt.timedelta(hours=5)
+    tracked_channel(h, upd=1, chat=BASIC, at=t)
+    mig = T0 - dt.timedelta(hours=2)
+    h.poll(migrate_to(2, mig))
+    h.fake.error("getChatMember", 400, "Bad Request: group chat was upgraded to a supergroup chat", times=3)
+    h.restart()
+    assert [c.params["chat_id"] for c in h.fake.calls_of("getChatMember")] == []
+    assert h.one("SELECT rights_due_at, metadata_due_at FROM tg.chat WHERE chat_id = %s", BASIC["id"]) == (None, None)
+    h.poll(my_chat_member(3, T0 - dt.timedelta(minutes=30), chat=NEW_SG))
+    assert h.q("SELECT chat_id FROM tg.chat") == [(NEW_SG["id"],)]
+    assert h.q("SELECT count(*) FROM tg.gap WHERE upper_inf(period)") == [(0,)]
+    assert h.q("SELECT lower(period), upper(period) FROM tg.coverage ORDER BY 1") == [
+        (t, mig), (T0 - dt.timedelta(minutes=30), None)]
+
+
+def test_an_erased_sender_keeps_chat_level_evidence(h):
+    t = T0 - dt.timedelta(hours=5)
+    tracked_channel(h, upd=1, chat=BASIC, at=t)
+    tracked_channel(h, upd=2, chat=GROUP, at=t)
+    erase(h, ADMIN)
+    before = T0 - dt.timedelta(hours=1)
+    draw = T0 + dt.timedelta(days=1)
+    h.poll(migrate_to(3, before),
+           message(4, before, chat=GROUP, uid=ADMIN, mid=8, text=TEXT,
+                   giveaway={"chats": [GROUP], "winners_selection_date": ts(draw), "winner_count": 1}),
+           message(5, before, chat=GROUP, uid=ADMIN, mid=9, text=TEXT))
+    assert h.q("SELECT old_chat_id, chat_id FROM tg.chat_alias") == [(BASIC["id"], NEW_SG["id"])]
+    assert h.q("SELECT post_chat_id, post_message_id FROM tg.campaign") == [(GROUP["id"], 8)]
+    assert h.q("SELECT count(*) FROM tg.activity_daily") == [(0,)]
+    assert h.q("SELECT count(*) FROM tg.tg_user") == [(0,)]
+
+
+def test_move_chat_history_keeps_what_only_the_source_rows_know(migrated_dsn):
+    old, new = -400002, -1004000000002
+    a, b, c = (T0 - dt.timedelta(days=n) for n in (10, 5, 1))
+    with psycopg.connect(migrated_dsn) as conn:
+        conn.execute("SELECT tg.ensure_partitions('member_event', 'month', %s, %s)", (a, T0))
+        conn.execute("INSERT INTO tg.chat (chat_id, chat_type, title, tracked) VALUES (%s, 'group', 'o', true), "
+                     "(%s, 'supergroup', 'n', true)", (old, new))
+        conn.execute("INSERT INTO tg.tg_user (user_id, first_seen_at, last_seen_at) VALUES (1, %s, %s)", (a, a))
+        camp = conn.execute("""INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at)
+                               VALUES ('owner', 'giveaway', 'annotation', %s, %s) RETURNING campaign_id""",
+                            (a, b)).fetchone()[0]
+        conn.execute("""INSERT INTO tg.invite_link (chat_id, masked_link, creator_id, name, campaign_id)
+                        VALUES (%s, 'm…', 7, 'owner label', %s), (%s, 'm…', 7, NULL, NULL)""", (old, camp, new))
+        conn.execute("""INSERT INTO tg.join_request (chat_id, user_id, requested_at, outcome, resolved_at, resolved_by)
+                        VALUES (%s, 1, %s, 'approved', %s, 7), (%s, 1, %s, NULL, NULL, NULL)""", (old, b, c, new, b))
+        # rollup inputs older than any event: a count sample and activity of the old id
+        conn.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events) "
+                     "VALUES (%s, %s, 10, 9, 0)", (old, a))
+        conn.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, 1, %s, 2)",
+                     (old, (a + dt.timedelta(days=1)).date()))
+        conn.execute("""INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status,
+                                                     actor_is_other) VALUES (%s, 1, %s, 1, 'left', 'member', false)""",
+                     (old, b))
+        conn.execute("INSERT INTO tg.rollup_dirty (chat_id, from_day) VALUES (%s, %s)", (new, c.date()))
+        conn.execute("SELECT tg.move_chat_history(%s, %s, %s)", (old, new, c))
+        assert conn.execute("SELECT chat_id, name, campaign_id FROM tg.invite_link").fetchall() == [
+            (new, "owner label", camp)]
+        assert conn.execute("SELECT chat_id, outcome, resolved_at, resolved_by FROM tg.join_request").fetchall() == [
+            (new, "approved", c, 7)]
+        assert conn.execute("SELECT from_day FROM tg.rollup_dirty WHERE chat_id = %s", (new,)).fetchone()[0] == a.date()
+        conn.rollback()

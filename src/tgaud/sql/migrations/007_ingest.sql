@@ -17,3 +17,20 @@ COMMENT ON COLUMN tg.chat.metadata_attempts IS
   'Failed getChat attempts since the last success (the backoff of metadata_due_at); 0 after a success.';
 
 CREATE INDEX chat_metadata_due ON tg.chat (metadata_due_at) WHERE metadata_due_at IS NOT NULL;
+
+------------------------------------------------------------------------------------------------------------
+-- Rights check queue
+------------------------------------------------------------------------------------------------------------
+
+ALTER TABLE tg.chat ADD COLUMN rights_due_at timestamptz;
+COMMENT ON COLUMN tg.chat.rights_due_at IS
+  'When ingest should check the bot''s rights here (getChatMember(chat, bot)); NULL = nothing pending. Set for '
+  'every tracked chat at startup and for a chat first seen; a failed check is retried with backoff, and until a '
+  'check or a newer my_chat_member resolves it the chat carries a suspected not_admin gap (confirmed false). '
+  'Never set for the old group of a migration.';
+
+ALTER TABLE tg.chat ADD COLUMN rights_attempts integer NOT NULL DEFAULT 0 CHECK (rights_attempts >= 0);
+COMMENT ON COLUMN tg.chat.rights_attempts IS
+  'Failed rights checks since the last success (the backoff of rights_due_at); 0 after a success.';
+
+CREATE INDEX chat_rights_due ON tg.chat (rights_due_at) WHERE rights_due_at IS NOT NULL;
