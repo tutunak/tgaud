@@ -313,6 +313,84 @@ def test_join_leave_join_in_one_second_is_one_rejoin(migrated_dsn, mode, rebuilt
         assert [(r["rejoins"], r["users"]) for r in res.dicts()] == [(1, 1)]
 
 
+def _censored(c, chat: int, user: int, leave: tuple[int, str]) -> None:
+    """E6: the first retained event is a leave: an inferred stay that starts and ends at that exit."""
+    c.execute("INSERT INTO tg.membership (chat_id, user_id, start_source, known_from, last_confirmed_at, end_source, "
+              "end_reason, left_event_id, left_at, left_after, left_before) VALUES (%s, %s, 'inferred', %s, %s, 'event', "
+              "'left', %s, %s, %s, %s)", (chat, user, leave[1], leave[1], leave[0], leave[1], leave[1], leave[1]))
+
+
+@pytest.mark.parametrize("censored_first", [True, False], ids=["censored-spell-first", "join-spell-first"])
+@pytest.mark.parametrize("mode", ["full", "chat"])
+def test_a_rejoin_in_the_second_of_a_left_censored_exit_is_counted(migrated_dsn, mode, censored_first):
+    """The retained history starts with a leave (E6); a larger update id rejoins in the same second."""
+    t = "2026-11-20 10:00:00+00"
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c)
+        left = _event(c, -100777, 1, t, 101, "member", "left")
+        joined = _event(c, -100777, 1, t, 102, "left", "member")
+        if censored_first:
+            _censored(c, -100777, 1, (left, t))
+            _stay(c, -100777, 1, (joined, t))
+        else:
+            _stay(c, -100777, 1, (joined, t))
+            _censored(c, -100777, 1, (left, t))
+        c.commit()
+        rollups.refresh_chat_days(c, [-100777], NOW, mode=mode)
+        row = c.execute("SELECT joins, rejoins FROM stats.chat_day WHERE chat_id = -100777 AND day = '2026-11-20'"
+                        ).fetchone()
+        assert row == (1, 1)
+        res = sql.run(c, "10a", as_of="2026-11-23 12:00+00", since="2026-11-01", scope=[-100777]).dicts()
+        assert [(r["rejoins"], r["observed"], r["possible"]) for r in res] == [(1, 1, 0)]  # the observed join, not E6
+
+
+def _migrate_c(dsn: str) -> int:
+    """M1 in its own session: C moves to a new supergroup (the old chat and its daily rows are deleted)."""
+    new_chat = -1001999999998
+    with psycopg.connect(dsn) as m1:
+        m1.execute("INSERT INTO tg.chat (chat_id, chat_type, title, tracked) VALUES (%s, 'supergroup', 'new', true)",
+                   (new_chat,))
+        m1.execute("SELECT tg.move_chat_history(%s, %s, '2026-11-23 11:00+00')", (C, new_chat))
+        m1.commit()
+    return new_chat
+
+
+def test_a_migration_committed_between_the_target_and_the_write_leaves_no_rows_for_the_old_chat(clone):
+    dsn = clone()
+    with psycopg.connect(dsn) as c:
+        rollups.refresh_chat_days(c, tracked(c), NOW)
+        c.commit()
+    new_chat: list[int] = []
+    with HookConnection.connect(dsn) as c:
+        c.after = lambda q: (not new_chat and q.lstrip().startswith("CREATE TEMP TABLE chat_day_target")
+                             and new_chat.append(_migrate_c(dsn)))
+        with pytest.raises(psycopg.errors.ForeignKeyViolation):                 # the step fails, the job retries
+            rollups.refresh_chat_days(c, [C], NOW)
+        c.after = None
+        c.rollback()
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (C,)).fetchone()[0] == 0
+        # the retry: the old chat is gone (no target), the new one is built from the marker the move left
+        res = rollups.refresh_chat_days(c, [C, new_chat[0]], NOW)
+        assert list(res.from_days) == [new_chat[0]] and res.markers_cleared == 1
+        c.commit()
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (C,)).fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (new_chat[0],)).fetchone()[0] > 0
+        assert c.execute("SELECT count(*) FROM tg.rollup_dirty").fetchone()[0] == 0
+
+
+def test_a_migration_committed_after_the_write_takes_the_daily_rows_with_the_chat(clone):
+    dsn = clone()
+    with psycopg.connect(dsn) as c:
+        rollups.refresh_chat_days(c, tracked(c), NOW)
+        c.commit()
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (C,)).fetchone()[0] > 0
+        _migrate_c(dsn)
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (C,)).fetchone()[0] == 0
+        c.rollback()
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id NOT IN (SELECT chat_id FROM tg.chat)"
+                         ).fetchone()[0] == 0
+
+
 def test_the_residual_compares_the_count_with_the_events_between_the_same_samples(migrated_dsn):
     """Three day-end samples and a 23:58 join after the middle one: no false residual on either day."""
     chat = -100777

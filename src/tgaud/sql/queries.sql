@@ -416,11 +416,9 @@ WHERE m.known_from >= :'since_ts' AND m.known_from < :'as_of_ts' AND m.chat_id =
                   WHERE p.chat_id = m.chat_id       -- opening event's order (update_id) decides; events come
                     AND p.user_id = m.user_id       -- before sightings and probes
                     AND p.known_from = m.known_from AND p.membership_id <> m.membership_id
-                    AND (coalesce((SELECT pe.update_id FROM tg.member_event pe
-                                    WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), 9223372036854775807),
+                    AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
                          p.membership_id)
-                      < (coalesce((SELECT me.update_id FROM tg.member_event me
-                                    WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), 9223372036854775807),
+                      < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
                          m.membership_id)))
 GROUP BY m.chat_id ORDER BY m.chat_id;
 \endif
@@ -723,7 +721,7 @@ SELECT :'only' IN ('R1') AS run \gset
 --  * joins, exits, net, short_stays, rejoins, corrections: calendar (UTC) day of the event. A rejoin is a stay
 --    with an earlier stay of the same person in the chat; at the same instant the opening event's order
 --    (event_at, update_id) decides, so join, leave, join in one second counts one rejoin, whatever the
---    spells' ids.
+--    spells' ids. A left-censored spell (inferred start at its own exit, E6) is ordered by that exit event.
 --  * reported_eod, known_eod, sample_at: the day's last count sample at or before as_of. sample_net: exact joins
 --    minus exact exits in (previous day's sample, this day's sample], so the residual (v_chat_day) compares
 --    Telegram's count with the events between the same two samples, not with the calendar day.
@@ -777,11 +775,9 @@ WITH grid AS (
                              OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
                                           AND p.user_id = m.user_id AND p.known_from = m.known_from
                                           AND p.membership_id <> m.membership_id
-                                          AND (coalesce((SELECT pe.update_id FROM tg.member_event pe
-                                                          WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), 9223372036854775807),
+                                          AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
                                                p.membership_id)
-                                            < (coalesce((SELECT me.update_id FROM tg.member_event me
-                                                          WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), 9223372036854775807),
+                                            < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
                                                m.membership_id))) AS rejoins,
          count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                             m.joined_at + interval '48 hours') = 'out') AS short_stays
@@ -892,11 +888,9 @@ WITH grid AS (
                                OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
                                             AND p.user_id = m.user_id AND p.known_from = m.known_from
                                             AND p.membership_id <> m.membership_id
-                                            AND (coalesce((SELECT pe.update_id FROM tg.member_event pe
-                                                            WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), 9223372036854775807),
+                                            AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
                                                  p.membership_id)
-                                              < (coalesce((SELECT me.update_id FROM tg.member_event me
-                                                            WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), 9223372036854775807),
+                                              < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
                                                  m.membership_id))) AS rejoins,
            count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                               m.joined_at + interval '48 hours') = 'out') AS short_stays

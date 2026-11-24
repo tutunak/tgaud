@@ -44,6 +44,17 @@ COMMENT ON COLUMN stats.chat_day.unsure_started IS
   'unsure human stays that begin on this day: bounded exits whose left_after falls on it, and open stays whose '
   'suspect_since falls on it';
 
+------------------------------------------------------------------------------------------------------------
+-- A daily row belongs to an existing chat
+------------------------------------------------------------------------------------------------------------
+-- tg.move_chat_history deletes the old chat and its daily rows. R1 captures its targets first and writes later,
+-- so without this it could write rows under the deleted id after the move committed, and nothing would clear
+-- them. With the key, the write fails (the job retries) or, when the move comes second, the delete cascades.
+
+DELETE FROM stats.chat_day d WHERE NOT EXISTS (SELECT 1 FROM tg.chat c WHERE c.chat_id = d.chat_id);
+ALTER TABLE stats.chat_day ADD CONSTRAINT chat_day_chat_fkey
+  FOREIGN KEY (chat_id) REFERENCES tg.chat ON UPDATE CASCADE ON DELETE CASCADE;
+
 DROP VIEW stats.v_chat_day;
 CREATE VIEW stats.v_chat_day AS
 SELECT d.*, d.reported_eod - lag(d.reported_eod) OVER w AS reported_change,
