@@ -495,7 +495,8 @@ def test_the_requeue_trigger_keeps_one_pending_probe_at_the_higher_priority_and_
     w.probe(2, sent + timedelta(seconds=2), "in", sent=sent, reason="manual")
     w.probe(3, sent + timedelta(seconds=2), "out", sent=sent, reason="outage")
     low2 = queue(e, 2, "sample")  # pending below the manual answer, in backoff after a failure
-    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s", (START, low2))
+    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                (START, START + timedelta(minutes=1), low2))
     high3 = queue(e, 3, "conflict")  # pending above the outage answer: it already asks the question
     w.c.commit()
     before = [(2, "sample", 1), (3, "conflict", 0)]
@@ -531,7 +532,8 @@ def test_a_straddled_manual_answer_outranks_a_pending_probe_in_backoff(env):
     t.join(10)
     assert not t.errors and probe_row(e, pid)["outcome"] == "out"  # the answer commits first
     low = queue(e, 1, "sample")  # later a routine probe of the pair fails once: in backoff for a minute
-    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s", (e.clock.now, low))
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (e.clock.now, e.clock.now + timedelta(minutes=1), low))
     e.w.c.commit()
     _ingest_join(e.dsn, 1, START.replace(microsecond=0) + timedelta(seconds=1), 930001)  # dated inside the call
     assert _pending(e.dsn) == [(1, "manual", 0)]
@@ -647,8 +649,8 @@ def test_an_outage_probe_out_of_its_backoff_is_asked_at_its_place(env):
     e = env
     _outage_backlog(e)
     pid = queue(e, 301, "outage", queued=START - timedelta(hours=2))
-    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s",
-                  (START - timedelta(seconds=30), pid))
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=30), START + timedelta(seconds=30), pid))
     e.w.c.commit()
     answer(e)
     p = prober.make(e.ctx)
@@ -659,70 +661,6 @@ def test_an_outage_probe_out_of_its_backoff_is_asked_at_its_place(env):
     e.run(p, 2.0)
     assert asked(e)[n] == (CHAT, 301)
     assert probe_row(e, pid)["outcome"] == "in"
-
-
-def test_a_failure_is_cached_until_its_backoff_ends_and_own_answers_rank_nothing_again(env, monkeypatch):
-    """The fix's bookkeeping: the job's own answers and failures leave the outage set it expects in step with the
-    database (no ranking again while nothing else changes); a probe that failed is asked again when its backoff ends,
-    at its place; one change by someone else ranks the chat again once."""
-    e = env
-    _outage_backlog(e)
-    e.w.c.commit()
-    failed = {200: 0}
-
-    def compute(params):
-        if params["user_id"] == 200 and failed[200] == 0:
-            failed[200] += 1
-            return None  # an answer without a status: a failure (attempt 1, backoff 60 s)
-        return {"status": "member", "user": {"id": params["user_id"], "is_bot": False}}
-    e.fake.respond("getChatMember", compute)
-    p = prober.make(e.ctx)
-    ranked = []
-    real = p._read_chat
-    monkeypatch.setattr(p, "_read_chat", lambda *a: (ranked.append(a[2]), real(*a)))
-    e.run(p, 10.0)
-    assert ranked == [] and [u for _, u in asked(e)][:2] == [200, 199]  # 200 failed: attempt 1, backoff 60 s
-    with psycopg.connect(e.dsn) as c:  # someone else's change while the backlog drains
-        c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [301]))
-    n = len(asked(e))
-    e.run(p, 1.0)
-    assert ranked == [CHAT] and asked(e)[n] == (CHAT, 301)
-    e.run(p, 52.0)  # user 200's backoff ends 60 s after its failure: asked again then
-    calls = [u for _, u in asked(e)]
-    assert calls.count(200) == 2 and calls[-1] == 200 and ranked == [CHAT]
-    pid = e.w.c.execute("SELECT probe_id FROM tg.probe WHERE user_id = 200").fetchone()[0]
-    assert probe_row(e, pid)["outcome"] == "in"
-
-
-def test_a_probe_queued_while_the_chat_is_ranked_again_is_caught_by_the_next_head_read(env, monkeypatch):
-    """Ordering of the set read and the ranking: another session queues a newer spell's probe between them. The ranking
-    may or may not see it; the expected set is the one read before, so the next head read ranks again if needed. Each
-    probe is asked once, newest spell first."""
-    e = env
-    _outage_backlog(e)
-    e.w.join(400, at(2000))
-    e.w.rebuild([400])
-    e.w.c.commit()
-    answer(e)
-    p = prober.make(e.ctx)
-    ranked = []
-    real = p._read_chat
-
-    def between(conn, now, chat, expect):
-        ranked.append(chat)
-        if len(ranked) == 1:
-            with psycopg.connect(e.dsn) as c:
-                c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [400]))
-        return real(conn, now, chat, expect)
-    monkeypatch.setattr(p, "_read_chat", between)
-    e.run(p, 2.0)
-    n = len(asked(e))
-    with psycopg.connect(e.dsn) as c:
-        c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [301]))
-    e.run(p, 5.0)
-    later = [u for _, u in asked(e)[n:]]
-    assert later[:2] == [400, 301] and len(set(asked(e))) == len(asked(e))
-    assert ranked[:2] == [CHAT, CHAT]  # the second ranking picked up what the first one's expected set did not hold
 
 
 def test_an_outage_set_swapped_with_the_same_count_and_id_sum_is_ranked_again(env):
@@ -787,11 +725,11 @@ def test_an_outage_retry_left_out_of_the_cache_is_asked_when_it_becomes_eligible
     for u in range(1, 101):
         queue(e, u, "outage", queued=START - timedelta(hours=2))
     waiting = [queue(e, u, "outage", queued=START - timedelta(hours=2)) for u in range(1001, 1601)]
-    w.c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = ANY(%s)",
-                (START - timedelta(minutes=1), waiting))
+    w.c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = ANY(%s)",
+                (START - timedelta(minutes=1), START + timedelta(minutes=9), waiting))
     pid = queue(e, 601, "outage", queued=START - timedelta(hours=2))
-    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s",
-                (START - timedelta(seconds=58), pid))
+    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                (START - timedelta(seconds=58), START + timedelta(seconds=2), pid))
     w.c.commit()
     answer(e)
     p = prober.make(e.ctx)
@@ -940,6 +878,294 @@ def test_a_conflict_queued_after_the_read_goes_before_cached_lower_priority_prob
     e.w.c.commit()
     e.run(p, 0.3)
     assert asked(e)[n] == (CHAT, 500)
+
+
+# --- prober-simplify: the four ways the old cache drifted (crossfix review 3) --------------------------------------
+
+def test_rank_changes_committed_late_by_other_transactions_are_seen(env):
+    """review 3, finding 1: (a) ingest's rebuild of user 1 (a late leave and rejoin: its spell becomes the newest of
+    all) holds its spell ids uncommitted across many steps and far longer than any margin, while another chat's
+    rebuild commits; once it commits, user 1 is the chat's next call. (b) a rebuild that only deletes the spell of
+    user 501 (a sighting of a snapshot then rejected): 501 had the newest spell, now has none and goes after every
+    probe with an open spell."""
+    e = env
+    e.w.add_chat(OTHER)
+    e.w.join(9999, at(1), chat=OTHER)
+    _outage_backlog(e)
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    first = psycopg.connect(e.dsn)
+    try:
+        history.lock_chats(first, [CHAT])
+        first.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                      "VALUES (%s, 1, %s, 960001, 'member', 'left'), (%s, 1, %s, 960002, 'left', 'member')",
+                      (CHAT, at(950), CHAT, at(951)))
+        history.rebuild_pairs(first, [(CHAT, 1)])  # ids taken, not committed
+        with psycopg.connect(e.dsn) as later:  # another chat's rebuild: later ids, committed first
+            history.lock_chats(later, [OTHER])
+            later.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                          "VALUES (%s, 9999, %s, 960003, 'member', 'left')", (OTHER, at(5)))
+            history.rebuild_pairs(later, [(OTHER, 9999)])
+        for u in range(3001, 3061):  # work of the other chat meanwhile (manual: first, no share); CHAT is locked
+            queue(e, u, "manual", chat=OTHER)
+        e.w.c.commit()
+        n = len(asked(e))
+        e.run(p, 8.0)  # 45 calls at most: the manual probes last, so the job never waits for `first`'s lock
+        assert {c for c, _ in asked(e)[n:]} == {OTHER} and len(asked(e)) - n >= 40
+        first.commit()
+    finally:
+        first.close()
+    n = len(asked(e))
+    e.run(p, 5.0)  # the rest of the manual probes, then CHAT
+    assert [u for c, u in asked(e)[n:] if c == CHAT][0] == 1
+
+    # (b) user 501: listed by a snapshot only, so its spell is the newest; then the owner rejects the snapshot
+    sid = e.w.snapshot(at(2000), {501: (at(2000), None)}, good=False)
+    e.w.rebuild([501])
+    queue(e, 501, "outage", queued=START)
+    e.w.c.commit()
+    assert e.w.c.execute("SELECT spell_from FROM tg.probe WHERE user_id = 501 AND outcome = 'pending'").fetchone()[0]
+    e.w.reject(sid)
+    e.w.rebuild([501])  # deletes its only spell, inserts nothing
+    e.w.c.commit()
+    assert e.w.spells(501) == []
+    n = len(asked(e))
+    e.run(p, 60.0)
+    later = [u for _, u in asked(e)[n:]]
+    assert later[-1] == 501 and later[:-1] == sorted(later[:-1], reverse=True), later
+
+
+def _two_chat_backlog(e: Env, per_chat: int) -> None:
+    """`per_chat` outage probes in CHAT (users 1..) and in OTHER (users 10001..), spells one minute apart."""
+    e.w.add_chat(OTHER)
+    for u in range(1, per_chat + 1):
+        e.w.join(u, at(u))
+        e.w.join(10000 + u, at(u) + timedelta(seconds=30), chat=OTHER)
+    e.w.rebuild()
+    history.rebuild_pairs(e.w.c, [(OTHER, 10000 + u) for u in range(1, per_chat + 1)])
+    for u in range(1, per_chat + 1):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+        queue(e, 10000 + u, "outage", chat=OTHER, queued=START - timedelta(hours=2))
+
+
+def _longest_run(chats: list[int]) -> int:
+    best = run = 0
+    for i, c in enumerate(chats):
+        run = run + 1 if i and chats[i - 1] == c else 1
+        best = max(best, run)
+    return best
+
+
+def test_each_chat_keeps_its_half_while_the_other_has_ready_probes(env):
+    """review 3, finding 2: two chats with 900 outage probes each, at 100 calls/s (the old cache cut each chat at 600
+    and gave every call to the other chat once those ran out). Late joins of CHAT (users 1-50, the oldest, rejoin
+    after everyone) make their probes the chat's newest; they are the chat's next calls. Each chat keeps its half
+    until well past 600 calls of its own: in every 200 consecutive calls each has 40-60 %, and no chat gets more than
+    its bucket's burst in a row."""
+    e = env
+    _two_chat_backlog(e, 900)
+    e.w.c.commit()
+    answer(e)
+    p = prober.Prober(e.ctx, rate=100.0)
+    e.run(p, 3.0, dt=0.02)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:  # ingest: the late leaves and rejoins of users 1-50 and their rebuild
+        history.lock_chats(c, [CHAT])
+        for u in range(1, 51):
+            c.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                      "VALUES (%s, %s, %s, %s, 'member', 'left'), (%s, %s, %s, %s, 'left', 'member')",
+                      (CHAT, u, at(5000 + u), 970000 + 2 * u, CHAT, u, at(5001 + u), 970001 + 2 * u))
+        history.rebuild_pairs(c, [(CHAT, u) for u in range(1, 51)])
+    e.run(p, 14.5, dt=0.02)
+    calls = asked(e)
+    later = calls[n:]
+    assert [u for c, u in later if c == CHAT][:50] == list(range(50, 0, -1))  # the rejoined, newest first
+    assert len(calls) >= 1600
+    chats = [c for c, _ in calls[:1600]]
+    for i in range(0, len(chats) - 200, 50):
+        mine = chats[i:i + 200].count(CHAT)
+        assert 80 <= mine <= 120, (i, mine)
+    assert _longest_run(chats) <= 55 and chats.count(CHAT) > 700
+    assert len(set(calls)) == len(calls)
+
+
+def test_outage_probes_rank_by_the_open_spell_and_those_without_one_go_last(env):
+    """review 3, finding 3: 200 outage probes; exact exits then close the 100 newest stays (users 101-200), whose
+    probes stay pending. The 100 open, suspect stays are asked first, newest first; the closed ones after them, in
+    queue order (queued_at, then probe id)."""
+    e = env
+    w = e.w
+    for u in range(1, 201):
+        w.join(u, at(u))
+    w.rebuild()
+    ids = {u: queue(e, u, "outage", queued=START - timedelta(hours=2)) for u in range(1, 201)}
+    w.c.commit()
+    for u in range(101, 201):
+        w.leave(u, at(1000 + u))
+    w.rebuild(list(range(101, 201)))
+    w.c.commit()
+    assert all(s.end_source is not None for u in range(101, 201) for s in w.spells(u))
+    answer(e, default="left")
+    e.run(prober.make(e.ctx), 45.0)
+    calls = [u for _, u in asked(e)]
+    assert calls[:100] == list(range(100, 0, -1))
+    assert calls[100:200] == sorted(range(101, 201), key=lambda u: ids[u])
+
+
+def test_a_retry_deadline_is_kept_while_nothing_else_is_ready(env):
+    """review 3, finding 4 (and D3): 600 probes in a ten-minute backoff and one in a one-minute backoff that ends 2 s
+    after the first read. The job is due at that deadline (not at the next idle read) and asks it then; a probe
+    queued meanwhile while everything waits is asked within the idle interval."""
+    e = env
+    w = e.w
+    for u in range(1001, 1601):
+        w.join(u, at(u))
+    w.join(601, at(1000))
+    w.rebuild()
+    waiting = [queue(e, u, "outage", queued=START - timedelta(hours=2)) for u in range(1001, 1601)]
+    w.c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = ANY(%s)",
+                (START - timedelta(minutes=1), START + timedelta(minutes=9), waiting))
+    pid = queue(e, 601, "outage", queued=START - timedelta(hours=2))
+    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                (START - timedelta(seconds=58), START + timedelta(seconds=2.3), pid))
+    w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    seen = []
+    while e.clock() < START.timestamp() + 4:
+        n = len(asked(e))
+        e.tick(p)
+        if len(asked(e)) > n:
+            seen.append(e.clock() - START.timestamp())
+        e.clock.advance(0.1)
+    assert asked(e) == [(CHAT, 601)] and 2.3 <= seen[0] < 2.45, seen
+    assert probe_row(e, pid)["outcome"] == "in"
+    queue(e, 77, "conflict", queued=START)
+    w.c.commit()
+    t = e.clock()
+    while len(asked(e)) == 1 and e.clock() < t + 30:
+        e.tick(p)
+        e.clock.advance(0.1)
+    assert asked(e)[1] == (CHAT, 77) and e.clock() - t <= prober.IDLE_REFRESH + 0.2
+
+
+# --- prober-simplify review 1 -----------------------------------------------------------------------------------------
+
+def test_a_status_that_is_not_a_string_is_a_failure_and_the_queue_moves_on(env):
+    """review 1, finding 3: the chat's first probe gets a list as its status on every call. Each answer is a failure
+    with its backoff (not an exception that rolls the step back), so the next probe is asked."""
+    e = env
+    first, second = queue(e, 1, queued=START - timedelta(hours=2)), queue(e, 2)
+    e.w.c.commit()
+    e.fake.respond("getChatMember", lambda params: {"status": ["member"]} if params["user_id"] == 1
+                   else {"status": "member"})
+    e.run(prober.make(e.ctx), 2.0)
+    assert asked(e) == [(CHAT, 1), (CHAT, 2)]
+    row = probe_row(e, first)
+    assert (row["outcome"], row["attempts"]) == ("pending", 1)
+    assert row["next_attempt_at"] == row["last_attempt_at"] + timedelta(seconds=prober.BACKOFF[0])
+    assert probe_row(e, second)["outcome"] == "in"
+
+
+def test_a_failure_written_without_its_deadline_gets_the_backoff_of_its_attempts(env):
+    """review 1, finding 2: the previous image records a second failure with its own UPDATE (attempts and
+    last_attempt_at, no next_attempt_at): the trigger gives it the ten-minute deadline, and the prober waits for it. A
+    deadline set in the same UPDATE (this prober's) is kept, and one set alone (the straddle delay) is not touched."""
+    e = env
+    pid = queue(e, 1)
+    e.w.c.commit()
+    with psycopg.connect(e.dsn) as c:  # the previous image's failure write
+        c.execute("UPDATE tg.probe SET attempts = %s, last_attempt_at = %s WHERE probe_id = %s", (2, START, pid))
+    assert probe_row(e, pid)["next_attempt_at"] == START + timedelta(seconds=prober.BACKOFF[1])
+    with psycopg.connect(e.dsn) as c:  # the SQL schedule is the job's, for every attempt count
+        for n, backoff in enumerate(prober.BACKOFF + (prober.BACKOFF[-1],), 1):
+            c.execute("UPDATE tg.probe SET attempts = %s, next_attempt_at = NULL WHERE probe_id = %s", (n, pid))
+            c.execute("UPDATE tg.probe SET last_attempt_at = %s WHERE probe_id = %s", (START + timedelta(n), pid))
+            assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == \
+                START + timedelta(n) + timedelta(seconds=backoff)
+        explicit = START + timedelta(seconds=7)
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), explicit, pid))
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == explicit
+        c.execute("UPDATE tg.probe SET next_attempt_at = %s WHERE probe_id = %s", (START, pid))  # the straddle delay
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == START
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), pid))  # the same values again: nothing to derive
+        assert c.execute("SELECT next_attempt_at FROM tg.probe WHERE probe_id = %s", (pid,)).fetchone()[0] == START
+        c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = NULL, next_attempt_at = NULL "
+                  "WHERE probe_id = %s", (pid,))
+        c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = %s",
+                  (START - timedelta(seconds=1), pid))  # the old image's second failure, a second before the job
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 598.0, dt=1.0)
+    assert asked(e) == []
+    e.run(p, 3.0, dt=0.1)
+    assert asked(e) == [(CHAT, 1)] and probe_row(e, pid)["outcome"] == "in"
+
+
+# --- prober-simplify review 2: passed deadlines are ready at their place, without a write --------------------------
+
+def _overdue(e: Env, ids: list[int], deadline: datetime) -> None:
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s "
+                  "WHERE probe_id = ANY(%s)", (deadline - timedelta(minutes=1), deadline, ids))
+
+
+def test_after_a_restart_every_passed_deadline_is_ready_at_its_place_and_in_the_share(env):
+    """review 2, finding 1: after a long stop every probe's deadline has passed: CHAT has 400 outage retries (more than
+    MANY: read in queue order) and one conflict retry whose deadline is the latest of all; OTHER has a manual and a
+    conflict retry and 300 sample retries (fewer than MANY: sorted). The manual goes first, then the conflicts, and
+    OTHER keeps its half while it has ready probes. Nothing is cleared: the deadlines stay as they were."""
+    e = env
+    w = e.w
+    w.add_chat(OTHER)
+    for u in range(1, 401):
+        w.join(u, at(u))
+    w.rebuild()
+    mine = [queue(e, u, "outage", queued=START - timedelta(hours=5)) for u in range(1, 401)]
+    late_conflict = queue(e, 500, "conflict", queued=START - timedelta(hours=1))
+    theirs = [queue(e, 2000 + u, "sample", chat=OTHER, queued=START - timedelta(hours=5)) for u in range(1, 301)]
+    manual = queue(e, 1999, "manual", chat=OTHER, queued=START - timedelta(hours=1))
+    conflict = queue(e, 1998, "conflict", chat=OTHER, queued=START - timedelta(hours=1))
+    _overdue(e, mine + theirs, START - timedelta(hours=3))
+    _overdue(e, [manual, conflict], START - timedelta(hours=2))
+    _overdue(e, [late_conflict], START - timedelta(seconds=1))
+    w.c.commit()
+    answer(e)
+    p = prober.Prober(e.ctx, rate=100.0)
+    e.run(p, 4.0, dt=0.02)
+    calls = asked(e)
+    assert calls[:3] == [(OTHER, 1999), (CHAT, 500), (OTHER, 1998)] or \
+        calls[:3] == [(OTHER, 1999), (OTHER, 1998), (CHAT, 500)], calls[:3]
+    assert [u for c, u in calls if c == CHAT][1:6] == [400, 399, 398, 397, 396]  # outage: newest spell first
+    both = [c for c, _ in calls[:2 * 300]]  # while OTHER has ready probes
+    assert 0.4 * len(both) <= both.count(OTHER) <= 0.6 * len(both), both.count(OTHER)
+    with psycopg.connect(e.dsn) as c:  # only the probes asked changed
+        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending' AND next_attempt_at IS NULL"
+                         ).fetchone()[0] == 0
+
+
+def test_a_few_passed_deadlines_rank_among_probes_without_one(env):
+    """Fewer than MANY passed deadlines in a chat (sorted with its probes without a deadline): a conflict retry goes
+    before 50 fresh sample probes, a sample retry after the older fresh ones, and a deadline still ahead waits."""
+    e = env
+    fresh = [queue(e, u, "sample", queued=START - timedelta(hours=2) + timedelta(minutes=u)) for u in range(1, 51)]
+    retry_conflict = queue(e, 100, "conflict", queued=START - timedelta(minutes=5))
+    retry_sample = queue(e, 101, "sample", queued=START - timedelta(hours=2) + timedelta(minutes=25, seconds=30))
+    ahead = queue(e, 102, "manual")
+    _overdue(e, [retry_conflict, retry_sample], START - timedelta(seconds=10))
+    _overdue(e, [ahead], START + timedelta(minutes=10))
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    assert [c.user_id for c in p.heads(e.conn, e.clock())] == [100, *range(1, 20)]  # PER_CHAT of them
+    e.conn.rollback()
+    e.run(p, 12.0)
+    calls = [u for _, u in asked(e)]
+    assert calls[:28] == [100, *range(1, 26), 101, 26] and 102 not in calls
+    assert len(fresh) == 50
 
 
 def test_no_transaction_is_open_during_the_call(env):
