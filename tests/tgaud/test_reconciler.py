@@ -767,3 +767,186 @@ def test_the_scheduler_runs_the_job_fenced_and_committed(migrated_dsn):
         assert c.execute("SELECT quality, reconciled_at IS NOT NULL FROM tg.snapshot WHERE snapshot_id = %s",
                          (sid,)).fetchone() == ("good", True)
         assert c.execute("SELECT count(*) FROM tg.membership").fetchone()[0] == 2
+
+
+# --- review round 1 -------------------------------------------------------------------------------------------------
+
+def _wait_for_lock_waiter(dsn: str) -> None:
+    """Until another session of this database waits on a lock."""
+    import time
+    with psycopg.connect(dsn, autocommit=True) as probe:
+        for _ in range(300):
+            if probe.execute("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                             "AND wait_event_type = 'Lock'").fetchone()[0]:
+                return
+            time.sleep(0.05)
+    raise AssertionError("no session waited on a lock")
+
+
+def test_expiry_yields_to_a_collector_that_finishes_first(migrated_dsn):
+    import threading
+    with psycopg.connect(migrated_dsn) as c:
+        lab = Lab(c)
+        now = c.execute("SELECT now()").fetchone()[0]
+        sid = lab.collect(now - timedelta(days=2, minutes=1), {1: now - timedelta(days=2), 2: now - timedelta(days=2)},
+                          done=False)
+        c.commit()
+    collector = psycopg.connect(migrated_dsn)
+    collector.execute("SET ROLE collect_writer")
+    collector.execute("UPDATE tg.snapshot SET finished_at = now(), reported_at_end = 2, fetched = 2, complete = true "
+                      "WHERE snapshot_id = %s", (sid,))  # the last transaction of the script, not committed yet
+    ran: list = []
+
+    def cleanup() -> None:
+        with psycopg.connect(migrated_dsn) as r:
+            ran.append(job().run_unit(r))  # reads the old (unfinished) row, then waits for the collector's lock
+            r.commit()
+
+    t = threading.Thread(target=cleanup)
+    t.start()
+    _wait_for_lock_waiter(migrated_dsn)
+    collector.commit()
+    collector.close()
+    t.join(30)
+    assert ran == ["expire"]
+    with psycopg.connect(migrated_dsn) as c:
+        lab = Lab(c)
+        s = lab.snapshot(sid)
+        assert s["finished_at"] is not None and s["expired_at"] is None
+        assert c.execute("SELECT count(*) FROM tg.snapshot_member WHERE snapshot_id = %s", (sid,)).fetchone()[0] == 2
+        lab.run()
+        assert lab.snapshot(sid)["quality"] == "good" and lab.snapshot(sid)["reconciled_at"] is not None
+
+
+def test_a_claimed_expiry_goes_on_after_the_collector_finishes_and_a_restart(migrated_dsn, monkeypatch):
+    import threading
+    monkeypatch.setattr(reconciler, "DELETE_BATCH", 1)
+    with psycopg.connect(migrated_dsn) as c:
+        lab = Lab(c)
+        now = c.execute("SELECT now()").fetchone()[0]
+        sid = lab.collect(now - timedelta(days=2, minutes=1), {u: now - timedelta(days=2) for u in (1, 2, 3)},
+                          done=False)
+        c.commit()
+    r = psycopg.connect(migrated_dsn)
+    assert job().run_unit(r) == "expire"  # the claim and one row, not committed yet
+    finished: list = []
+
+    def finish() -> None:
+        with psycopg.connect(migrated_dsn) as w:
+            w.execute("SET ROLE collect_writer")
+            finished.append(w.execute("UPDATE tg.snapshot SET finished_at = now(), reported_at_end = 3, fetched = 3, "
+                                      "complete = true WHERE snapshot_id = %s", (sid,)).rowcount)
+            w.commit()
+
+    t = threading.Thread(target=finish)
+    t.start()
+    _wait_for_lock_waiter(migrated_dsn)
+    r.commit()  # the claim commits first; the script's last transaction then goes through
+    r.close()
+    t.join(30)
+    assert finished == [1]
+    with psycopg.connect(migrated_dsn) as c:
+        lab = Lab(c)  # a new job object: nothing in memory
+        s = lab.snapshot(sid)
+        assert s["expired_at"] is not None and s["finished_at"] is not None and s["quality"] is None
+        assert lab.run() == ["expire", "expire", "expire"]
+        assert lab.snapshot(sid) == {}
+
+
+def test_an_erased_page_never_reaches_the_cursor_or_the_run_rows(lab):
+    lab.c.execute("INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(20), %s)", (at(H),))
+    sid = lab.collect(at(0), {20: at(5), 21: at(6)})
+    lab.fixed_chunk(1)
+    cursors = []
+    while lab.job.run_unit(lab.c) is not None:
+        cursors.append(lab.snapshot(sid).get("applied_through_user_id"))
+    assert 20 not in cursors and 21 in cursors
+    assert lab.c.execute("SELECT chunk, from_user_id, through_user_id FROM tg.reconcile_run WHERE snapshot_id = %s "
+                         "ORDER BY chunk", (sid,)).fetchall() == [(1, None, None), (2, 21, 21), (3, None, None)]
+    assert lab.snapshot(sid)["reconciled_at"] is not None and lab.totals(sid)["listed"] == 1
+    assert lab.c.execute("SELECT count(*) FROM tg.tg_user WHERE user_id = 20").fetchone()[0] == 0
+
+
+def test_a_last_chunk_of_erased_rows_completes_the_snapshot(lab):
+    for u in (20, 22):
+        lab.c.execute("INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(%s), %s)", (u, at(H)))
+    sid = lab.collect(at(0), {20: at(5), 22: at(6)})
+    lab.run()
+    s = lab.snapshot(sid)
+    assert s["reconciled_at"] is not None and s["applied_through_user_id"] is None
+    assert lab.c.execute("SELECT from_user_id, through_user_id, listed FROM tg.reconcile_run WHERE snapshot_id = %s",
+                         (sid,)).fetchall() == [(None, None, 0)]
+
+
+def test_profile_values_follow_the_latest_page_and_names_go_when_not_kept(lab):
+    other = CHAT - 10
+    lab.add_chat(other)
+
+    def profile():
+        return lab.c.execute("SELECT username, first_name, last_name, is_premium FROM tg.tg_user WHERE user_id = 40"
+                             ).fetchone()
+
+    lab.collect(at(0), rows=[{"user_id": 40, "seen_at": at(1), "username": "oldname", "first_name": "Old",
+                              "last_name": "One", "is_premium": True}])
+    lab.run()
+    assert profile() == ("oldname", "Old", "One", True)
+    lab.collect(at(H), rows=[{"user_id": 40, "seen_at": at(H + 1), "username": None, "first_name": "New",
+                              "last_name": None, "is_premium": False}])  # username removed, premium gone
+    lab.run()
+    assert profile() == (None, "New", None, None)
+    lab.collect(at(30), rows=[{"user_id": 40, "seen_at": at(31), "username": "older", "first_name": "Older",
+                               "is_premium": True}], chat=other)  # an older page applied later
+    lab.run()
+    assert profile() == (None, "New", None, None)
+    lab.job = job({"TGAUD_STORE_NAMES": "false"})
+    lab.collect(at(2 * H), rows=[{"user_id": 40, "seen_at": at(2 * H + 1), "username": "u40", "first_name": "F",
+                                  "is_premium": True}])
+    lab.run()
+    assert profile() == (None, None, None, True)
+    lab.c.execute("UPDATE tg.tg_user SET username = 'kept', first_name = 'Kept' WHERE user_id = 40")
+    lab.collect(at(H + 30), rows=[{"user_id": 40, "seen_at": at(H + 31)}], chat=other)  # older, names off
+    lab.run()
+    assert profile()[:2] == (None, None)  # blanking is not an update of values: any visit clears them
+
+
+def _record(lab, times, src, users):
+    lab.c.execute("SELECT tg.record_contradictions(%s::bigint[], %s::bigint[], %s::text[], %s::timestamptz[], "
+                  "%s::bigint[])", ([CHAT] * len(times), users[:len(times)], ["E4"] * len(times), times,
+                                    [src + i for i in range(len(times))]))
+
+
+@pytest.mark.parametrize("g1_first", [False, True])
+def test_a_bridging_batch_merges_contradiction_gaps_into_one_and_g1_follows(lab, g1_first):
+    lab.join(1, at(-H))
+    lab.event(1, at(80), "member", "administrator")  # confirmed at 11:20
+    lab.rebuild()
+    users = [lab.user(300 + i) for i in range(11)]
+    _record(lab, [at(i) for i in range(11)], 0, users)              # 10:00-10:10
+    _record(lab, [at(100 + i) for i in range(11)], 100, users)      # 11:40-11:50
+    assert contradiction_gaps(lab) == [(at(0), at(10)), (at(100), at(110))]
+    if g1_first:
+        lab.run()
+        assert lab.spells(1)[0].suspect_since == at(100)  # doubted by the 11:40 start
+        assert (1, "outage", None, None) in lab.pending()
+    _record(lab, [at(50 + i) for i in range(11)], 50, users)        # 10:50-11:00 bridges both
+    assert contradiction_gaps(lab) == [(at(0), at(110))]
+    lab.run()
+    assert lab.spells(1)[0].suspect_since is None  # confirmed after the merged episode began
+    assert [p for p in lab.pending() if p[0] == 1] == []
+    assert lab.c.execute("SELECT count(*), bool_and(done) FROM tg.gap_progress").fetchone() == (1, True)
+    assert_equivalent(lab)
+
+
+def test_a_moved_start_lifts_doubts_that_rested_on_the_later_start(lab):
+    lab.join(1, at(0))
+    lab.event(1, at(2 * H), "member", "administrator")  # confirmed at 12:00
+    lab.rebuild()
+    lab.gap(at(3 * H), None, reason="not_admin")
+    lab.run()
+    assert lab.spells(1)[0].suspect_since == at(3 * H)
+    lab.c.execute("UPDATE tg.gap SET period = tstzrange(%s, NULL) WHERE chat_id = %s", (at(H), CHAT))  # ingest
+    lab.c.execute("DELETE FROM tg.gap_progress")
+    lab.run()
+    assert lab.spells(1)[0].suspect_since is None  # positive evidence after the (new) start
+    assert [p for p in lab.pending() if p[0] == 1] == []
+    assert_equivalent(lab)

@@ -111,7 +111,12 @@ DECLARE
   v_lo timestamptz;
   v_hi timestamptz;
   r record;
-  g record;
+  v_span tstzrange;
+  v_keep bigint;
+  v_old tstzrange;
+  v_union tstzrange;
+  v_other bigint;
+  v_absorbed boolean;
   v_changed integer := 0;
 BEGIN
   SELECT min(t) - interval '60 minutes', max(t) + interval '60 minutes' INTO v_lo, v_hi FROM unnest(p_times) t;
@@ -119,44 +124,65 @@ BEGIN
     RETURN 0;
   END IF;
   FOR r IN
+    -- more than 10 cases within 60 minutes <=> some case and the 10th case after it (in time order) are at most
+    -- 60 minutes apart: one ordered pass over the index, no aggregate over each window
     WITH c AS (
       SELECT k.at FROM tg.contradiction_case k WHERE k.chat_id = p_chat_id AND k.at BETWEEN v_lo AND v_hi
-    ), w AS (     -- every window [case time, case time + 60 min] with more than 10 cases
-      SELECT lo, hi, n FROM (
-        SELECT c.at AS lo, max(c.at) OVER f AS hi, count(*) OVER f AS n FROM c
-        WINDOW f AS (ORDER BY c.at RANGE BETWEEN CURRENT ROW AND interval '60 minutes' FOLLOWING)) x
-      WHERE n > 10
+    ), q AS (
+      SELECT at AS lo, lead(at, 10) OVER (ORDER BY at) AS hi FROM c
+    ), w AS (
+      SELECT lo, hi FROM q WHERE hi - lo <= interval '60 minutes'
     ), islands AS (
-      SELECT lo, hi, n, sum(brk) OVER (ORDER BY lo, hi) AS grp FROM (
-        SELECT lo, hi, n, CASE WHEN lo <= max(hi) OVER (ORDER BY lo, hi ROWS BETWEEN UNBOUNDED PRECEDING
-                                                                         AND 1 PRECEDING) THEN 0 ELSE 1 END AS brk
+      SELECT lo, hi, sum(brk) OVER (ORDER BY lo, hi) AS grp FROM (
+        SELECT lo, hi, CASE WHEN lo <= max(hi) OVER (ORDER BY lo, hi ROWS BETWEEN UNBOUNDED PRECEDING
+                                                                     AND 1 PRECEDING) THEN 0 ELSE 1 END AS brk
         FROM w) y
     )
-    SELECT min(lo) AS lo, max(hi) AS hi, max(n) AS n FROM islands GROUP BY grp ORDER BY 1
+    SELECT min(lo) AS lo, max(hi) AS hi FROM islands GROUP BY grp ORDER BY 1
   LOOP
-    SELECT gap_id, period INTO g FROM tg.gap
-     WHERE chat_id = p_chat_id AND reason = 'contradiction' AND period && tstzrange(r.lo, r.hi, '[]')
-     ORDER BY gap_id LIMIT 1 FOR UPDATE;
-    IF NOT FOUND THEN
+    v_span := tstzrange(r.lo, r.hi, '[]');
+    SELECT min(gap_id) INTO v_keep FROM tg.gap
+     WHERE chat_id = p_chat_id AND reason = 'contradiction' AND period && v_span;
+    IF v_keep IS NULL THEN
       INSERT INTO tg.gap (chat_id, period, reason, confirmed, note)
-      VALUES (p_chat_id, tstzrange(r.lo, r.hi, '[]'), 'contradiction', true,
-              format('%s E4/E10/S3 cases within 60 minutes', r.n));
+      VALUES (p_chat_id, v_span, 'contradiction', true,
+              format('%s E4/E10/S3 cases, more than 10 within 60 minutes',
+                     (SELECT count(*) FROM tg.contradiction_case
+                       WHERE chat_id = p_chat_id AND at BETWEEN r.lo AND r.hi)));
       v_changed := v_changed + 1;
-    ELSIF NOT g.period @> tstzrange(r.lo, r.hi, '[]') THEN
-      UPDATE tg.gap SET period = g.period + tstzrange(r.lo, r.hi, '[]') WHERE gap_id = g.gap_id;
-      IF r.lo < lower(g.period) THEN
-        DELETE FROM tg.gap_progress WHERE gap_id = g.gap_id;   -- an earlier start: G1 handles it again
-      END IF;
+      CONTINUE;
+    END IF;
+    -- one gap per episode: the oldest overlapping gap takes the union of the span and of every contradiction gap
+    -- that overlaps it, directly or through another; the others go (with their tg.gap_progress)
+    SELECT period INTO v_old FROM tg.gap WHERE gap_id = v_keep FOR UPDATE;
+    v_union := v_old + v_span;
+    v_absorbed := false;
+    LOOP
+      SELECT gap_id INTO v_other FROM tg.gap
+       WHERE chat_id = p_chat_id AND reason = 'contradiction' AND gap_id <> v_keep AND period && v_union
+       ORDER BY gap_id LIMIT 1 FOR UPDATE;
+      EXIT WHEN NOT FOUND;
+      v_union := v_union + (SELECT period FROM tg.gap WHERE gap_id = v_other);
+      DELETE FROM tg.gap WHERE gap_id = v_other;
+      v_absorbed := true;
+    END LOOP;
+    IF v_union <> v_old THEN
+      UPDATE tg.gap SET period = v_union WHERE gap_id = v_keep;
       v_changed := v_changed + 1;
+    END IF;
+    IF v_absorbed OR lower(v_union) < lower(v_old) THEN
+      -- a start moved earlier or a start vanished: G1 again for the whole gap, as ingest does for a moved start;
+      -- its chunks also rebuild the spells doubted since a later start (tgaud.jobs.reconciler.g1_chunk)
+      DELETE FROM tg.gap_progress WHERE gap_id = v_keep;
     END IF;
   END LOOP;
   RETURN v_changed;
 END $$;
 COMMENT ON FUNCTION tg.contradiction_check(bigint, timestamptz[]) IS
-  'For a chat whose cases changed near these evidence times: every window of 60 minutes (inclusive) holding more '
-  'than 10 cases, merged where they overlap, becomes a contradiction gap from its first to its last case, or widens '
-  'the contradiction gap it overlaps (deleting its tg.gap_progress when the start moves earlier, as ingest does). '
-  'Returns the gaps inserted or widened.';
+  'For a chat whose cases changed near these evidence times: every span in which more than 10 cases lie within 60 '
+  'minutes (inclusive), merged where they overlap, becomes a contradiction gap from its first to its last case. A '
+  'span that overlaps contradiction gaps merges them all into the oldest one; when that removes a gap or moves the '
+  'start earlier, the kept gap''s tg.gap_progress is deleted so G1 handles it again. Returns the gaps changed.';
 
 CREATE FUNCTION tg.record_contradictions(p_chat_ids bigint[], p_user_ids bigint[], p_rules text[],
                                          p_ats timestamptz[], p_source_ids bigint[]) RETURNS integer

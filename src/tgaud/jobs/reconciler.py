@@ -99,7 +99,14 @@ class Reconciler:
             return False
         snapshot_id, chat_id, marked = row
         if not marked:
-            conn.execute("UPDATE tg.snapshot SET expired_at = now() WHERE snapshot_id = %s", (snapshot_id,))
+            # the claim re-checks the row under its lock: a collector whose finishing UPDATE was in flight when the
+            # row was read wins, and its listing is graded as usual (READ COMMITTED re-reads the updated row)
+            claimed = conn.execute("""
+                UPDATE tg.snapshot SET expired_at = now()
+                WHERE snapshot_id = %s AND expired_at IS NULL AND finished_at IS NULL
+                  AND started_at <= now() - %s::interval""", (snapshot_id, EXPIRE_AFTER)).rowcount
+            if not claimed:
+                return True
         deleted = conn.execute("""
             DELETE FROM tg.snapshot_member WHERE snapshot_id = %(s)s AND user_id <= (
               SELECT max(user_id) FROM (SELECT user_id FROM tg.snapshot_member WHERE snapshot_id = %(s)s
@@ -291,14 +298,15 @@ ON CONFLICT (user_id) DO UPDATE SET
   is_deleted = CASE WHEN u.deleted_seen_at IS NULL OR excluded.deleted_seen_at >= u.deleted_seen_at
                     THEN excluded.is_deleted ELSE u.is_deleted END,
   deleted_seen_at = greatest(u.deleted_seen_at, excluded.deleted_seen_at),
-  is_premium = CASE WHEN excluded.is_premium AND excluded.last_seen_at >= u.last_seen_at THEN true
-                    ELSE u.is_premium END,
-  username = CASE WHEN %(names)s AND excluded.last_seen_at >= u.last_seen_at
-                  THEN coalesce(excluded.username, u.username) ELSE u.username END,
-  first_name = CASE WHEN %(names)s AND excluded.last_seen_at >= u.last_seen_at
-                    THEN coalesce(excluded.first_name, u.first_name) ELSE u.first_name END,
-  last_name = CASE WHEN %(names)s AND excluded.last_seen_at >= u.last_seen_at
-                   THEN coalesce(excluded.last_name, u.last_name) ELSE u.last_name END,
+  -- latest profile values: a page at least as recent as the user's last sighting sets them, removals (a NULL
+  -- username, premium false = NULL) included; an older page changes none; names are blanked when not kept
+  is_premium = CASE WHEN excluded.last_seen_at >= u.last_seen_at THEN excluded.is_premium ELSE u.is_premium END,
+  username = CASE WHEN NOT %(names)s THEN NULL WHEN excluded.last_seen_at >= u.last_seen_at
+                  THEN excluded.username ELSE u.username END,
+  first_name = CASE WHEN NOT %(names)s THEN NULL WHEN excluded.last_seen_at >= u.last_seen_at
+                    THEN excluded.first_name ELSE u.first_name END,
+  last_name = CASE WHEN NOT %(names)s THEN NULL WHEN excluded.last_seen_at >= u.last_seen_at
+                   THEN excluded.last_name ELSE u.last_name END,
   first_seen_at = least(u.first_seen_at, excluded.first_seen_at),
   last_seen_at = greatest(u.last_seen_at, excluded.last_seen_at)
 RETURNING WITH (OLD AS o, NEW AS n) n.user_id,   -- reports count humans: not a bot, is_deleted not true
@@ -329,12 +337,25 @@ def apply_chunk(conn: psycopg.Connection, snapshot_id: int, chat_id: int, size: 
           (SELECT user_id FROM tg.membership WHERE %(absences)s AND chat_id = %(c)s AND end_source IS NULL
              AND user_id > %(k)s ORDER BY user_id LIMIT %(n)s)) u
         ORDER BY user_id LIMIT %(n)s""", p).fetchall()]
-    last = len(users) < size
+    scanned = len(users)
+    last = scanned < size
     counts = dict(listed=0, seeded=0, missed_joins=0, confirmed=0, absent_candidates=0, probes_queued=0,
                   conflicts=0)
     if users:
         p["hi"] = users[-1]
-        _erase_and_blank(conn, p, store_names)
+        if _erase_and_blank(conn, p, store_names):
+            # the cursor and the run row never hold an erased id: they come from the users left in the range (the
+            # dropped rows are gone, so a later chunk does not meet them again)
+            users = [r[0] for r in conn.execute("""
+                SELECT user_id FROM tg.snapshot_member WHERE snapshot_id = %(s)s AND user_id > %(k)s
+                  AND user_id <= %(hi)s
+                UNION
+                SELECT user_id FROM tg.membership WHERE %(absences)s AND chat_id = %(c)s AND end_source IS NULL
+                  AND user_id > %(k)s AND user_id <= %(hi)s
+                ORDER BY 1""", p).fetchall()]
+            if users:
+                p["hi"] = users[-1]
+    if users:
         _upsert_users(conn, p, store_names)
         prev = None
         if not late:
@@ -384,7 +405,7 @@ def apply_chunk(conn: psycopg.Connection, snapshot_id: int, chat_id: int, size: 
                 %(absent_candidates)s, %(probes_queued)s, 0, %(conflicts)s,
                 (SELECT count(*) + 1 FROM tg.reconcile_run WHERE snapshot_id = %(s)s), %(lo)s, %(hi)s)""",
                  {**counts, "c": chat_id, "s": snapshot_id, "lo": users[0] if users else None,
-                  "hi": users[-1] if users else None})
+                  "hi": users[-1] if users else None})  # NULL ends: no user left in the chunk
     if last:
         total = conn.execute("""
             SELECT count(*), sum(listed), sum(seeded), sum(missed_joins), sum(confirmed), sum(absent_candidates),
@@ -392,25 +413,27 @@ def apply_chunk(conn: psycopg.Connection, snapshot_id: int, chat_id: int, size: 
                              (snapshot_id,)).fetchone()
         log.info("snapshot %s of chat %s reconciled in %s chunks: listed %s, seeded %s, missed joins %s, "
                  "confirmed %s, absent candidates %s, probes queued %s, conflicts %s", snapshot_id, chat_id, *total)
-    return len(users)
+    return scanned
 
 
-def _erase_and_blank(conn: psycopg.Connection, p: dict, store_names: bool) -> None:
+def _erase_and_blank(conn: psycopg.Connection, p: dict, store_names: bool) -> int:
     """Drop the chunk's rows about people erased at or after the page (and erased inviters); blank names when the
-    owner keeps none (design.md 11: snapshot_member after reconcile)."""
+    owner keeps none (design.md 11: snapshot_member after reconcile). Returns the rows dropped."""
     erasures = conn.execute("""
         SELECT EXISTS (SELECT 1 FROM tg.erasure WHERE erased_at >= (
           SELECT min(seen_at) FROM tg.snapshot_member WHERE snapshot_id = %(s)s AND user_id > %(k)s
                                                         AND user_id <= %(hi)s))""", p).fetchone()[0]
+    dropped = 0
     if erasures:
-        conn.execute("DELETE FROM tg.snapshot_member WHERE snapshot_id = %(s)s AND user_id > %(k)s "
-                     "AND user_id <= %(hi)s AND tg.is_erased(user_id, seen_at)", p)
+        dropped = conn.execute("DELETE FROM tg.snapshot_member WHERE snapshot_id = %(s)s AND user_id > %(k)s "
+                               "AND user_id <= %(hi)s AND tg.is_erased(user_id, seen_at)", p).rowcount
         conn.execute("UPDATE tg.snapshot_member SET inviter_id = NULL WHERE snapshot_id = %(s)s AND user_id > %(k)s "
                      "AND user_id <= %(hi)s AND inviter_id IS NOT NULL AND tg.is_erased(inviter_id, seen_at)", p)
     if not store_names:
         conn.execute("""UPDATE tg.snapshot_member SET username = NULL, first_name = NULL, last_name = NULL
                         WHERE snapshot_id = %(s)s AND user_id > %(k)s AND user_id <= %(hi)s
                           AND (username IS NOT NULL OR first_name IS NOT NULL OR last_name IS NOT NULL)""", p)
+    return dropped
 
 
 def _upsert_users(conn: psycopg.Connection, p: dict, store_names: bool) -> None:
@@ -430,11 +453,11 @@ def _upsert_users(conn: psycopg.Connection, p: dict, store_names: bool) -> None:
 def _advance(conn: psycopg.Connection, snapshot_id: int, hi: int | None, last: bool) -> None:
     """Move the cursor past the chunk before any evidence is read for the rebuild (the rebuild counts the chunk's
     points and absences only for users within it). The last chunk marks the snapshot reconciled and clears the
-    cursor, so no user id stays behind in it."""
+    cursor, so no user id stays behind in it; a chunk with no user left (every row erased) keeps the cursor."""
     if last:
         conn.execute("UPDATE tg.snapshot SET reconciled_at = now(), applied_through_user_id = NULL "
                      "WHERE snapshot_id = %s", (snapshot_id,))
-    else:
+    elif hi is not None:
         conn.execute("UPDATE tg.snapshot SET applied_through_user_id = %s WHERE snapshot_id = %s", (hi, snapshot_id))
 
 
@@ -486,8 +509,10 @@ def register_gaps(conn: psycopg.Connection) -> int:
 
 def g1_chunk(conn: psycopg.Connection, gap_id: int, chat_id: int, size: int) -> int:
     """Rule G1 for one (gap, chat), one chunk: rebuild the next open spells doubted by the gap (last positive
-    evidence before its start; later spells cannot change); the last chunk queues outage probes for the newest of
-    them, within OUTAGE_BUDGET and for tracked chats only, and marks the progress done. Returns the spells taken."""
+    evidence before its start) or doubted since its start or later (a moved or merged gap start), and cancel the
+    pending outage probes of those no longer in doubt; the last chunk queues outage probes for the newest spells
+    doubted by the gap, within OUTAGE_BUDGET and for tracked chats only, and marks the progress done. Returns the
+    spells taken."""
     history.lock_chats(conn, [chat_id])
     row = conn.execute("""
         SELECT p.last_user_id, p.done, lower(g.period), c.tracked
@@ -496,11 +521,22 @@ def g1_chunk(conn: psycopg.Connection, gap_id: int, chat_id: int, size: int) -> 
     if row is None or row[1]:
         return 0
     cursor, _, start, tracked = row
+    # doubted by this gap (last positive evidence before its start), or doubted since its start or later: when a
+    # gap start moved earlier or vanished (gaps merged), such a doubt may have no gap left to stand on
     users = [r[0] for r in conn.execute("""
         SELECT user_id FROM tg.membership
-        WHERE chat_id = %s AND end_source IS NULL AND user_id > %s AND last_confirmed_at < %s
-        ORDER BY user_id LIMIT %s""", (chat_id, BEFORE_ALL if cursor is None else cursor, start, size)).fetchall()]
+        WHERE chat_id = %(c)s AND end_source IS NULL AND user_id > %(k)s
+          AND (last_confirmed_at < %(t)s OR suspect_since >= %(t)s)
+        ORDER BY user_id LIMIT %(n)s""", {"c": chat_id, "k": BEFORE_ALL if cursor is None else cursor, "t": start,
+                                          "n": size}).fetchall()]
     result = history.rebuild_pairs(conn, [(chat_id, u) for u in users])
+    if users:
+        # an outage probe for a spell no longer in doubt has nothing to check
+        conn.execute("""
+            UPDATE tg.probe p SET outcome = 'cancelled'
+            WHERE p.chat_id = %s AND p.user_id = ANY(%s::bigint[]) AND p.outcome = 'pending' AND p.reason = 'outage'
+              AND NOT EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.chat_id AND m.user_id = p.user_id
+                                AND m.end_source IS NULL AND m.suspect_since IS NOT NULL)""", (chat_id, users))
     if len(users) == size:
         conn.execute("UPDATE tg.gap_progress SET last_user_id = %s, updated_at = now() WHERE gap_id = %s "
                      "AND chat_id = %s", (users[-1], gap_id, chat_id))

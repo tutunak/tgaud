@@ -99,3 +99,36 @@ def test_reconcile_a_weekly_snapshot_at_scale(pg, capsys):
     assert same == history.RebuildResult()  # the sampled pairs equal a full rebuild
     if "TGAUD_RECONCILE_SCALE" in os.environ:
         assert total < 30 * 60 and longest < 10
+
+
+def test_one_new_case_in_a_dense_hour_is_checked_within_the_step(pg, capsys):
+    """Recording one new E4 next to a dense hour of cases (the review's case: 120 000 S3 over 50 minutes, 40 a second)
+    runs in the caller's transaction, ingest's included: it must stay well inside a step. The suite runs 20 000;
+    TGAUD_CONTRADICTION_SCALE=120000 runs the review's size."""
+    n = int(os.environ.get("TGAUD_CONTRADICTION_SCALE", "20000"))
+    dsn = pg.make_db(migrated=True)
+    with psycopg.connect(dsn) as c:
+        c.execute("INSERT INTO tg.chat (chat_id, chat_type, title, tracked) VALUES (%s, 'channel', 'dense', true)",
+                  (CHAT,))
+        c.execute("INSERT INTO tg.tg_user (user_id, first_seen_at, last_seen_at) "
+                  "SELECT u, %s, %s FROM generate_series(1, 1000) u", (WEEK0, WEEK0))
+        c.execute("""INSERT INTO tg.contradiction_case (chat_id, user_id, rule, at, source_id)
+                     SELECT %(c)s, 1 + i %% 1000, 'S3', %(t)s::timestamptz + i * (interval '50 minutes' / %(n)s), i
+                     FROM generate_series(0, %(n)s - 1) i""", {"c": CHAT, "t": WEEK0, "n": n})
+        c.execute("ANALYZE tg.contradiction_case")
+        t = time.perf_counter()
+        c.execute("SELECT tg.contradiction_check(%s, ARRAY[%s::timestamptz, %s::timestamptz + interval '50 minutes'])",
+                  (CHAT, WEEK0, WEEK0))
+        first = time.perf_counter() - t
+        c.commit()
+        t = time.perf_counter()
+        c.execute("SELECT tg.record_contradictions(ARRAY[%s]::bigint[], ARRAY[7]::bigint[], ARRAY['E4'], "
+                  "ARRAY[%s::timestamptz + interval '25 minutes'], ARRAY[999999999]::bigint[])", (CHAT, WEEK0))
+        one = time.perf_counter() - t
+        gaps = c.execute("SELECT count(*) FROM tg.gap WHERE reason = 'contradiction'").fetchone()[0]
+        c.rollback()
+    with capsys.disabled():
+        print(f"\ncontradiction scale: {n} cases over 50 minutes; first check {first:.2f} s, "
+              f"one new case recorded and checked in {one:.2f} s")
+    assert gaps == 1
+    assert one < 5
