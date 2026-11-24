@@ -1,31 +1,321 @@
-"""Ingest (its own thread, on the connection that holds the service lock). Filled by the ingest task.
+"""Ingest (its own thread, on the connection that holds the service lock): design.md 7, D1, D14.
 
 serve calls, in this order, with the service lock held:
 
     identify(ctx, conn) the identity guards of the deploy contract, before the generation is claimed: getMe's
                         bot id and ctx.config.link_key_fingerprint() against tg.bot_state; on a mismatch raise
                         tgaud.jobs.StartupError (exit 2) having written nothing. On the first start (no row) it
-                        records both. It must leave exactly one tg.bot_state row and commit or roll back.
+                        records both. It leaves exactly one tg.bot_state row and commits or rolls back.
                         No other writes here: a refused start must not change the database, not even the
                         serve generation, which serve claims only after this returns.
-    startup(ctx, conn)  once, after the claim: the other startup writes (rights checks, ...); each transaction
+    startup(ctx, conn)  once, after the claim: partitions, allowed_updates, and the rights check of every
+                        tracked chat (getChatMember(chat, bot) -> bot_status, coverage, not_admin / rights_lost
+                        gaps, the chat gauges); queues a getChat metadata fetch for each. Every transaction
                         starts with ctx.fence(conn).
-    run(ctx, conn)      the long-polling loop until ctx.stop is set: ctx.api.get_updates(timeout=8, ...), one
-                        transaction per update that starts with ctx.fence(conn) and ends with the offset;
-                        ctx.health.mark_poll_ok() after each successful poll and ctx.health.mark_commit() after
-                        each successful commit (an empty poll counts). Returning or raising while ctx.stop is not
-                        set ends the process with exit 1 (the connection, and with it the lock, is never
-                        reopened; systemd restarts the unit).
+    run(ctx, conn)      the long-polling loop until ctx.stop is set.
 
-Core stub: identify implements the two guards, startup does nothing, run idles until the stop.
+The loop. Before every getUpdates: when tg.bot_state.last_update_at is older than 6 days (or unset), the offset
+is omitted (ids restart after a week without updates, F§1) until an update commits. Then
+getUpdates(offset, timeout=POLL_TIMEOUT, limit=100, allowed_updates), and per update one transaction:
+
+    fence -> tg.update_receipt ON CONFLICT DO NOTHING (seen: skip the body) -> lock_chats -> the body by type
+    -> tg.bot_state (next_offset = update_id + 1, last_update_*, last_poll_ok_at; caught_up_at = the poll's
+    send time in the transaction of the response's last update when the response had fewer than 100) -> commit
+
+An empty response commits last_poll_ok_at and caught_up_at in a transaction of its own. A service_down gap
+is recorded in the transaction that advances last_poll_ok_at when the previous durable value is more than
+24 h old (a restart after a long stop, or a long run of failed polls), and a suspected one when an update's lag
+passed 20 h; the open stays of the affected chats are left to the reconciler (G1). Metrics and health marks
+happen only after a commit.
+
+Failures: a body that does not parse goes through the malformed path in one transaction (a receipt with
+update_type 'malformed' dated at the receive time, the redacted payload in tg.raw_update when it is a
+membership update with a known chat id, the offset), counted as tgaud_ingest_failures_total{stage="parse"};
+the loop never wedges on one bad update. A database error rolls back and retries the same update with backoff
+(stage "db") and never advances the offset; a lost connection ends ingest (serve exits 1).
+
+Privacy (design.md 11): never bio, user_chat_id or message text; a full invite link made by this bot is stored
+only as HMAC-SHA256 with TGAUD_LINK_HMAC_KEY (tg.invite_link.link_digest, and a digest marker in raw payloads);
+names are dropped when TGAUD_STORE_NAMES is off. Updates about an erased person (tg.is_erased) dated before
+the erasure are committed as a receipt only; an erased actor, inviter or resolver is stored as NULL (with
+member_event.actor_is_other kept) and replaced in raw payloads.
+
+Chats: only channels, groups and supergroups carry audience data; any other chat (a private chat, e.g. a user
+blocking the bot) commits the receipt (without the chat id) and the offset only. Every chat id is routed through
+tg.chat_alias rows whose moved_at is set (M1 done); an alias still waiting for M1 (moved_at NULL, the new chat
+not tracked) routes nothing. Migrations (migrate_to_chat_id in the old group, migrate_from_chat_id in the new
+supergroup, in either order and repeated) record the alias once; M1 (tg.move_chat_history, then a rebuild of the
+moved pairs) runs when the new chat is tracked, now or when it becomes tracked later; until then M2 holds.
+
+getChat metadata is fetched between polls for chats whose tg.chat.metadata_due_at has passed (first seen,
+became tracked, every tracked chat at startup), retried with backoff until it succeeds; the update that queued
+it never waits for it.
 """
 
 from __future__ import annotations
 
-import psycopg
+import copy
+import datetime as dt
+import logging
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
+from typing import Any
 
-from tgaud.botapi import ALLOWED_UPDATES
+import psycopg
+from psycopg.types.json import Jsonb
+
+from tgaud import db, history, metrics
+from tgaud.botapi import ALLOWED_UPDATES, POLL_TIMEOUT, ApiError
 from tgaud.jobs import JobContext, StartupError
+
+log = logging.getLogger(__name__)
+
+LIMIT = 100
+STALE_OFFSET = dt.timedelta(days=6)
+SERVICE_DOWN = dt.timedelta(hours=24)
+LAG_SUSPECT = dt.timedelta(hours=20)
+SHORT_STAY = dt.timedelta(hours=48)
+MIN_EMPTY_POLL = 1.0  # seconds: an empty answer faster than this (a broken proxy, a fake) is not hammered
+MAX_BACKOFF = 60.0
+METADATA_BATCH = 5
+METADATA_BACKOFF = (30, 120, 600, 1800, 3600)  # seconds after the 1st, 2nd, ... failed getChat
+
+MEMBERSHIP_TYPES = ("chat_member", "my_chat_member", "chat_join_request")
+AUDIENCE_CHATS = ("channel", "group", "supergroup")
+STATUSES = ("creator", "administrator", "member", "restricted", "left", "kicked")
+ADMIN = ("creator", "administrator")
+EXIT_KINDS = ("leave", "kick", "restrict_out")
+EVENT_LABELS = ("join", "leave", "kick", "restrict_out", "ban_out", "unban")  # anything else: "role"
+POST_KINDS = ("text", "photo", "video", "animation", "audio", "document", "poll", "giveaway")
+# Service messages carry one of these keys; they are not someone writing (activity) nor a channel post.
+SERVICE_KEYS = frozenset((
+    "new_chat_members", "left_chat_member", "new_chat_title", "new_chat_photo", "delete_chat_photo",
+    "group_chat_created", "supergroup_chat_created", "channel_chat_created", "message_auto_delete_timer_changed",
+    "migrate_to_chat_id", "migrate_from_chat_id", "pinned_message", "successful_payment", "refunded_payment",
+    "users_shared", "chat_shared", "connected_website", "write_access_allowed", "passport_data",
+    "proximity_alert_triggered", "boost_added", "chat_background_set", "forum_topic_created",
+    "forum_topic_edited", "forum_topic_closed", "forum_topic_reopened", "general_forum_topic_hidden",
+    "general_forum_topic_unhidden", "giveaway_created", "giveaway_winners", "giveaway_completed",
+    "video_chat_scheduled", "video_chat_started", "video_chat_ended", "video_chat_participants_invited",
+    "web_app_data", "gift", "unique_gift", "paid_message_price_changed", "direct_message_price_changed",
+    "checklist_tasks_done", "checklist_tasks_added", "suggested_post_approved", "suggested_post_declined",
+    "suggested_post_paid", "suggested_post_refunded", "suggested_post_approval_failed",
+))
+DIGEST_MARK = "hmac-sha256:"
+
+
+class Malformed(ValueError):
+    """The update's body cannot be parsed."""
+
+
+# ------------------------------------------------------------------------------------------------------------
+# Parsing (pure Python: nothing here touches the database)
+# ------------------------------------------------------------------------------------------------------------
+
+
+def _clean(v: Any) -> Any:
+    """The JSON value without NUL characters (PostgreSQL text and jsonb refuse them)."""
+    if isinstance(v, str):
+        return v.replace("\x00", "")
+    if isinstance(v, dict):
+        return {_clean(k): _clean(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_clean(x) for x in v]
+    return v
+
+
+def _int(v: Any, what: str) -> int:
+    if isinstance(v, bool) or not isinstance(v, int):
+        raise Malformed(f"{what} is not an integer")
+    return v
+
+
+def _opt_str(v: Any) -> str | None:
+    return v if isinstance(v, str) and v else None
+
+
+def _opt_bool(v: Any) -> bool | None:
+    return v if isinstance(v, bool) else None
+
+
+def _ts(v: Any, what: str) -> dt.datetime:
+    n = _int(v, what)
+    if n <= 0 or n > 32503680000:  # year 3000
+        raise Malformed(f"{what} is out of range")
+    return dt.datetime.fromtimestamp(n, dt.UTC)
+
+
+def _until(v: Any) -> dt.datetime | None:
+    """until_date: absent or 0 = forever / none."""
+    if v is None or v == 0:
+        return None
+    return _ts(v, "until_date")
+
+
+def _dict(v: Any, what: str) -> dict:
+    if not isinstance(v, dict):
+        raise Malformed(f"{what} is missing")
+    return v
+
+
+@dataclass(frozen=True)
+class User:
+    id: int
+    is_bot: bool
+    is_premium: bool | None
+    language_code: str | None
+    username: str | None
+    first_name: str | None
+    last_name: str | None
+
+
+@dataclass(frozen=True)
+class Chat:
+    id: int
+    type: str
+    title: str | None
+    username: str | None
+
+
+@dataclass(frozen=True)
+class Member:
+    status: str
+    user: User
+    is_member: bool | None
+    until_date: dt.datetime | None
+    can_invite_users: bool | None
+    can_restrict_members: bool | None
+
+
+@dataclass(frozen=True)
+class Link:
+    invite_link: str
+    creator: User | None
+    name: str | None
+    is_primary: bool | None
+    creates_join_request: bool | None
+    subscription_price: int | None
+
+
+@dataclass
+class Parsed:
+    update_id: int
+    type: str
+    date: dt.datetime
+    chat: Chat | None
+    inner: dict | None  # the update's object (ChatMemberUpdated, ChatJoinRequest, Message)
+    sender: User | None = None  # `from`
+    member: Member | None = None
+    old: Member | None = None
+    link: Link | None = None
+    via_join_request: bool = False
+    via_folder: bool = False
+
+
+def parse_user(v: Any, what: str = "user") -> User:
+    d = _dict(v, what)
+    return User(id=_int(d.get("id"), f"{what}.id"), is_bot=d.get("is_bot") is True,
+                is_premium=True if d.get("is_premium") is True else None,
+                language_code=_opt_str(d.get("language_code")), username=_opt_str(d.get("username")),
+                first_name=_opt_str(d.get("first_name")), last_name=_opt_str(d.get("last_name")))
+
+
+def parse_chat(v: Any) -> Chat:
+    d = _dict(v, "chat")
+    kind = d.get("type")
+    if not isinstance(kind, str):
+        raise Malformed("chat.type is missing")
+    return Chat(id=_int(d.get("id"), "chat.id"), type=kind, title=_opt_str(d.get("title")),
+                username=_opt_str(d.get("username")))
+
+
+def parse_member(v: Any, what: str) -> Member:
+    d = _dict(v, what)
+    status = d.get("status")
+    if status not in STATUSES:
+        raise Malformed(f"{what}.status {status!r} is unknown")
+    is_member = _opt_bool(d.get("is_member")) if status == "restricted" else None
+    return Member(status=status, user=parse_user(d.get("user"), f"{what}.user"), is_member=is_member,
+                  until_date=_until(d.get("until_date")),
+                  can_invite_users=_opt_bool(d.get("can_invite_users")),
+                  can_restrict_members=_opt_bool(d.get("can_restrict_members")))
+
+
+def parse_link(v: Any) -> Link | None:
+    if v is None:
+        return None
+    d = _dict(v, "invite_link")
+    text = d.get("invite_link")
+    if not isinstance(text, str) or not text:
+        raise Malformed("invite_link.invite_link is missing")
+    price = d.get("subscription_price")
+    return Link(invite_link=text, creator=parse_user(d["creator"], "invite_link.creator") if "creator" in d else None,
+                name=_opt_str(d.get("name")), is_primary=_opt_bool(d.get("is_primary")),
+                creates_join_request=_opt_bool(d.get("creates_join_request")),
+                subscription_price=price if isinstance(price, int) and not isinstance(price, bool) else None)
+
+
+def update_type_of(raw: dict) -> str | None:
+    keys = [k for k in raw if k != "update_id"]
+    return keys[0] if len(keys) == 1 and isinstance(keys[0], str) else None
+
+
+def parse_update(raw: dict, received: dt.datetime) -> Parsed:
+    """The update's fields this service uses; raises Malformed (or a TypeError/KeyError on odd shapes).
+    `received` dates an update of a type that was not asked for and has no date."""
+    update_id = _int(raw.get("update_id"), "update_id")
+    kind = update_type_of(raw)
+    if kind is None:
+        raise Malformed("an update must carry exactly one object")
+    inner = raw[kind]
+    if not isinstance(inner, dict):
+        raise Malformed(f"{kind} is not an object")
+    if kind in ("chat_member", "my_chat_member"):
+        p = Parsed(update_id, kind, _ts(inner.get("date"), "date"), parse_chat(inner.get("chat")), inner,
+                   sender=parse_user(inner.get("from"), "from"),
+                   member=parse_member(inner.get("new_chat_member"), "new_chat_member"),
+                   old=parse_member(inner.get("old_chat_member"), "old_chat_member"),
+                   link=parse_link(inner.get("invite_link")),
+                   via_join_request=inner.get("via_join_request") is True,
+                   via_folder=inner.get("via_chat_folder_invite_link") is True)
+        if p.member.user.id != p.old.user.id:
+            raise Malformed("old and new chat member are different users")
+        return p
+    if kind == "chat_join_request":
+        return Parsed(update_id, kind, _ts(inner.get("date"), "date"), parse_chat(inner.get("chat")), inner,
+                      sender=parse_user(inner.get("from"), "from"), link=parse_link(inner.get("invite_link")))
+    if kind in ("message", "channel_post"):
+        sender = parse_user(inner["from"], "from") if "from" in inner else None
+        _int(inner.get("message_id"), "message_id")
+        return Parsed(update_id, kind, _ts(inner.get("date"), "date"), parse_chat(inner.get("chat")), inner,
+                      sender=sender)
+    # a type that was not asked for: only its date, when it has one
+    date = inner.get("date")
+    chat = inner.get("chat")
+    return Parsed(update_id, kind, _ts(date, "date") if date is not None else received,
+                  parse_chat(chat) if chat is not None else None, None)
+
+
+def is_masked(link: str) -> bool:
+    """Telegram replaces the second half of other admins' links with an ellipsis (F§4)."""
+    return "…" in link or "..." in link
+
+
+def post_kind(msg: dict) -> str:
+    for k in POST_KINDS:
+        if k in msg:
+            return k
+    return "other"
+
+
+def _is_user_dict(d: dict) -> bool:
+    return isinstance(d.get("id"), int) and "is_bot" in d
+
+
+# ------------------------------------------------------------------------------------------------------------
+# The service entry points
+# ------------------------------------------------------------------------------------------------------------
 
 
 def identify(ctx: JobContext, conn: psycopg.Connection) -> None:
@@ -56,9 +346,867 @@ def identify(ctx: JobContext, conn: psycopg.Connection) -> None:
 
 
 def startup(ctx: JobContext, conn: psycopg.Connection) -> None:
-    pass
+    Ingest(ctx, conn).startup()
 
 
 def run(ctx: JobContext, conn: psycopg.Connection) -> None:
-    while not ctx.stop.wait(1.0):
-        pass
+    Ingest(ctx, conn).run()
+
+
+# ------------------------------------------------------------------------------------------------------------
+# The ingest worker
+# ------------------------------------------------------------------------------------------------------------
+
+
+@dataclass
+class Effects:
+    """What to tell the metrics and logs once the transaction committed."""
+
+    actions: list[Callable[[], None]] = field(default_factory=list)
+
+    def add(self, action: Callable[[], None]) -> None:
+        self.actions.append(action)
+
+    def apply(self) -> None:
+        for a in self.actions:
+            try:
+                a()
+            except Exception:  # a metric must never break ingest
+                log.exception("ingest: a post-commit action failed")
+
+
+class Ingest:
+    def __init__(self, ctx: JobContext, conn: psycopg.Connection, *, poll_timeout: int = POLL_TIMEOUT) -> None:
+        self.ctx = ctx
+        self.conn = conn
+        self.poll_timeout = poll_timeout
+        self.bot_id: int | None = None
+        self.store_names = ctx.config.store_names
+        self._partitions: set[tuple[str, dt.date]] = set()
+        self.backoff_base = 1.0  # first wait after a failed poll or database error (seconds); doubles
+        self.min_empty_poll = MIN_EMPTY_POLL
+        self._poll_backoff = self.backoff_base
+        # test hook: called inside each update (or empty poll) transaction just before the commit, with the
+        # update id (None for an empty poll)
+        self.before_commit: Callable[[int | None], None] | None = None
+
+    # -- time --------------------------------------------------------------------------------------------
+
+    def now(self) -> dt.datetime:
+        return dt.datetime.fromtimestamp(self.ctx.clock(), dt.UTC)
+
+    # -- transactions ------------------------------------------------------------------------------------
+
+    def _bot_id(self) -> int:
+        if self.bot_id is None:
+            row = self.conn.execute("SELECT bot_id FROM tg.bot_state").fetchone()
+            self.conn.rollback()
+            if row is None:
+                raise StartupError("tg.bot_state has no row: identify did not run")
+            self.bot_id = int(row[0])
+        return self.bot_id
+
+    def _transaction(self, body: Callable[[Effects], Any], *, retry: bool = True) -> Any:
+        """Run body in one fenced transaction and commit; a database error rolls back and (with retry) tries
+        again with backoff until it succeeds or the stop is set (then returns None). A lost connection, a
+        takeover (StaleGeneration) and anything that is not a database error propagate."""
+        backoff = self.backoff_base
+        while True:
+            started = time.monotonic()
+            effects = Effects()
+            try:
+                self.ctx.fence(self.conn)
+                result = body(effects)
+                self.conn.commit()
+            except db.StaleGeneration:
+                self._rollback()
+                raise
+            except psycopg.Error as e:
+                self._rollback()
+                if self.conn.closed or self.conn.broken:
+                    raise
+                metrics.INGEST_FAILURES.labels("db").inc()
+                if not retry or self.ctx.stop.is_set():
+                    raise
+                log.warning("ingest: database error (%s: %s); retry in %.0f s", type(e).__name__,
+                            str(e).splitlines()[0] if str(e) else "", backoff)
+                if self.ctx.stop.wait(backoff):
+                    return None
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+            except BaseException:
+                self._rollback()
+                raise
+            metrics.DB_TRANSACTION_SECONDS.labels("ingest").observe(time.monotonic() - started)
+            effects.apply()
+            return result if result is not None else True
+
+    def _rollback(self) -> None:
+        self._partitions.clear()  # partitions created in the rolled-back transaction are gone
+        try:
+            self.conn.rollback()
+        except psycopg.Error:
+            pass
+
+    def _ensure_partitions(self, table: str, step: str, at: dt.datetime) -> None:
+        day = at.date() if step == "day" else at.date().replace(day=1)
+        if (table, day) in self._partitions:
+            return
+        start = dt.datetime.combine(day, dt.time(), dt.UTC)
+        self.conn.execute("SELECT tg.ensure_partitions(%s, %s, %s, %s)",
+                          (table, step, start, start + dt.timedelta(days=1)))
+        self._partitions.add((table, day))
+
+    # -- startup -----------------------------------------------------------------------------------------
+
+    def startup(self) -> None:
+        bot_id = self._bot_id()
+        now = self.now()
+
+        def prepare(fx: Effects) -> list[int]:
+            self.conn.execute("SELECT * FROM tg.maintain_partitions(%s)", (now,))
+            self.conn.execute("UPDATE tg.bot_state SET allowed_updates = %s, updated_at = now() WHERE bot_id = %s",
+                              (list(ALLOWED_UPDATES), bot_id))
+            rows = self.conn.execute("SELECT chat_id FROM tg.chat WHERE tracked ORDER BY chat_id").fetchall()
+            return [r[0] for r in rows]
+
+        chats = self._transaction(prepare)
+        if chats is None or chats is True:
+            chats = []
+        for chat_id in chats:
+            if self.ctx.stop.is_set():
+                return
+            self.check_rights(chat_id)
+
+        def queue(fx: Effects) -> None:
+            self.conn.execute("UPDATE tg.chat SET metadata_due_at = %s WHERE tracked", (now,))
+
+        self._transaction(queue)
+
+    def check_rights(self, chat_id: int) -> None:
+        """getChatMember(chat, bot) -> bot status, rights, coverage and gaps of one chat."""
+        assert self.ctx.api is not None
+        bot_id = self._bot_id()
+        try:
+            m = self.ctx.api.get_chat_member(chat_id, bot_id)
+            member = parse_member(m, "chat_member")
+        except ApiError as e:
+            if e.outcome not in ("400", "403"):
+                log.warning("ingest: rights check of chat %s failed (%s); left as it was", chat_id, e.outcome)
+                return
+            # chat not found, bot kicked or not a member: the bot is not admin there
+            kicked = "kick" in (e.description or "").lower()
+            member = Member("kicked" if kicked else "left", User(bot_id, True, None, None, None, None, None),
+                            None, None, None, None)
+        except (Malformed, KeyError, TypeError) as e:
+            log.warning("ingest: rights check of chat %s returned an unexpected member (%s)", chat_id, e)
+            return
+        at = self.now()
+
+        def body(fx: Effects) -> None:
+            pending = self._pending_aliases(chat_id)
+            history.lock_chats(self.conn, [chat_id, *(o for o, _ in pending)])
+            if self.conn.execute("SELECT 1 FROM tg.chat WHERE chat_id = %s", (chat_id,)).fetchone() is None:
+                return
+            self._set_bot_state(chat_id, at, member, "rights_check", fx)
+            self._move_pending(chat_id, pending)
+
+        self._transaction(body)
+
+    # -- the loop ----------------------------------------------------------------------------------------
+
+    def run(self) -> None:
+        self._bot_id()
+        while not self.ctx.stop.is_set():
+            self.refresh_metadata()
+            if self.ctx.stop.is_set():
+                return
+            self.poll_once()
+
+    def _offset(self) -> int | None:
+        """The offset for the next getUpdates: None while the last committed update is older than 6 days."""
+        row = self.conn.execute("SELECT next_offset, last_update_at FROM tg.bot_state WHERE bot_id = %s",
+                                (self._bot_id(),)).fetchone()
+        self.conn.rollback()
+        next_offset, last_update_at = row
+        if last_update_at is None or self.now() - last_update_at > STALE_OFFSET:
+            return None
+        return int(next_offset)
+
+    def poll_once(self) -> int | None:
+        """One getUpdates and its updates; returns how many updates were committed (None after a failed
+        poll)."""
+        assert self.ctx.api is not None
+        offset = self._offset()
+        sent = self.now()
+        started = time.monotonic()
+        try:
+            updates = self.ctx.api.get_updates(offset, timeout=self.poll_timeout, limit=LIMIT,
+                                               allowed_updates=ALLOWED_UPDATES)
+            if not isinstance(updates, list):
+                raise ApiError("getUpdates", "other", "result is not a list")
+        except ApiError as e:
+            if self.ctx.stop.is_set():
+                return None
+            wait = e.retry_after if e.outcome == "429" and e.retry_after else self._poll_backoff
+            log.warning("ingest: getUpdates failed (%s: %s); retry in %.0f s", e.outcome, e.description, wait)
+            self._poll_backoff = min(self._poll_backoff * 2, MAX_BACKOFF)
+            self.ctx.stop.wait(wait)
+            return None
+        except Exception:
+            if self.ctx.stop.is_set():  # the client was closed by the shutdown
+                return None
+            raise
+        self._poll_backoff = self.backoff_base
+        received = self.now()
+        self.ctx.health.mark_poll_ok()
+        if not updates:
+            def empty(fx: Effects) -> None:
+                self._advance(fx, received, caught_up=sent)
+                self._hook(None)
+
+            if self._transaction(empty) is not None:
+                self.ctx.health.mark_commit()
+            elapsed = time.monotonic() - started
+            if elapsed < self.min_empty_poll:
+                self.ctx.stop.wait(self.min_empty_poll - elapsed)
+            return 0
+        done = 0
+        short = len(updates) < LIMIT
+        for i, raw in enumerate(updates):
+            if self.ctx.stop.is_set():
+                break
+            last = i == len(updates) - 1
+            if self.handle(raw, received, sent if (last and short) else None):
+                done += 1
+                self.ctx.health.mark_commit()
+            elif self.ctx.stop.is_set():
+                break
+        return done
+
+    # -- one update --------------------------------------------------------------------------------------
+
+    def handle(self, raw: Any, received: dt.datetime, caught_up: dt.datetime | None) -> bool:
+        """Process one update in one transaction; True when it committed."""
+        if not isinstance(raw, dict) or isinstance(raw.get("update_id"), bool) \
+                or not isinstance(raw.get("update_id"), int):
+            metrics.INGEST_FAILURES.labels("parse").inc()
+            log.error("ingest: an update without a valid update_id was skipped")
+            return False
+        raw = _clean(raw)
+        try:
+            parsed = parse_update(raw, received)
+        except (Malformed, KeyError, TypeError, ValueError, AttributeError) as e:
+            return self._malformed(raw, received, caught_up, f"{type(e).__name__}: {e}")
+        try:
+            ok = self._transaction(lambda fx: self._apply(fx, parsed, raw, received, caught_up))
+        except (db.StaleGeneration, psycopg.Error):
+            raise
+        except Exception as e:  # a body this code cannot handle is a parse failure, not a wedge
+            log.exception("ingest: update %s could not be processed", parsed.update_id)
+            return self._malformed(raw, received, caught_up, f"{type(e).__name__}: {e}")
+        return ok is not None
+
+    def _malformed(self, raw: dict, received: dt.datetime, caught_up: dt.datetime | None, why: str) -> bool:
+        update_id = int(raw["update_id"])
+        kind = update_type_of(raw)
+        inner = raw.get(kind) if kind else None
+        chat_id = None
+        if isinstance(inner, dict) and isinstance(inner.get("chat"), dict):
+            cid = inner["chat"].get("id")
+            if isinstance(cid, int) and not isinstance(cid, bool) and inner["chat"].get("type") in AUDIENCE_CHATS:
+                chat_id = cid
+        log.error("ingest: update %s (%s) does not parse (%s): recorded as malformed", update_id, kind, why)
+
+        def body(fx: Effects) -> None:
+            self._ensure_partitions("update_receipt", "day", received)
+            self.conn.execute("""INSERT INTO tg.update_receipt (update_id, update_date, update_type, chat_id, received_at)
+                                 VALUES (%s, %s, 'malformed', %s, %s) ON CONFLICT DO NOTHING""",
+                              (update_id, received, chat_id, received))
+            if kind in MEMBERSHIP_TYPES and chat_id is not None and isinstance(inner, dict):
+                subject = _subject_id(kind, inner)
+                # the payload's date is unknown: anyone ever erased is left out
+                if not self._erased([subject], dt.datetime(1970, 1, 1, tzinfo=dt.UTC)):
+                    self._raw_update(update_id, received, kind, chat_id, subject, inner, received, erased=set())
+            self._advance(fx, received, update_id=update_id, update_date=received, caught_up=caught_up)
+            fx.add(lambda: metrics.INGEST_FAILURES.labels("parse").inc())
+            fx.add(lambda: metrics.UPDATES.labels("malformed").inc())
+            self._hook(update_id)
+
+        return self._transaction(body) is not None
+
+    def _hook(self, update_id: int | None) -> None:
+        if self.before_commit is not None:
+            self.before_commit(update_id)
+
+    def _apply(self, fx: Effects, p: Parsed, raw: dict, received: dt.datetime,
+               caught_up: dt.datetime | None) -> None:
+        conn = self.conn
+        in_scope = p.chat is not None and p.chat.type in AUDIENCE_CHATS
+        self._ensure_partitions("update_receipt", "day", p.date)
+        seen = conn.execute("""INSERT INTO tg.update_receipt (update_id, update_date, update_type, chat_id, received_at)
+                               VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING RETURNING 1""",
+                            (p.update_id, p.date, p.type, p.chat.id if in_scope else None, received)).fetchone() is None
+        if not seen and in_scope:
+            self._body(fx, p, raw, received)
+        self._advance(fx, received, update_id=p.update_id, update_date=p.date, caught_up=caught_up)
+        lag = max(0.0, (received - p.date).total_seconds())
+        fx.add(lambda: metrics.UPDATES.labels(p.type).inc())
+        fx.add(lambda: metrics.UPDATE_LAG.labels(p.type).observe(lag))
+        self._hook(p.update_id)
+
+    def _advance(self, fx: Effects, received: dt.datetime, *, update_id: int | None = None,
+                 update_date: dt.datetime | None = None, caught_up: dt.datetime | None = None) -> None:
+        """tg.bot_state after an update (or an empty poll), and the service_down gaps."""
+        bot_id = self._bot_id()
+        if update_id is None:
+            row = self.conn.execute(
+                """WITH old AS (SELECT last_poll_ok_at FROM tg.bot_state WHERE bot_id = %(bot)s)
+                   UPDATE tg.bot_state SET last_poll_ok_at = greatest(last_poll_ok_at, %(recv)s),
+                          caught_up_at = CASE WHEN %(cu)s::timestamptz IS NULL THEN caught_up_at
+                                              ELSE greatest(caught_up_at, %(cu)s) END,
+                          updated_at = now()
+                   WHERE bot_id = %(bot)s RETURNING (SELECT last_poll_ok_at FROM old)""",
+                dict(bot=bot_id, recv=received, cu=caught_up)).fetchone()
+        else:
+            row = self.conn.execute(
+                """WITH old AS (SELECT last_poll_ok_at FROM tg.bot_state WHERE bot_id = %(bot)s)
+                   UPDATE tg.bot_state SET next_offset = %(id)s + 1, last_update_id = %(id)s,
+                          last_update_at = %(date)s, last_poll_ok_at = greatest(last_poll_ok_at, %(recv)s),
+                          caught_up_at = CASE WHEN %(cu)s::timestamptz IS NULL THEN caught_up_at
+                                              ELSE greatest(caught_up_at, %(cu)s) END,
+                          updated_at = now()
+                   WHERE bot_id = %(bot)s RETURNING (SELECT last_poll_ok_at FROM old)""",
+                dict(bot=bot_id, id=update_id, date=update_date, recv=received, cu=caught_up)).fetchone()
+        previous = row[0] if row else None
+        if previous is not None and received - previous > SERVICE_DOWN:
+            self.conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                                 VALUES (NULL, tstzrange(%s, %s), 'service_down', true, %s, %s)""",
+                              (previous, received, received, "no successful getUpdates for longer than 24 h"))
+            lost = (received - previous - SERVICE_DOWN).total_seconds()
+            fx.add(lambda: metrics.LOST_SECONDS.inc(lost))
+            log.warning("ingest: no successful poll since %s: service_down gap recorded", previous.isoformat())
+        if update_date is not None and received - update_date > LAG_SUSPECT:
+            hit = self.conn.execute("""SELECT 1 FROM tg.gap WHERE chat_id IS NULL AND reason = 'service_down'
+                                       AND period && tstzrange(%s, %s) LIMIT 1""",
+                                    (update_date, received)).fetchone()
+            if hit is None:
+                self.conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                                     VALUES (NULL, tstzrange(%s, %s), 'service_down', false, %s, %s)""",
+                                  (update_date, received, received, "update lag passed 20 h"))
+
+    # -- bodies ------------------------------------------------------------------------------------------
+
+    def _route(self, chat_id: int) -> int:
+        row = self.conn.execute("SELECT chat_id FROM tg.chat_alias WHERE old_chat_id = %s AND moved_at IS NOT NULL",
+                                (chat_id,)).fetchone()
+        return int(row[0]) if row else chat_id
+
+    def _erased(self, ids: Iterable[int | None], at: dt.datetime) -> set[int]:
+        ids = sorted({i for i in ids if i is not None})
+        if not ids:
+            return set()
+        rows = self.conn.execute("SELECT u FROM unnest(%s::bigint[]) u WHERE tg.is_erased(u, %s)",
+                                 (ids, at)).fetchall()
+        return {int(r[0]) for r in rows}
+
+    def _body(self, fx: Effects, p: Parsed, raw: dict, received: dt.datetime) -> None:
+        conn = self.conn
+        if p.type not in (*MEMBERSHIP_TYPES, "message", "channel_post"):
+            return
+        assert p.chat is not None and p.inner is not None
+        subject = self._subject(p)
+        secondary = [p.sender.id if p.sender else None, p.link.creator.id if p.link and p.link.creator else None]
+        erased = self._erased([subject, *secondary], p.date)
+        if subject is not None and subject in erased:
+            return  # evidence from before the person's erasure: the receipt only
+        # writers of evidence lock every chat the transaction touches, once, in ascending order
+        raw_chat = p.chat.id
+        migration = self._migration_of(p)
+        pending: list[tuple[int, dt.datetime]] = []
+        if p.type == "my_chat_member":
+            pending = self._pending_aliases(raw_chat)
+        if p.type in ("chat_member", "my_chat_member") or migration is not None:
+            lock = {raw_chat, self._route(raw_chat), *(o for o, _ in pending)}
+            if migration is not None:
+                lock |= {migration[0], migration[1]}
+            history.lock_chats(conn, lock)
+        chat_id = self._route(raw_chat)
+        if chat_id == raw_chat:
+            self._upsert_chat(p.chat, received)
+        if p.type == "chat_member":
+            self._chat_member(fx, p, chat_id, raw_chat, erased, received)
+        elif p.type == "my_chat_member":
+            self._my_chat_member(fx, p, chat_id, raw_chat, pending, erased, received)
+        elif p.type == "chat_join_request":
+            self._join_request(fx, p, chat_id, raw_chat, erased, received)
+        elif p.type == "message":
+            self._message(fx, p, chat_id, raw_chat, migration, received)
+        elif p.type == "channel_post":
+            self._channel_post(fx, p, chat_id)
+
+    def _pending_aliases(self, chat_id: int) -> list[tuple[int, dt.datetime]]:
+        """Migrations into this chat whose history waits for M1 (old chat id, migrated_at)."""
+        return [(int(r[0]), r[1]) for r in self.conn.execute(
+            "SELECT old_chat_id, migrated_at FROM tg.chat_alias WHERE chat_id = %s AND moved_at IS NULL "
+            "ORDER BY old_chat_id", (chat_id,)).fetchall()]
+
+    def _move_pending(self, chat_id: int, pending: list[tuple[int, dt.datetime]]) -> None:
+        """M1 for migrations into `chat_id` once it is tracked (the caller locked every chat involved)."""
+        if not pending:
+            return
+        tracked = self.conn.execute("SELECT tracked FROM tg.chat WHERE chat_id = %s", (chat_id,)).fetchone()
+        if tracked and tracked[0]:
+            for old, migrated_at in pending:
+                self._move(old, chat_id, migrated_at)
+
+    def _subject(self, p: Parsed) -> int | None:
+        if p.type == "chat_member" and p.member:
+            return p.member.user.id
+        if p.type == "chat_join_request" and p.sender:
+            return p.sender.id
+        if p.type == "message" and p.sender and _attribution(p.inner or {}, p.chat) is None:
+            return p.sender.id
+        return None
+
+    def _migration_of(self, p: Parsed) -> tuple[int, int] | None:
+        """(old chat id, new chat id) of a migration service message."""
+        if p.type != "message" or p.inner is None or p.chat is None:
+            return None
+        if "migrate_to_chat_id" in p.inner:
+            return p.chat.id, _int(p.inner["migrate_to_chat_id"], "migrate_to_chat_id")
+        if "migrate_from_chat_id" in p.inner:
+            return _int(p.inner["migrate_from_chat_id"], "migrate_from_chat_id"), p.chat.id
+        return None
+
+    def _upsert_chat(self, chat: Chat, received: dt.datetime) -> None:
+        title = chat.title or str(chat.id)
+        self.conn.execute(
+            """INSERT INTO tg.chat AS c (chat_id, chat_type, title, username, metadata_due_at)
+               VALUES (%s, %s, %s, %s, %s)
+               ON CONFLICT (chat_id) DO UPDATE SET chat_type = excluded.chat_type, title = excluded.title,
+                      username = excluded.username, updated_at = now()
+               WHERE (c.chat_type, c.title, c.username) IS DISTINCT FROM
+                     (excluded.chat_type, excluded.title, excluded.username)""",
+            (chat.id, chat.type, title, chat.username, received))
+
+    def _upsert_user(self, u: User, at: dt.datetime) -> None:
+        names = (u.username, u.first_name, u.last_name) if self.store_names else (None, None, None)
+        self.conn.execute(
+            """INSERT INTO tg.tg_user AS t (user_id, is_bot, is_premium, language_code, username, first_name,
+                                            last_name, first_seen_at, last_seen_at)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (user_id) DO UPDATE SET
+                 first_seen_at = least(t.first_seen_at, excluded.first_seen_at),
+                 last_seen_at = greatest(t.last_seen_at, excluded.last_seen_at),
+                 is_bot = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.is_bot ELSE t.is_bot END,
+                 is_premium = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.is_premium
+                                   ELSE t.is_premium END,
+                 language_code = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.language_code
+                                      ELSE t.language_code END,
+                 username = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.username
+                                 ELSE t.username END,
+                 first_name = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.first_name
+                                   ELSE t.first_name END,
+                 last_name = CASE WHEN excluded.last_seen_at >= t.last_seen_at THEN excluded.last_name
+                                  ELSE t.last_name END""",
+            (u.id, u.is_bot, u.is_premium, u.language_code, *names, at, at))
+
+    def _is_bot_link(self, link: Link) -> bool:
+        return link.creator is not None and link.creator.id == self._bot_id()
+
+    def _upsert_link(self, chat_id: int, link: Link, at: dt.datetime, erased: set[int]) -> int:
+        creator = link.creator.id if link.creator and link.creator.id not in erased else None
+        common = (chat_id, creator, link.name, link.is_primary, link.creates_join_request, link.subscription_price,
+                  at, at)
+        update = """name = coalesce(excluded.name, l.name), is_primary = coalesce(excluded.is_primary, l.is_primary),
+                    creates_join_request = coalesce(excluded.creates_join_request, l.creates_join_request),
+                    subscription_price = coalesce(excluded.subscription_price, l.subscription_price),
+                    first_seen_at = least(l.first_seen_at, excluded.first_seen_at),
+                    last_seen_at = greatest(l.last_seen_at, excluded.last_seen_at)"""
+        if self._is_bot_link(link):
+            digest = self.ctx.config.link_digest(link.invite_link)
+            row = self.conn.execute(
+                f"""INSERT INTO tg.invite_link AS l (chat_id, creator_id, name, is_primary, creates_join_request,
+                                                     subscription_price, first_seen_at, last_seen_at, link_digest)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (chat_id, link_digest) WHERE link_digest IS NOT NULL DO UPDATE SET {update},
+                       creator_id = coalesce(l.creator_id, excluded.creator_id)
+                    RETURNING invite_link_id""", (*common, digest)).fetchone()
+        else:
+            row = self.conn.execute(
+                f"""INSERT INTO tg.invite_link AS l (chat_id, creator_id, name, is_primary, creates_join_request,
+                                                     subscription_price, first_seen_at, last_seen_at, masked_link)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (chat_id, masked_link, creator_id) WHERE link_digest IS NULL DO UPDATE SET {update}
+                    RETURNING invite_link_id""", (*common, link.invite_link)).fetchone()
+        return int(row[0])
+
+    def _chat_member(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int, erased: set[int],
+                     received: dt.datetime) -> None:
+        conn = self.conn
+        assert p.member and p.old and p.sender
+        user = p.member.user
+        self._upsert_user(user, p.date)
+        link_id = self._upsert_link(chat_id, p.link, p.date, erased) if p.link else None
+        actor_is_other = p.sender.id != user.id
+        actor_id = p.sender.id if actor_is_other and p.sender.id not in erased else None
+        self._ensure_partitions("member_event", "month", p.date)
+        row = conn.execute(
+            """INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, received_at, old_status,
+                                            old_is_member, new_status, new_is_member, actor_id, actor_is_other,
+                                            invite_link_id, via_join_request, via_folder_link, old_until_date,
+                                            new_until_date, source_chat_id)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (update_id, event_at) DO NOTHING RETURNING kind""",
+            (chat_id, user.id, p.date, p.update_id, received, p.old.status, p.old.is_member, p.member.status,
+             p.member.is_member, actor_id, actor_is_other, link_id, p.via_join_request, p.via_folder,
+             p.old.until_date, p.member.until_date, raw_chat if raw_chat != chat_id else None)).fetchone()
+        if row is not None:
+            kind = row[0]
+            label = kind if kind in EVENT_LABELS else "role"
+            chat = str(chat_id)
+            at = p.date.timestamp()
+            fx.add(lambda: metrics.CHAT_EVENTS.labels(chat, label).inc())
+            fx.add(lambda: metrics.LAST_TRANSITION.labels(chat).set(at))
+            if kind in EXIT_KINDS:
+                prev = conn.execute(
+                    """SELECT kind, event_at FROM tg.member_event
+                       WHERE chat_id = %s AND user_id = %s AND kind IN ('join', 'leave', 'kick', 'restrict_out')
+                         AND (event_at, update_id) < (%s, %s)
+                       ORDER BY event_at DESC, update_id DESC LIMIT 1""",
+                    (chat_id, user.id, p.date, p.update_id)).fetchone()
+                if prev is not None and prev[0] == "join" and p.date - prev[1] <= SHORT_STAY:
+                    fx.add(lambda: metrics.CHAT_SHORT_STAYS.labels(chat).inc())
+            if kind == "join" and p.via_join_request:
+                resolver = p.sender.id if actor_is_other and p.sender.id not in erased else None
+                hit = conn.execute(
+                    """UPDATE tg.join_request SET outcome = 'approved', resolved_at = %s, resolved_by = %s
+                       WHERE join_request_id = (SELECT join_request_id FROM tg.join_request
+                                                WHERE chat_id = %s AND user_id = %s AND outcome IS NULL
+                                                  AND requested_at <= %s
+                                                ORDER BY requested_at DESC LIMIT 1)
+                       RETURNING 1""", (p.date, resolver, chat_id, user.id, p.date)).fetchone()
+                if hit is not None:
+                    fx.add(lambda: metrics.CHAT_JOIN_REQUESTS.labels(chat, "approved").inc())
+            history.rebuild_pairs(conn, [(chat_id, user.id)])
+        self._raw_update(p.update_id, p.date, p.type, raw_chat, user.id, p.inner, received, erased)
+
+    def _my_chat_member(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int,
+                        pending: list[tuple[int, dt.datetime]], erased: set[int], received: dt.datetime) -> None:
+        assert p.member and p.sender
+        subject = p.sender.id if p.sender.id not in erased else None
+        # The old group of a migration ended at the migration: news about the bot there changes nothing.
+        old_group = self.conn.execute("SELECT 1 FROM tg.chat_alias WHERE old_chat_id = %s", (raw_chat,)).fetchone()
+        if old_group is None:
+            if p.member.user.id != self._bot_id():
+                log.warning("ingest: my_chat_member about user %s, not this bot; ignored", p.member.user.id)
+            else:
+                if self._set_bot_state(chat_id, p.date, p.member, "my_chat_member", fx):
+                    self.conn.execute("UPDATE tg.chat SET metadata_due_at = %s, metadata_attempts = 0 "
+                                      "WHERE chat_id = %s", (received, chat_id))
+                self._move_pending(chat_id, pending)
+        self._raw_update(p.update_id, p.date, p.type, raw_chat, subject, p.inner, received, erased)
+
+    def _set_bot_state(self, chat_id: int, at: dt.datetime, member: Member, source: str, fx: Effects) -> bool:
+        """The bot's status and rights in one chat as of `at`: tg.chat, coverage, not_admin / rights_lost gaps.
+        Older news than the chat's last rights check changes nothing. Returns True when the chat became
+        tracked."""
+        conn = self.conn
+        row = conn.execute("SELECT tracked, rights_checked_at FROM tg.chat WHERE chat_id = %s FOR UPDATE",
+                           (chat_id,)).fetchone()
+        if row is None:
+            return False
+        was_tracked, checked_at = row
+        if checked_at is not None and at < checked_at:
+            return False
+        status = member.status
+        admin = status in ADMIN
+        can_invite = True if status == "creator" else (bool(member.can_invite_users) if admin else None)
+        can_restrict = True if status == "creator" else (bool(member.can_restrict_members) if admin else None)
+        tracked = bool(was_tracked or admin)
+        conn.execute("""UPDATE tg.chat SET bot_status = %s, can_invite_users = %s, can_restrict_members = %s,
+                               rights_checked_at = %s, tracked = %s, updated_at = now() WHERE chat_id = %s""",
+                     (status, can_invite, can_restrict, at, tracked, chat_id))
+        # coverage: an open period while admin
+        if admin:
+            open_period = conn.execute("SELECT 1 FROM tg.coverage WHERE chat_id = %s AND upper_inf(period)",
+                                       (chat_id,)).fetchone()
+            if open_period is None:
+                conn.execute("""INSERT INTO tg.coverage (chat_id, period, source)
+                                SELECT %(c)s, tstzrange(greatest(%(at)s, max(upper(period))), NULL), %(s)s
+                                FROM tg.coverage WHERE chat_id = %(c)s""", dict(c=chat_id, at=at, s=source))
+        else:
+            conn.execute("DELETE FROM tg.coverage WHERE chat_id = %s AND upper_inf(period) AND lower(period) >= %s",
+                         (chat_id, at))
+            conn.execute("""UPDATE tg.coverage SET period = tstzrange(lower(period), %s)
+                            WHERE chat_id = %s AND upper_inf(period)""", (at, chat_id))
+        # gaps of a tracked chat: not_admin, or rights_lost while admin without a needed right
+        if tracked:
+            want = None if (admin and can_invite and can_restrict) else ("rights_lost" if admin else "not_admin")
+            conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %s))
+                            WHERE chat_id = %s AND upper_inf(period) AND reason IN ('not_admin', 'rights_lost')
+                              AND reason IS DISTINCT FROM %s""", (at, chat_id, want))
+            if want is not None:
+                have = conn.execute("""SELECT 1 FROM tg.gap WHERE chat_id = %s AND reason = %s
+                                       AND upper_inf(period)""", (chat_id, want)).fetchone()
+                if have is None:
+                    missing = [r for r, ok in (("can_invite_users", can_invite),
+                                               ("can_restrict_members", can_restrict)) if not ok]
+                    note = (f"{source}: bot is {status}" if want == "not_admin"
+                            else f"{source}: missing {', '.join(missing)}")
+                    conn.execute("""INSERT INTO tg.gap (chat_id, period, reason, confirmed, detected_at, note)
+                                    VALUES (%s, tstzrange(%s, NULL), %s, true, %s, %s)""",
+                                 (chat_id, at, want, self.now(), note))
+        chat = str(chat_id)
+        fx.add(lambda: metrics.CHAT_BOT_ADMIN.labels(chat).set(1 if admin else 0))
+        fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "invite_users").set(1 if can_invite else 0))
+        fx.add(lambda: metrics.CHAT_PERMISSION_OK.labels(chat, "restrict_members").set(1 if can_restrict else 0))
+        return tracked and not was_tracked
+
+    def _join_request(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int, erased: set[int],
+                      received: dt.datetime) -> None:
+        assert p.sender
+        self._upsert_user(p.sender, p.date)
+        link_id = self._upsert_link(chat_id, p.link, p.date, erased) if p.link else None
+        row = self.conn.execute(
+            """INSERT INTO tg.join_request (chat_id, user_id, requested_at, update_id, invite_link_id)
+               VALUES (%s, %s, %s, %s, %s) ON CONFLICT (chat_id, user_id, requested_at) DO NOTHING RETURNING 1""",
+            (chat_id, p.sender.id, p.date, p.update_id, link_id)).fetchone()
+        if row is not None:
+            chat = str(chat_id)
+            fx.add(lambda: metrics.CHAT_JOIN_REQUESTS.labels(chat, "received").inc())
+        self._raw_update(p.update_id, p.date, p.type, raw_chat, p.sender.id, p.inner, received, erased)
+
+    def _message(self, fx: Effects, p: Parsed, chat_id: int, raw_chat: int,
+                 migration: tuple[int, int] | None, received: dt.datetime) -> None:
+        msg = p.inner
+        assert msg is not None and p.chat is not None
+        if migration is not None:
+            self._migrate(migration[0], migration[1], p.date, p.chat, received)
+            return
+        if p.chat.type not in ("group", "supergroup"):
+            return
+        if "giveaway" in msg:
+            self._giveaway(chat_id, msg, p.date)
+        if SERVICE_KEYS.intersection(msg):
+            return
+        day = p.date.date()
+        kind = _attribution(msg, p.chat)
+        if kind is not None:
+            self.conn.execute(
+                """INSERT INTO tg.unattributed_daily AS a (chat_id, day, sender_kind, messages) VALUES (%s, %s, %s, 1)
+                   ON CONFLICT (chat_id, day, sender_kind) DO UPDATE SET messages = a.messages + 1""",
+                (chat_id, day, kind))
+        elif p.sender is not None:
+            self._upsert_user(p.sender, p.date)
+            self.conn.execute(
+                """INSERT INTO tg.activity_daily AS a (chat_id, user_id, day, messages) VALUES (%s, %s, %s, 1)
+                   ON CONFLICT (chat_id, user_id, day) DO UPDATE SET messages = a.messages + 1""",
+                (chat_id, p.sender.id, day))
+
+    def _channel_post(self, fx: Effects, p: Parsed, chat_id: int) -> None:
+        msg = p.inner
+        assert msg is not None and p.chat is not None
+        if p.chat.type != "channel":
+            return
+        if "giveaway" in msg:
+            self._giveaway(chat_id, msg, p.date)
+        if SERVICE_KEYS.intersection(msg):
+            return
+        self.conn.execute("""INSERT INTO tg.post (chat_id, message_id, posted_at, kind) VALUES (%s, %s, %s, %s)
+                             ON CONFLICT (chat_id, message_id) DO NOTHING""",
+                          (chat_id, _int(msg.get("message_id"), "message_id"), p.date, post_kind(msg)))
+
+    def _giveaway(self, chat_id: int, msg: dict, at: dt.datetime) -> None:
+        g = _dict(msg.get("giveaway"), "giveaway")
+        draw = _ts(g.get("winners_selection_date"), "giveaway.winners_selection_date")
+        if draw <= at:
+            log.warning("ingest: giveaway in chat %s draws before it starts; not recorded", chat_id)
+            return
+        winners = g.get("winner_count")
+        winners = winners if isinstance(winners, int) and not isinstance(winners, bool) else None
+        message_id = _int(msg.get("message_id"), "message_id")
+        chats = [_int(_dict(c, "giveaway.chats[]").get("id"), "giveaway.chats[].id") for c in g.get("chats") or []]
+        row = self.conn.execute(
+            """INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at, only_new_members, winner_count,
+                                        post_chat_id, post_message_id)
+               VALUES (%s, 'tg_giveaway', 'observation', %s, %s, %s, %s, %s, %s)
+               ON CONFLICT (post_chat_id, post_message_id) DO NOTHING RETURNING campaign_id""",
+            (f"Telegram giveaway {chat_id}/{message_id}", at, draw, g.get("only_new_members") is True, winners,
+             chat_id, message_id)).fetchone()
+        if row is None:
+            return
+        for c in sorted(set(chats) or {chat_id}):
+            self.conn.execute("INSERT INTO tg.campaign_chat (campaign_id, chat_id) VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                              (row[0], c))
+
+    # -- migrations (D2, M1/M2) --------------------------------------------------------------------------
+
+    def _migrate(self, old: int, new: int, at: dt.datetime, chat: Chat, received: dt.datetime) -> None:
+        """A migration service message (either one, either order, repeated): the alias once; M1 when the new
+        chat is tracked, else M2 (the old history stays under the old id and is closed by the rebuild)."""
+        conn = self.conn
+        alias = conn.execute("SELECT chat_id, moved_at FROM tg.chat_alias WHERE old_chat_id = %s",
+                             (old,)).fetchone()
+        if alias is not None:
+            if alias[0] != new:
+                log.warning("ingest: chat %s migrated to %s, but the alias says %s; ignored", old, new, alias[0])
+                return
+            if alias[1] is not None:
+                return  # M1 done
+        title = chat.title or str(new)
+        conn.execute("""INSERT INTO tg.chat (chat_id, chat_type, title, metadata_due_at)
+                        VALUES (%s, 'supergroup', %s, %s) ON CONFLICT (chat_id) DO NOTHING""", (new, title, received))
+        if alias is None:
+            conn.execute("INSERT INTO tg.chat_alias (old_chat_id, chat_id, migrated_at, moved_at) "
+                         "VALUES (%s, %s, %s, NULL)", (old, new, at))
+            # the old group ends at the migration: its coverage and its rights gaps end there too
+            conn.execute("DELETE FROM tg.coverage WHERE chat_id = %s AND upper_inf(period) AND lower(period) >= %s",
+                         (old, at))
+            conn.execute("UPDATE tg.coverage SET period = tstzrange(lower(period), %s) "
+                         "WHERE chat_id = %s AND upper_inf(period)", (at, old))
+            conn.execute("""UPDATE tg.gap SET period = tstzrange(lower(period), greatest(lower(period), %s))
+                            WHERE chat_id = %s AND upper_inf(period) AND reason IN ('not_admin', 'rights_lost')""",
+                         (at, old))
+            log.info("ingest: chat %s migrated to %s", old, new)
+        migrated_at = conn.execute("SELECT migrated_at FROM tg.chat_alias WHERE old_chat_id = %s",
+                                   (old,)).fetchone()[0]
+        tracked = conn.execute("SELECT tracked FROM tg.chat WHERE chat_id = %s", (new,)).fetchone()
+        if tracked and tracked[0]:
+            self._move(old, new, migrated_at)
+        elif alias is None:
+            # M2: the rebuild closes the old chat's open spells by migration (censoring, never an exit)
+            history.rebuild_pairs(conn, [(old, u) for u in self._pair_users(old)])
+
+    def _pair_users(self, chat_id: int) -> list[int]:
+        rows = self.conn.execute(
+            """SELECT user_id FROM tg.member_event WHERE chat_id = %(c)s
+               UNION SELECT user_id FROM tg.sighting WHERE chat_id = %(c)s
+               UNION SELECT user_id FROM tg.probe WHERE chat_id = %(c)s
+               UNION SELECT user_id FROM tg.membership WHERE chat_id = %(c)s
+               ORDER BY 1""", dict(c=chat_id)).fetchall()
+        return [int(r[0]) for r in rows]
+
+    def _move(self, old: int, new: int, migrated_at: dt.datetime) -> None:
+        """M1: the old chat's history moves to the new id (once), then its pairs are rebuilt."""
+        users = sorted(set(self._pair_users(old)) | set(self._pair_users(new)))
+        moved = self.conn.execute("SELECT tg.move_chat_history(%s, %s, %s)", (old, new, migrated_at)).fetchone()[0]
+        log.info("ingest: history of chat %s moved to %s (%s events)", old, new, moved)
+        history.rebuild_pairs(self.conn, [(new, u) for u in users])
+
+    # -- raw membership updates --------------------------------------------------------------------------
+
+    def _raw_update(self, update_id: int, update_date: dt.datetime, kind: str, chat_id: int, user_id: int | None,
+                    inner: dict | None, received: dt.datetime, erased: set[int]) -> None:
+        if kind not in MEMBERSHIP_TYPES or inner is None:
+            return
+        payload = self.redact(inner, erased)
+        self._ensure_partitions("raw_update", "day", update_date)
+        self.conn.execute(
+            """INSERT INTO tg.raw_update (update_id, update_date, update_type, chat_id, user_id, received_at, payload)
+               VALUES (%s, %s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING""",
+            (update_id, update_date, kind, chat_id, user_id if user_id not in erased else None, received,
+             Jsonb(payload)))
+
+    def redact(self, inner: dict, erased: set[int] = frozenset()) -> dict:  # type: ignore[assignment]
+        """The payload as stored in tg.raw_update: no bio or user_chat_id anywhere, a full invite link (one
+        this bot made, or any link Telegram did not mask) replaced by its digest marker, erased people replaced,
+        names and usernames of people dropped when store_names is off."""
+        bot_id = self._bot_id()
+        digest = self.ctx.config.link_digest
+
+        def walk(v: Any, key: str | None = None) -> Any:
+            if isinstance(v, list):
+                return [walk(x) for x in v]
+            if not isinstance(v, dict):
+                return v
+            if _is_user_dict(v) and v["id"] in erased:
+                return {"erased": True}
+            out: dict[str, Any] = {}
+            for k, x in v.items():
+                if k in ("bio", "user_chat_id"):
+                    continue
+                if not self.store_names and _is_user_dict(v) and k in ("first_name", "last_name", "username"):
+                    continue
+                out[k] = walk(x, k)
+            if key == "invite_link" and isinstance(out.get("invite_link"), str):
+                creator = v.get("creator")
+                by_bot = isinstance(creator, dict) and creator.get("id") == bot_id
+                text = out["invite_link"]
+                if by_bot or not is_masked(text):
+                    out["invite_link"] = DIGEST_MARK + digest(text).hex()
+            return out
+
+        return walk(copy.deepcopy(inner))
+
+    # -- getChat metadata --------------------------------------------------------------------------------
+
+    def refresh_metadata(self, limit: int = METADATA_BATCH) -> int:
+        """Fetch getChat for up to `limit` due chats; returns how many succeeded."""
+        if self.ctx.api is None:
+            return 0
+        now = self.now()
+        due = self.conn.execute("""SELECT chat_id, metadata_attempts, rights_checked_at IS NULL FROM tg.chat
+                                   WHERE metadata_due_at <= %s AND (tracked OR rights_checked_at IS NULL)
+                                   ORDER BY metadata_due_at, chat_id LIMIT %s""",
+                                (now, limit)).fetchall()
+        self.conn.rollback()
+        ok = 0
+        for chat_id, attempts, unchecked in due:
+            if self.ctx.stop.is_set():
+                break
+            try:
+                info = self.ctx.api.get_chat(chat_id)
+                if not isinstance(info, dict):
+                    raise ApiError("getChat", "other", "result is not an object")
+            except ApiError as e:
+                wait = METADATA_BACKOFF[min(attempts, len(METADATA_BACKOFF) - 1)]
+                if e.outcome == "429" and e.retry_after:
+                    wait = max(wait, e.retry_after)
+                log.warning("ingest: getChat %s failed (%s); retry in %d s", chat_id, e.outcome, wait)
+                due_at = self.now() + dt.timedelta(seconds=wait)
+                self._transaction(lambda fx, c=chat_id, d=due_at: self.conn.execute(
+                    "UPDATE tg.chat SET metadata_due_at = %s, metadata_attempts = metadata_attempts + 1 "
+                    "WHERE chat_id = %s", (d, c)))
+                continue
+            info = _clean(info)
+            kind = info.get("type") if info.get("type") in AUDIENCE_CHATS else None
+            fields = dict(
+                c=chat_id, kind=kind, title=_opt_str(info.get("title")), username=_opt_str(info.get("username")),
+                linked=info.get("linked_chat_id") if isinstance(info.get("linked_chat_id"), int) else None,
+                forum=_opt_bool(info.get("is_forum")), jbr=_opt_bool(info.get("join_by_request")),
+                hidden=_opt_bool(info.get("has_hidden_members")))
+            self._transaction(lambda fx, f=fields: self.conn.execute(
+                """UPDATE tg.chat SET chat_type = coalesce(%(kind)s, chat_type), title = coalesce(%(title)s, title),
+                          username = %(username)s, linked_chat_id = %(linked)s, is_forum = %(forum)s,
+                          join_by_request = %(jbr)s, has_hidden_members = %(hidden)s,
+                          metadata_due_at = NULL, metadata_attempts = 0, updated_at = now()
+                   WHERE chat_id = %(c)s""", f))
+            ok += 1
+            if unchecked:
+                self.check_rights(chat_id)
+        return ok
+
+
+def _attribution(msg: dict, chat: Chat | None) -> str | None:
+    """The unattributed kind of a group message, or None when a user wrote it."""
+    if msg.get("is_automatic_forward") is True:
+        return "automatic_forward"
+    sender_chat = msg.get("sender_chat")
+    if isinstance(sender_chat, dict):
+        return "anonymous_admin" if chat is not None and sender_chat.get("id") == chat.id else "sender_chat"
+    return None
+
+
+def _subject_id(kind: str, inner: dict) -> int | None:
+    """The subject user id of a (possibly malformed) membership payload, when it can be read."""
+    try:
+        if kind in ("chat_join_request", "my_chat_member"):
+            v = inner["from"]["id"]
+        else:
+            v = inner["new_chat_member"]["user"]["id"]
+    except (KeyError, TypeError):
+        return None
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+

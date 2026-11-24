@@ -818,30 +818,77 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, tg AS $$
   GROUP BY c.campaign_id, c.name, c.origin, c.only_new_members, cc.chat_id, c.starts_at, c.draw_at
 $$;
 
--- Group to supergroup migration (D2): move every row of the old chat id to the new one in the caller's
--- transaction, record the alias and drop the old chat row. Spells of the old id are deleted; the caller
--- rebuilds the affected (chat, user) pairs from the moved evidence (join echoes in the new id are absorbed
--- by the rebuild rules). Returns the number of moved events.
+-- Group to supergroup migration (D2, M1): move every row of the old chat id to the new one in the caller's
+-- transaction, record the alias as moved (moved_at = now(); an alias recorded earlier by M2 with moved_at NULL
+-- is completed) and drop the old chat row. Idempotent per (old, new): an alias already moved returns 0 and
+-- changes nothing. Spells of the old id are deleted; the caller rebuilds the affected (chat, user) pairs from
+-- the moved evidence (join echoes in the new id are absorbed by the rebuild rules). Coverage periods of the two
+-- ids that overlap (the bot was admin in both around the migration) are merged; a pending probe of the old id is
+-- cancelled when the new id has one for the same user; links, join requests and posts that the new
+-- id already has are merged into its rows. Returns the number of moved events.
 CREATE FUNCTION tg.move_chat_history(p_old_chat_id bigint, p_new_chat_id bigint, p_migrated_at timestamptz)
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
   v_events bigint;
+  v_old_coverage tstzmultirange;
+  v_new_coverage tstzmultirange;
 BEGIN
   IF NOT EXISTS (SELECT 1 FROM tg.chat WHERE chat_id = p_new_chat_id) THEN
     RAISE EXCEPTION 'new chat % must exist before the move', p_new_chat_id;
+  END IF;
+  IF EXISTS (SELECT 1 FROM tg.chat_alias WHERE old_chat_id = p_old_chat_id AND moved_at IS NOT NULL) THEN
+    RETURN 0;
   END IF;
   DELETE FROM tg.membership WHERE chat_id = p_old_chat_id;
   UPDATE tg.member_event SET chat_id = p_new_chat_id, source_chat_id = coalesce(source_chat_id, p_old_chat_id)
    WHERE chat_id = p_old_chat_id;
   GET DIAGNOSTICS v_events = ROW_COUNT;
-  UPDATE tg.coverage SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  SELECT range_agg(period) INTO v_old_coverage FROM tg.coverage WHERE chat_id = p_old_chat_id;
+  SELECT range_agg(period) INTO v_new_coverage FROM tg.coverage WHERE chat_id = p_new_chat_id;
+  IF v_old_coverage && v_new_coverage THEN   -- overlapping periods: merged; otherwise the rows move as they are
+    DELETE FROM tg.coverage WHERE chat_id IN (p_old_chat_id, p_new_chat_id);
+    INSERT INTO tg.coverage (chat_id, period)
+      SELECT p_new_chat_id, r FROM unnest(v_old_coverage + v_new_coverage) r;
+  ELSE
+    UPDATE tg.coverage SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  END IF;
   UPDATE tg.gap SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  -- links the new id already has (same digest, or same masked text and creator): repoint, then drop the old row
+  IF EXISTS (SELECT 1 FROM tg.invite_link o JOIN tg.invite_link n ON n.chat_id = p_new_chat_id
+              AND (n.link_digest = o.link_digest
+                   OR (o.link_digest IS NULL AND n.link_digest IS NULL AND n.masked_link = o.masked_link
+                       AND n.creator_id IS NOT DISTINCT FROM o.creator_id))
+              WHERE o.chat_id = p_old_chat_id) THEN
+    CREATE TEMP TABLE move_link_map ON COMMIT DROP AS
+      SELECT o.invite_link_id AS old_id, n.invite_link_id AS new_id
+      FROM tg.invite_link o JOIN tg.invite_link n ON n.chat_id = p_new_chat_id
+       AND (n.link_digest = o.link_digest
+            OR (o.link_digest IS NULL AND n.link_digest IS NULL AND n.masked_link = o.masked_link
+                AND n.creator_id IS NOT DISTINCT FROM o.creator_id))
+      WHERE o.chat_id = p_old_chat_id;
+    UPDATE tg.member_event e SET invite_link_id = m.new_id FROM move_link_map m
+     WHERE e.chat_id = p_new_chat_id AND e.invite_link_id = m.old_id;
+    UPDATE tg.join_request j SET invite_link_id = m.new_id FROM move_link_map m
+     WHERE j.chat_id IN (p_old_chat_id, p_new_chat_id) AND j.invite_link_id = m.old_id;
+    UPDATE tg.membership s SET invite_link_id = m.new_id FROM move_link_map m
+     WHERE s.chat_id = p_new_chat_id AND s.invite_link_id = m.old_id;
+    DELETE FROM tg.invite_link l USING move_link_map m WHERE l.invite_link_id = m.old_id;
+    DROP TABLE move_link_map;
+  END IF;
   UPDATE tg.invite_link SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
   UPDATE tg.snapshot SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
   UPDATE tg.sighting SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  UPDATE tg.probe o SET outcome = 'cancelled' WHERE o.chat_id = p_old_chat_id AND o.outcome = 'pending'
+     AND EXISTS (SELECT 1 FROM tg.probe n WHERE n.chat_id = p_new_chat_id AND n.user_id = o.user_id
+                                             AND n.outcome = 'pending');
   UPDATE tg.probe SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
   UPDATE tg.reconcile_run SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  DELETE FROM tg.join_request o WHERE o.chat_id = p_old_chat_id
+     AND EXISTS (SELECT 1 FROM tg.join_request n WHERE n.chat_id = p_new_chat_id AND n.user_id = o.user_id
+                                                   AND n.requested_at = o.requested_at);
   UPDATE tg.join_request SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
+  DELETE FROM tg.post o WHERE o.chat_id = p_old_chat_id
+     AND EXISTS (SELECT 1 FROM tg.post n WHERE n.chat_id = p_new_chat_id AND n.message_id = o.message_id);
   UPDATE tg.post SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;
   UPDATE tg.campaign_chat SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id
      AND NOT EXISTS (SELECT 1 FROM tg.campaign_chat x WHERE x.campaign_id = campaign_chat.campaign_id
@@ -860,9 +907,11 @@ BEGIN
   DELETE FROM tg.campaign_chat WHERE chat_id = p_old_chat_id;
   DELETE FROM tg.rollup_dirty WHERE chat_id = p_old_chat_id;
   DELETE FROM stats.chat_day WHERE chat_id = p_old_chat_id;
-  DELETE FROM tg.chat WHERE chat_id = p_old_chat_id;
-  INSERT INTO tg.chat_alias (old_chat_id, chat_id, migrated_at) VALUES (p_old_chat_id, p_new_chat_id, p_migrated_at);
   UPDATE tg.chat_alias SET chat_id = p_new_chat_id WHERE chat_id = p_old_chat_id;   -- chained migrations
+  INSERT INTO tg.chat_alias AS a (old_chat_id, chat_id, migrated_at, moved_at)
+    VALUES (p_old_chat_id, p_new_chat_id, p_migrated_at, now())
+  ON CONFLICT (old_chat_id) DO UPDATE SET chat_id = excluded.chat_id, moved_at = excluded.moved_at;
+  DELETE FROM tg.chat WHERE chat_id = p_old_chat_id;
   INSERT INTO tg.rollup_dirty (chat_id, from_day)
     SELECT p_new_chat_id, coalesce(min(event_at)::date, p_migrated_at::date) FROM tg.member_event
      WHERE chat_id = p_new_chat_id
