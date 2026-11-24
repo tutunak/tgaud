@@ -120,10 +120,10 @@ rerun from an empty database after every change of section 6; the final run is t
 | 2b | user 1001; user 1006 | 4 chats (2 seeded with hints, 2 exact joins); 2 stays in A | same |
 | 3 | exclusive A, B, C, D; distinct total | 6, 1, 2, 1; 15 | same |
 | 3 | scope A, B: exclusive; total | A 6, B 2; 12 | same |
-| 4a | G1 chat A: entrants, first-time, returners, quick exits, in at draw, exit after draw, still in | 6, 5, 1, 3, 4, 2, 2 | same |
+| 4a | G1 chat A (only_new_members): entrants, first-time, returners, eligible (first-time only), quick exits, in at draw, exit after draw, still in | 6, 5, 1, 5, 3, 4, 2, 2 | same |
 | 4a | G1 chat B: entrants, quick exits (kicked), quick unknown, in at draw, draw unknown, after-draw unknown, still in | 3, 1 (1), 1, 1, 1, 1, 1 | same |
 | 4a | G2 chat C: entrants, quick exits, in at draw, still in | 2, 1, 1, 1 | same |
-| 4b | G1 per person: persons, multi-chat, first-time, quick exit, in at draw, exit after draw, still in | 8, 1, 7, 4, 5, 2, 3 | same |
+| 4b | G1 per person: persons, multi-chat, first-time, eligible, quick exit, in at draw, exit after draw, still in | 8, 1, 7, 7, 4, 5, 2, 3 | same |
 | 5 | A week 10-19: joins / short; A week 11-02 | 2 / 1; 6 campaign joins, 0 free | same |
 | 5 | B week 10-19; C week 11-23 (raid); A week 08-10 flags | 2 / 2; 6 / 6 (5 kicked); gap | same, `gap:service_down` |
 | 6a | serial short-stayers | only 1022 (2 stays, 2 chats) | same |

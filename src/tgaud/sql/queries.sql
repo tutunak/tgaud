@@ -148,10 +148,13 @@ SELECT :'only' IN ('all', '4', '4a') AS run \gset
 \if :run
 \echo == 4a. giveaway report per campaign and chat
 -- Q: for each campaign chat: who joined inside [starts_at, draw_at] (first qualifying exact join per person
--- and chat); how many were first-time joiners (no earlier stay; only these count when only_new_members);
--- how many left within H hours of their join (confirmed exits; kicked apart; uncertain bounds apart); how
--- many were in at the draw and left within H after it; how many are still in. Immature = H not over yet.
--- window_flags: gaps or missing coverage over [starts_at, draw_at + H].
+-- and chat; every entrant is reported); how many were first-time joiners (no earlier stay) and how many
+-- returners; when the campaign has only_new_members, `eligible` is the first-time count and returners are not
+-- eligible (NULL otherwise); how many left within H hours of their join (confirmed exits; kicked apart;
+-- uncertain bounds apart); how many were in at the draw and left within H after it; how many are in at as_of.
+-- Immature = H not over yet at as_of; an outcome after as_of is never counted, and a campaign that starts
+-- after as_of has no entrants.
+-- window_flags: gaps or missing coverage over [starts_at, min(draw_at + H, as_of)].
 -- Body: tg.campaign_entrant (one row per chat and person) aggregated by stats.campaign_summary (schema.sql).
 :explain
 SELECT * FROM stats.campaign_summary(:hours, :'as_of_ts', nullif(:campaign, 0)) ORDER BY campaign_id, chat_id;
@@ -161,14 +164,17 @@ SELECT :'only' IN ('all', '4', '4b') AS run \gset
 \if :run
 \echo == 4b. giveaway report per person (multi-chat giveaways)
 -- Q: counted once per person across all chats of the campaign: entrants, how many joined several of its
--- chats, first-time in every chat they entered, left at least one within H (confirmed; unknown only if no
--- confirmed one), were in at least one at the draw, left one within H after it, are still in at least one.
+-- chats, first-time in every chat they entered, eligible (only_new_members campaigns: eligible in every chat
+-- they entered, i.e. first-time in all of them; NULL otherwise), left at least one within H (confirmed; unknown only if no confirmed
+-- one), were in at least one at the draw, left one within H after it, are still in at least one.
 :explain
 WITH e AS (
-  SELECT x.* FROM tg.campaign c CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
+  SELECT x.*, c.only_new_members FROM tg.campaign c
+  CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
   WHERE :campaign = 0 OR c.campaign_id = :campaign
 ), p AS (
   SELECT campaign_id, user_id, count(*) AS chats_joined, bool_and(first_time) AS first_time,
+         bool_and(eligible) AS eligible, bool_or(only_new_members) AS only_new_members,
          bool_or(quick_exit = 'yes') AS quick_yes, bool_or(quick_exit = 'unknown') AS quick_unknown,
          bool_or(at_draw = 'in') AS in_at_draw, bool_or(exit_after_draw = 'yes') AS left_after_draw,
          bool_or(still_in = 'in') AS still_in
@@ -176,6 +182,7 @@ WITH e AS (
 )
 SELECT campaign_id, count(*) AS persons, count(*) FILTER (WHERE chats_joined > 1) AS multi_chat,
        count(*) FILTER (WHERE first_time) AS first_time,
+       CASE WHEN bool_or(only_new_members) THEN count(*) FILTER (WHERE eligible) END AS eligible,
        count(*) FILTER (WHERE quick_yes) AS quick_exit,
        count(*) FILTER (WHERE quick_unknown AND NOT quick_yes) AS quick_exit_unknown,
        count(*) FILTER (WHERE in_at_draw) AS in_at_draw,
@@ -188,8 +195,8 @@ SELECT :'only' IN ('all', '4', '4c') AS run \gset
 \if :run
 \echo == 4c. giveaway entrants, one row per chat and person (CLI --csv, web drill-down)
 :explain
-SELECT x.campaign_id, x.chat_id, x.user_id, u.username, x.joined_at, x.first_time, x.quick_exit, x.exit_reason,
-       x.at_draw, x.exit_after_draw, x.still_in
+SELECT x.campaign_id, x.chat_id, x.user_id, u.username, x.joined_at, x.first_time, x.eligible, x.quick_exit,
+       x.exit_reason, x.at_draw, x.exit_after_draw, x.still_in
 FROM tg.campaign c
 CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
 JOIN tg.tg_user u ON u.user_id = x.user_id
@@ -205,12 +212,13 @@ SELECT :'only' IN ('all', '5') AS run \gset
 \echo == 5. short stays per chat and week, outside campaign windows
 -- Q: per chat and join week: how many joiners left within H hours, counting only joins outside every
 -- campaign window of that chat (so it works where the owner never entered a campaign). Exits are confirmed
--- ones; kicked apart; unknown = exit bounds straddle H; immature = joined less than H ago and still in.
+-- ones; kicked apart; unknown = exit bounds straddle H; immature = joined less than H ago and still in. The
+-- state is read at min(join + H, as_of): an exit after as_of is never counted (immature, or unknown).
 :explain
 WITH j AS (
   SELECT m.chat_id, date_trunc('week', m.joined_at AT TIME ZONE 'UTC')::date AS week, m.end_reason,
          tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                     m.joined_at + :hours * interval '1 hour') AS state,
+                     least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) AS state,
          m.joined_at + :hours * interval '1 hour' > :'as_of_ts'::timestamptz AS young,
          EXISTS (SELECT 1 FROM tg.campaign_chat cc JOIN tg.campaign g ON g.campaign_id = cc.campaign_id
                  WHERE cc.chat_id = m.chat_id AND m.joined_at BETWEEN g.starts_at AND g.draw_at) AS in_campaign
@@ -238,7 +246,8 @@ FROM j GROUP BY chat_id, week ORDER BY chat_id, week;
 SELECT :'only' IN ('all', '6', '6a') AS run \gset
 \if :run
 \echo == 6a. serial short-stayers: people with 2+ short stays in the window
--- Q: who keeps joining and leaving within H hours, in one chat or across chats (prize hunters)?
+-- Q: who keeps joining and leaving within H hours, in one chat or across chats (prize hunters)? An exit after
+-- as_of is not counted.
 :explain
 SELECT m.user_id, u.username, count(*) AS short_stays, count(DISTINCT m.chat_id) AS chats,
        min(m.joined_at) AS first_join, max(m.joined_at) AS last_join
@@ -247,7 +256,7 @@ JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
 JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 WHERE m.joined_at >= :'since_ts' AND m.joined_at < :'as_of_ts' AND m.chat_id = ANY (:'scope_ids'::bigint[])
   AND tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                  m.joined_at + :hours * interval '1 hour') = 'out'
+                  least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) = 'out'
 GROUP BY m.user_id, u.username
 HAVING count(*) >= 2
 ORDER BY short_stays DESC, chats DESC, m.user_id;
@@ -364,17 +373,43 @@ SELECT :'only' IN ('all', '9', '9a') AS run \gset
 \if :run
 \echo == 9a. daily growth (days with any movement) from stats.chat_day
 -- Q: per chat and day: joins, rejoins, exits (kicked apart), bans of non-members, net, short stays,
--- corrections by reconciliation, Telegram's count at the end of the day, and the residual
--- (change of Telegram's count - net events): a non-zero residual means events we did not see.
+-- corrections by reconciliation, Telegram's count at the end of the day (the day's last count sample), and the
+-- residual (change of Telegram's count - net of the events between the same two day-end samples, not the
+-- calendar day's net): a non-zero residual means events we did not see.
+-- The rollup is kept up to date, so it can say nothing exact about a time before the data it holds. It was last
+-- computed as of the as_of of its latest run (stats.rollup_run, 'chat_day'); when the report's as_of is earlier,
+-- the day of as_of is only partly over and its values are withheld (NULL, withheld = 'day'), and so are the
+-- short stays of a join day whose 48 h are not over at as_of (withheld = 'short_stays'): a later exit must not
+-- be counted. The sample columns (reported_eod, known_eod, reported_change, residual) are also withheld
+-- (withheld = 'samples') when the day's count sample is later than as_of. At as_of >= the rollup's every value
+-- is shown.
 :explain
-SELECT d.chat_id, d.day, d.joins, d.rejoins, d.exits, d.kicks, d.bans_from_out, d.net, d.short_stays,
-       d.corrections_in, d.corrections_out, d.reported_eod, d.known_eod, d.reported_change, d.residual,
-       d.messages, d.active_users,
+WITH ctx AS (
+  SELECT :'as_of_ts'::timestamptz AS as_of,
+         :'as_of_ts'::timestamptz >= coalesce((SELECT max(r.as_of) FROM stats.rollup_run r WHERE r.rollup = 'chat_day'),
+                                              '-infinity'::timestamptz) AS is_current
+)
+SELECT d.chat_id, d.day,
+       CASE WHEN x.day_ok THEN d.joins END AS joins, CASE WHEN x.day_ok THEN d.rejoins END AS rejoins,
+       CASE WHEN x.day_ok THEN d.exits END AS exits, CASE WHEN x.day_ok THEN d.kicks END AS kicks,
+       CASE WHEN x.day_ok THEN d.bans_from_out END AS bans_from_out, CASE WHEN x.day_ok THEN d.net END AS net,
+       CASE WHEN x.short_ok THEN d.short_stays END AS short_stays,
+       CASE WHEN x.day_ok THEN d.corrections_in END AS corrections_in,
+       CASE WHEN x.day_ok THEN d.corrections_out END AS corrections_out,
+       CASE WHEN x.sample_ok THEN d.reported_eod END AS reported_eod, CASE WHEN x.sample_ok THEN d.known_eod END AS known_eod,
+       CASE WHEN x.sample_ok THEN d.reported_change END AS reported_change, CASE WHEN x.sample_ok THEN d.residual END AS residual,
+       CASE WHEN x.day_ok THEN d.messages END AS messages, CASE WHEN x.day_ok THEN d.active_users END AS active_users,
+       CASE WHEN NOT x.day_ok THEN 'day' WHEN NOT x.sample_ok THEN 'samples' WHEN NOT x.short_ok THEN 'short_stays' END AS withheld,
        tg.window_flags(d.chat_id, tstzrange(d.day::timestamp AT TIME ZONE 'UTC', (d.day + 1)::timestamp AT TIME ZONE 'UTC')) AS flags
-FROM stats.v_chat_day d
+FROM stats.v_chat_day d CROSS JOIN ctx
+CROSS JOIN LATERAL (SELECT ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS day_ok,
+                           (ctx.is_current OR (d.day + 1)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of)
+                             AND (d.sample_at IS NULL OR d.sample_at <= ctx.as_of) AS sample_ok,
+                           ctx.is_current OR (d.day + 3)::timestamp AT TIME ZONE 'UTC' <= ctx.as_of AS short_ok) x
 WHERE d.chat_id = ANY (:'scope_ids'::bigint[])
   AND d.day >= (:'since_ts'::timestamptz AT TIME ZONE 'UTC')::date AND d.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
-  AND (d.joins + d.exits + d.bans_from_out + d.corrections_in + d.corrections_out + d.messages > 0 OR d.reported_eod IS NOT NULL)
+  AND (NOT x.day_ok OR d.joins + d.exits + d.bans_from_out + d.corrections_in + d.corrections_out + d.messages > 0
+       OR d.reported_eod IS NOT NULL)
 ORDER BY d.chat_id, d.day;
 \endif
 
@@ -399,7 +434,9 @@ SELECT :'only' IN ('all', '10', '10a') AS run \gset
 \echo == 10a. rejoiners per chat
 -- Q: how many people came back to a chat they had left? A rejoin is a stay that starts after an earlier
 -- stay of the same person in the chat: observed (a join event) or found later (snapshot or probe).
--- Migration echoes are not stays, so they never count.
+-- Migration echoes are not stays, so they never count. Stays that start at the same instant (join, leave, join
+-- in one second) are ordered by tg.spell_order: the replay order of the events that opened them (an inferred start
+-- by the event that opened it), events before sightings and probes.
 :explain
 SELECT m.chat_id, count(*) AS rejoins, count(DISTINCT m.user_id) AS users,
        count(*) FILTER (WHERE m.start_source = 'event') AS observed,
@@ -410,14 +447,17 @@ JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
 JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 WHERE m.known_from >= :'since_ts' AND m.known_from < :'as_of_ts' AND m.chat_id = ANY (:'scope_ids'::bigint[])
   AND EXISTS (SELECT 1 FROM tg.membership p
-              WHERE p.chat_id = m.chat_id AND p.user_id = m.user_id AND p.known_from < m.known_from)
+              WHERE p.chat_id = m.chat_id AND p.user_id = m.user_id AND p.membership_id <> m.membership_id
+                AND (p.known_from < m.known_from
+                     OR (p.known_from = m.known_from AND tg.spell_order(p.membership_id) < tg.spell_order(m.membership_id))))
 GROUP BY m.chat_id ORDER BY m.chat_id;
 \endif
 
 SELECT :'only' IN ('all', '10', '10b') AS run \gset
 \if :run
 \echo == 10b. flow between own chats: joined A, then B within flow_days
--- Q: does chat A feed chat B? People with an exact join to A and a later exact join to B within flow_days.
+-- Q: does chat A feed chat B? People with an exact join to A and a later exact join to B within flow_days;
+-- both joins must be before as_of (a join to B after as_of is not counted).
 :explain
 SELECT a.chat_id AS from_chat, b.chat_id AS to_chat, count(DISTINCT a.user_id) AS users,
        round((percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM b.joined_at - a.joined_at) / 3600))::numeric, 2) AS median_hours
@@ -426,6 +466,7 @@ JOIN tg.chat ca ON ca.chat_id = a.chat_id AND ca.tracked
 JOIN tg.tg_user u ON u.user_id = a.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
 JOIN tg.membership b ON b.user_id = a.user_id AND b.chat_id <> a.chat_id
                     AND b.joined_at > a.joined_at AND b.joined_at <= a.joined_at + :flow_days * interval '1 day'
+                    AND b.joined_at < :'as_of_ts'::timestamptz
 JOIN tg.chat cb ON cb.chat_id = b.chat_id AND cb.tracked
 WHERE a.joined_at >= :'since_ts' AND a.joined_at < :'as_of_ts'
   AND a.chat_id = ANY (:'scope_ids'::bigint[]) AND b.chat_id = ANY (:'scope_ids'::bigint[])
@@ -440,7 +481,10 @@ SELECT :'only' IN ('all', '11') AS run \gset
 \echo == 11. channel and its discussion group
 -- Q: what share of a channel's subscribers is in its discussion group, how many group members do not
 -- subscribe, and who of the group is active (wrote in the last active_days)? Counts of members come from
--- the pair matrix stats.overlap (R2); the active ones are checked live.
+-- the pair matrix stats.overlap (R2, as of its own refresh time, the as_of column); the active ones are checked
+-- live, and who is a member of the group or a subscriber is read at as_of, not today. The daily activity counts have no
+-- time of day: when as_of is earlier than the last update ingest committed, only complete UTC days up to
+-- activity_through count (the day of as_of is partly over and its messages may come after as_of).
 :explain
 WITH pair AS (
   SELECT ch.chat_id AS channel_id, ch.title AS channel, g.chat_id AS group_id, g.title AS group_title
@@ -453,16 +497,20 @@ WITH pair AS (
          (SELECT o.shared FROM stats.overlap o WHERE o.chat_a = least(p.channel_id, p.group_id)
                                                  AND o.chat_b = greatest(p.channel_id, p.group_id)) AS in_both
   FROM pair p
+), lim AS (
+  SELECT CASE WHEN :'as_of_ts'::timestamptz >= coalesce((SELECT max(b.last_poll_ok_at) FROM tg.bot_state b), '-infinity'::timestamptz)
+              THEN (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
+              ELSE (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - 1 END AS last_day
 ), active AS (
   SELECT p.channel_id, a.user_id,
          EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.channel_id AND m.user_id = a.user_id
-                 AND m.end_source IS NULL) AS subscribed
+                 AND m.stay @> :'as_of_ts'::timestamptz) AS subscribed
   FROM pair p
   JOIN tg.activity_daily a ON a.chat_id = p.group_id
-   AND a.day > (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - :active_days
-   AND a.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
+   AND a.day > (SELECT last_day FROM lim) - :active_days AND a.day <= (SELECT last_day FROM lim)
   JOIN tg.tg_user u ON u.user_id = a.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
-  WHERE EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.group_id AND m.user_id = a.user_id AND m.end_source IS NULL)
+  WHERE EXISTS (SELECT 1 FROM tg.membership m WHERE m.chat_id = p.group_id AND m.user_id = a.user_id
+                AND m.stay @> :'as_of_ts'::timestamptz)
   GROUP BY p.channel_id, a.user_id
 )
 SELECT p.channel_id, p.channel, p.group_id, p.group_title, c.subscribers, c.group_members, c.in_both,
@@ -471,6 +519,7 @@ SELECT p.channel_id, p.channel, p.group_id, p.group_title, c.subscribers, c.grou
        (SELECT count(*) FROM active x WHERE x.channel_id = p.channel_id) AS active_in_group,
        (SELECT count(*) FROM active x WHERE x.channel_id = p.channel_id AND x.subscribed) AS active_subscribers,
        (SELECT count(*) FROM active x WHERE x.channel_id = p.channel_id AND NOT x.subscribed) AS active_non_subscribers,
+       (SELECT last_day FROM lim) AS activity_through,
        (SELECT max(as_of) FROM stats.rollup_run WHERE rollup = 'audience') AS as_of
 FROM pair p LEFT JOIN counts c ON c.channel_id = p.channel_id
 ORDER BY p.channel_id;
@@ -484,25 +533,32 @@ SELECT :'only' IN ('all', '12') AS run \gset
 \echo == 12. join-request funnel per chat and week
 -- Q: how many asked to join, how many were approved, how fast, and did the approved stay 30 days?
 -- unknown = no answer seen within 7 days (declines by other admins send no update, F§3); pending = younger.
+-- Outcomes are read as of as_of: an answer after as_of leaves the request pending, 'unknown' only once 7 days
+-- have passed, and the approved join must be before as_of.
 :explain
 SELECT r.chat_id, date_trunc('week', r.requested_at AT TIME ZONE 'UTC')::date AS week, count(*) AS requests,
-       count(*) FILTER (WHERE r.outcome = 'approved') AS approved,
-       count(*) FILTER (WHERE r.outcome = 'declined') AS declined,
-       count(*) FILTER (WHERE r.outcome = 'unknown') AS unknown,
-       count(*) FILTER (WHERE r.outcome IS NULL) AS pending,
+       count(*) FILTER (WHERE o.outcome = 'approved') AS approved,
+       count(*) FILTER (WHERE o.outcome = 'declined') AS declined,
+       count(*) FILTER (WHERE o.outcome = 'unknown') AS unknown,
+       count(*) FILTER (WHERE o.outcome IS NULL) AS pending,
        percentile_cont(0.5) WITHIN GROUP (ORDER BY extract(epoch FROM r.resolved_at - r.requested_at) / 60)
-         FILTER (WHERE r.outcome = 'approved') AS median_minutes_to_approve,
+         FILTER (WHERE o.outcome = 'approved') AS median_minutes_to_approve,
        count(*) FILTER (WHERE j.joined_at + interval '30 days' <= :'as_of_ts'::timestamptz) AS approved_mature_30d,
        count(*) FILTER (WHERE j.joined_at + interval '30 days' <= :'as_of_ts'::timestamptz
                           AND tg.state_at(j.known_from, j.left_after, j.left_before, j.end_source, j.suspect_since,
                                           j.joined_at + interval '30 days') = 'in') AS approved_retained_30d
 FROM tg.join_request r
 JOIN tg.chat c ON c.chat_id = r.chat_id AND c.tracked
+CROSS JOIN LATERAL (SELECT CASE WHEN r.outcome = 'unknown'
+                                THEN CASE WHEN r.requested_at + interval '7 days' <= :'as_of_ts'::timestamptz THEN 'unknown' END
+                                WHEN r.resolved_at > :'as_of_ts'::timestamptz THEN NULL
+                                ELSE r.outcome END AS outcome) o
 LEFT JOIN LATERAL (
   SELECT m.joined_at, m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since
   FROM tg.membership m
   WHERE m.chat_id = r.chat_id AND m.user_id = r.user_id AND m.joined_at >= r.requested_at
-  ORDER BY m.joined_at LIMIT 1) j ON r.outcome = 'approved'
+    AND m.joined_at <= :'as_of_ts'::timestamptz
+  ORDER BY m.joined_at LIMIT 1) j ON o.outcome = 'approved'
 WHERE r.requested_at >= :'since_ts' AND r.requested_at < :'as_of_ts' AND r.chat_id = ANY (:'scope_ids'::bigint[])
 GROUP BY 1, 2 ORDER BY 1, 2;
 \endif
@@ -515,11 +571,12 @@ SELECT :'only' IN ('all', '13') AS run \gset
 \echo == 13. raids: minutes with joins far above the baseline of the chat, share kicked within an hour
 -- Q: in the last raid_hours, which minutes had at least raid_min_joins joins and 10x the chat's average
 -- per-minute joins of the 7 days before, and what share of those joiners was kicked within an hour?
--- All accounts count (spam accounts are often bots).
+-- All accounts count (spam accounts are often bots). A kick after as_of is not counted.
 :explain
 WITH j AS (
   SELECT m.chat_id, date_trunc('minute', m.joined_at) AS minute, count(*) AS joins,
-         count(*) FILTER (WHERE m.end_reason = 'kicked' AND m.left_before <= m.joined_at + interval '1 hour') AS kicked_1h
+         count(*) FILTER (WHERE m.end_reason = 'kicked' AND m.left_before <= m.joined_at + interval '1 hour'
+                            AND m.left_before <= :'as_of_ts'::timestamptz) AS kicked_1h
   FROM tg.membership m JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
   WHERE m.joined_at > :'as_of_ts'::timestamptz - :raid_hours * interval '1 hour' AND m.joined_at <= :'as_of_ts'::timestamptz
     AND m.chat_id = ANY (:'scope_ids'::bigint[])
@@ -546,36 +603,43 @@ SELECT :'only' IN ('all', '14') AS run \gset
 \if :run
 \echo == 14. groups: active vs silent members, and did short-stayers ever write
 -- Q: per group: how many current members wrote in the last active_days, how many are silent; of the
--- short stays in the window (exit within H), how many wrote at least once during their stay?
+-- short stays in the window (exit within H, an exit after as_of not counted), how many wrote at least once
+-- during their stay? Members are the stays that hold as_of. Activity counts are daily: when as_of is earlier than
+-- the last update ingest committed, only complete UTC days up to activity_through count (as in 11).
 :explain
-WITH g AS (
+WITH lim AS (
+  SELECT CASE WHEN :'as_of_ts'::timestamptz >= coalesce((SELECT max(b.last_poll_ok_at) FROM tg.bot_state b), '-infinity'::timestamptz)
+              THEN (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
+              ELSE (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - 1 END AS last_day
+), g AS (
   SELECT chat_id, title FROM tg.chat
   WHERE tracked AND chat_type IN ('group', 'supergroup') AND chat_id = ANY (:'scope_ids'::bigint[])
 ), mem AS (
   SELECT g.chat_id, count(*) AS members,
          count(*) FILTER (WHERE EXISTS (
            SELECT 1 FROM tg.activity_daily a WHERE a.chat_id = m.chat_id AND a.user_id = m.user_id
-             AND a.day > (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - :active_days
-             AND a.day <= (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date)) AS active
-  FROM g JOIN tg.membership m ON m.chat_id = g.chat_id AND m.end_source IS NULL
+             AND a.day > (SELECT last_day FROM lim) - :active_days AND a.day <= (SELECT last_day FROM lim))) AS active
+  FROM g JOIN tg.membership m ON m.chat_id = g.chat_id AND m.stay @> :'as_of_ts'::timestamptz
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
   GROUP BY g.chat_id
 ), ss AS (
   SELECT g.chat_id, count(*) AS short_stays,
          count(*) FILTER (WHERE EXISTS (
            SELECT 1 FROM tg.activity_daily a WHERE a.chat_id = m.chat_id AND a.user_id = m.user_id
-             AND a.day BETWEEN (m.joined_at AT TIME ZONE 'UTC')::date AND (m.left_before AT TIME ZONE 'UTC')::date)) AS wrote
+             AND a.day BETWEEN (m.joined_at AT TIME ZONE 'UTC')::date
+                           AND least((m.left_before AT TIME ZONE 'UTC')::date, (SELECT last_day FROM lim)))) AS wrote
   FROM g JOIN tg.membership m ON m.chat_id = g.chat_id
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
   WHERE m.joined_at >= :'since_ts' AND m.joined_at < :'as_of_ts'
     AND tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
-                    m.joined_at + :hours * interval '1 hour') = 'out'
+                    least(m.joined_at + :hours * interval '1 hour', :'as_of_ts'::timestamptz)) = 'out'
   GROUP BY g.chat_id
 )
 SELECT g.chat_id, g.title, coalesce(mem.members, 0) AS members, coalesce(mem.active, 0) AS active,
        coalesce(mem.members - mem.active, 0) AS silent,
        round(100.0 * mem.active / nullif(mem.members, 0), 1) AS active_pct,
-       coalesce(ss.short_stays, 0) AS short_stays, coalesce(ss.wrote, 0) AS short_stays_who_wrote
+       coalesce(ss.short_stays, 0) AS short_stays, coalesce(ss.wrote, 0) AS short_stays_who_wrote,
+       (SELECT last_day FROM lim) AS activity_through
 FROM g LEFT JOIN mem ON mem.chat_id = g.chat_id LEFT JOIN ss ON ss.chat_id = g.chat_id
 ORDER BY g.chat_id;
 \endif
@@ -587,17 +651,21 @@ SELECT :'only' IN ('all', '15') AS run \gset
 \if :run
 \echo == 15. leaves within post_hours after each channel post, against the same span before it
 -- Q: which posts make people leave? Exact self-leaves in (posted_at, posted_at + post_hours], with the
--- span before the post as a baseline. Posts close together share leaves.
+-- span before the post as a baseline. Posts close together share leaves. Leaves after as_of are not counted:
+-- a post whose window after it reaches past as_of is marked immature.
 :explain
 SELECT p.chat_id, p.message_id, p.posted_at, p.kind,
        (SELECT count(*) FROM tg.membership m
          WHERE m.chat_id = p.chat_id AND m.end_source = 'event' AND m.end_reason = 'left'
-           AND m.left_before > p.posted_at AND m.left_before <= p.posted_at + :post_hours * interval '1 hour') AS leaves_after,
+           AND m.left_before > p.posted_at
+           AND m.left_before <= least(p.posted_at + :post_hours * interval '1 hour', :'as_of_ts'::timestamptz)) AS leaves_after,
        (SELECT count(*) FROM tg.membership m
          WHERE m.chat_id = p.chat_id AND m.end_source = 'event' AND m.end_reason = 'left'
            AND m.left_before > p.posted_at - :post_hours * interval '1 hour' AND m.left_before <= p.posted_at) AS leaves_before,
+       p.posted_at + :post_hours * interval '1 hour' > :'as_of_ts'::timestamptz AS immature,
        tg.window_flags(p.chat_id, tstzrange(p.posted_at - :post_hours * interval '1 hour',
-                                            p.posted_at + :post_hours * interval '1 hour')) AS flags
+                                            least(p.posted_at + :post_hours * interval '1 hour',
+                                                  :'as_of_ts'::timestamptz))) AS flags
 FROM tg.post p JOIN tg.chat c ON c.chat_id = p.chat_id AND c.tracked AND c.chat_type = 'channel'
 WHERE p.posted_at >= :'since_ts' AND p.posted_at < :'as_of_ts' AND p.chat_id = ANY (:'scope_ids'::bigint[])
 ORDER BY p.chat_id, p.posted_at;
@@ -700,51 +768,76 @@ ORDER BY d.chat_id;
 SELECT :'only' IN ('R1') AS run \gset
 \if :run
 \echo == R1. refresh stats.chat_day from the earliest affected day
--- Per tracked chat: recompute from min(dirty day, today - lookback_days) to today; a chat without rows is
--- built from its first coverage or evidence day. Late events, reconciliation fixes, rebuilds and migrations
--- upsert tg.rollup_dirty with least(from_day) = the earliest of the old and new known_from, left_after and
--- left_before of every changed spell; markers older than this run are cleared at the end. Readers see the
--- old rows until the commit.
+-- Per tracked chat in scope: recompute from min(dirty day, today - lookback_days) to today, even when that day
+-- is before the chat's first rollup row or its first coverage (the grid then starts there); a chat without rows
+-- is built from its first coverage or evidence day (or an earlier dirty day). Late events, reconciliation fixes,
+-- rebuilds and migrations call tg.mark_dirty (least from_day, a new version on every write). The markers read
+-- here are cleared at the end only where their version is unchanged: a marker written while this ran stays,
+-- and a marker another transaction holds is skipped, never waited for (a migration that deleted it waits for
+-- the chat row this run's foreign key holds: waiting here would be a deadlock).
+-- Readers see the old rows until the commit. The service runs this per chat (scope = one chat; far-back
+-- chats together in one set-based pass) in tgaud.jobs.chat_day and gives the same rows.
+--
+-- Rules of the stored columns:
+--  * joins, exits, net, short_stays, rejoins, corrections: calendar (UTC) day of the event. A rejoin is a stay
+--    with an earlier stay of the same person in the chat; at the same instant the opening event's order
+--    (event_at, update_id) decides, so join, leave, join in one second counts one rejoin, whatever the
+--    spells' ids. A spell with an inferred start (E6, E9) has no opening event of its own: tg.spell_order
+--    replays the events of that instant and orders it by the event that opened it (the same order as 10a).
+--  * reported_eod, known_eod, sample_at: the day's last count sample at or before as_of. sample_net: exact joins
+--    minus exact exits in (previous day's sample, this day's sample], so the residual (v_chat_day) compares
+--    Telegram's count with the events between the same two samples, not with the calendar day.
+--  * members_started/ended, unsure_started/ended: daily deltas of human stays (known_from, left_before; bounded
+--    exits at left_after and left_before; open stays at suspect_since, which are unsure from then on).
+--    members_midnight and unsure_midnight hold the part at exactly 00:00 UTC, which v_chat_day counts into the
+--    end of the day before: members_eod = 16a at the next midnight.
 BEGIN;
 SET LOCAL work_mem = '16MB';
 CREATE TEMP TABLE chat_day_target ON COMMIT DROP AS
-SELECT c.chat_id, t.from_day, t.from_day::timestamp AT TIME ZONE 'UTC' AS from_ts
+SELECT c.chat_id, t.from_day, t.from_day::timestamp AT TIME ZONE 'UTC' AS from_ts, r.version AS dirty_version
 FROM tg.chat c
 LEFT JOIN tg.rollup_dirty r ON r.chat_id = c.chat_id
 LEFT JOIN LATERAL (SELECT min(d.day) AS first_row_day FROM stats.chat_day d WHERE d.chat_id = c.chat_id) e ON true
 CROSS JOIN LATERAL (SELECT CASE
     WHEN e.first_row_day IS NULL THEN
-      (least((SELECT min(lower(v.period)) FROM tg.coverage v WHERE v.chat_id = c.chat_id),
-             (SELECT min(m.known_from) FROM tg.membership m WHERE m.chat_id = c.chat_id),
-             :'as_of_ts'::timestamptz) AT TIME ZONE 'UTC')::date
-    ELSE greatest(least(coalesce(r.from_day, 'infinity'::date),
-                        (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - :lookback_days),
-                  least(e.first_row_day,
-                        ((SELECT min(lower(v.period)) FROM tg.coverage v WHERE v.chat_id = c.chat_id) AT TIME ZONE 'UTC')::date))
+      least((least((SELECT min(lower(v.period)) FROM tg.coverage v WHERE v.chat_id = c.chat_id),
+                   (SELECT min(m.known_from) FROM tg.membership m WHERE m.chat_id = c.chat_id),
+                   :'as_of_ts'::timestamptz) AT TIME ZONE 'UTC')::date,
+            r.from_day)
+    ELSE least(coalesce(r.from_day, 'infinity'::date),
+               (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - :lookback_days)
   END AS from_day) t
-WHERE c.tracked;
+WHERE c.tracked AND c.chat_id = ANY (:'scope_ids'::bigint[]);
 ANALYZE chat_day_target;
 
 DELETE FROM stats.chat_day d USING chat_day_target t WHERE d.chat_id = t.chat_id AND d.day >= t.from_day;
 
 -- Two plan shapes, one result. A large recompute (the first build, or dirty days going far back) is one
 -- set-based pass over membership; the normal run (a few days per chat) reads each chat by index range scans
--- from its from_day (LATERAL), so it touches only those days' rows. The switch is the number of chat-days.
-SELECT sum((:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - from_day + 1) > 30 * count(*) AS chat_day_full
+-- from its from_day (LATERAL), so it touches only those days' rows. The switch is how far back the oldest
+-- target day is (7 days; tgaud.jobs.chat_day.FULL_DAYS).
+SELECT coalesce(bool_or((:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - from_day > 7), false) AS chat_day_full
 FROM chat_day_target \gset
 \if :chat_day_full
 :explain
 INSERT INTO stats.chat_day (chat_id, day, joins, rejoins, exits, kicks, bans_from_out, net, short_stays,
                             corrections_in, corrections_out, reported_eod, known_eod, messages, active_users,
-                            members_started, members_ended, unsure_started, unsure_ended, refreshed_at)
+                            members_started, members_ended, unsure_started, unsure_ended,
+                            members_midnight, unsure_midnight, sample_at, sample_net, refreshed_at)
 WITH grid AS (
   SELECT t.chat_id, g::date AS day
   FROM chat_day_target t, generate_series(t.from_day, (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date, interval '1 day') g
 ), j AS (
   SELECT m.chat_id, (m.joined_at AT TIME ZONE 'UTC')::date AS day, count(*) AS joins,
          count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started,
+         count(*) FILTER (WHERE m.joined_at AT TIME ZONE 'UTC' = (m.joined_at AT TIME ZONE 'UTC')::date
+                            AND m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS mid_started,
          count(*) FILTER (WHERE EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
-                                          AND p.user_id = m.user_id AND p.known_from < m.known_from)) AS rejoins,
+                                          AND p.user_id = m.user_id AND p.known_from < m.known_from)
+                             OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
+                                          AND p.user_id = m.user_id AND p.known_from = m.known_from
+                                          AND p.membership_id <> m.membership_id
+                                          AND tg.spell_order(p.membership_id) < tg.spell_order(m.membership_id))) AS rejoins,
          count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                             m.joined_at + interval '48 hours') = 'out') AS short_stays
   FROM chat_day_target t JOIN tg.membership m ON m.chat_id = t.chat_id AND m.joined_at >= t.from_ts
@@ -752,9 +845,18 @@ WITH grid AS (
 ), f AS (
   SELECT m.chat_id, (m.known_from AT TIME ZONE 'UTC')::date AS day,
          count(*) FILTER (WHERE m.start_source IN ('snapshot', 'probe')) AS corrections_in,
-         count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started
+         count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started,
+         count(*) FILTER (WHERE m.known_from AT TIME ZONE 'UTC' = (m.known_from AT TIME ZONE 'UTC')::date
+                            AND m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS mid_started
   FROM chat_day_target t JOIN tg.membership m ON m.chat_id = t.chat_id AND m.start_source <> 'event'
                                              AND m.known_from >= t.from_ts
+  GROUP BY 1, 2
+), sp AS (           -- open stays under suspicion: unsure from suspect_since on
+  SELECT m.chat_id, (m.suspect_since AT TIME ZONE 'UTC')::date AS day, count(*) AS unsure_started,
+         count(*) FILTER (WHERE m.suspect_since AT TIME ZONE 'UTC' = (m.suspect_since AT TIME ZONE 'UTC')::date) AS mid_started
+  FROM chat_day_target t JOIN tg.membership m ON m.chat_id = t.chat_id AND m.end_source IS NULL
+                                             AND m.suspect_since >= t.from_ts
+  WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)
   GROUP BY 1, 2
 ), e AS MATERIALIZED (
   SELECT m.chat_id, m.left_after, m.left_before, m.end_source, m.end_reason, t.from_ts, m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted) AS human
@@ -762,25 +864,42 @@ WITH grid AS (
                                              AND m.left_before >= t.from_ts
 ), x AS (
   SELECT u.chat_id, u.day, sum(u.exits) AS exits, sum(u.kicks) AS kicks, sum(u.corrections_out) AS corrections_out,
-         sum(u.members_ended) AS members_ended, sum(u.unsure_ended) AS unsure_ended, sum(u.unsure_started) AS unsure_started
+         sum(u.members_ended) AS members_ended, sum(u.unsure_ended) AS unsure_ended, sum(u.unsure_started) AS unsure_started,
+         sum(u.mid_ended) AS mid_ended, sum(u.mid_unsure_ended) AS mid_unsure_ended, sum(u.mid_unsure_started) AS mid_unsure_started
   FROM (SELECT e.chat_id, (e.left_before AT TIME ZONE 'UTC')::date AS day, (e.end_source = 'event')::int AS exits,
                (e.end_source = 'event' AND e.end_reason = 'kicked')::int AS kicks,
                (e.end_source IN ('probe', 'inferred'))::int AS corrections_out, e.human::int AS members_ended,
-               (e.human AND e.end_source <> 'event')::int AS unsure_ended, 0 AS unsure_started
+               (e.human AND e.end_source <> 'event')::int AS unsure_ended, 0 AS unsure_started,
+               (e.human AND e.left_before AT TIME ZONE 'UTC' = (e.left_before AT TIME ZONE 'UTC')::date)::int AS mid_ended,
+               (e.human AND e.end_source <> 'event'
+                  AND e.left_before AT TIME ZONE 'UTC' = (e.left_before AT TIME ZONE 'UTC')::date)::int AS mid_unsure_ended,
+               0 AS mid_unsure_started
         FROM e
         UNION ALL
-        SELECT e.chat_id, (e.left_after AT TIME ZONE 'UTC')::date, 0, 0, 0, 0, 0, 1
+        SELECT e.chat_id, (e.left_after AT TIME ZONE 'UTC')::date, 0, 0, 0, 0, 0, 1, 0, 0,
+               (e.left_after AT TIME ZONE 'UTC' = (e.left_after AT TIME ZONE 'UTC')::date)::int
         FROM e WHERE e.human AND e.end_source <> 'event' AND e.left_after >= e.from_ts) u
   GROUP BY 1, 2
 ), b AS (
   SELECT ev.chat_id, (ev.event_at AT TIME ZONE 'UTC')::date AS day, count(*) AS bans_from_out
   FROM chat_day_target t JOIN tg.member_event ev ON ev.chat_id = t.chat_id AND ev.event_at >= t.from_ts AND ev.kind = 'ban_out'
   GROUP BY 1, 2
-), s AS (
+), s0 AS (           -- the last finalized count sample of each day, from the day before the range (for its interval)
   SELECT DISTINCT ON (cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date)
-         cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.reported, cs.known_open
-  FROM chat_day_target t JOIN tg.count_sample cs ON cs.chat_id = t.chat_id AND cs.sampled_at >= t.from_ts
+         cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported, cs.known_open
+  FROM chat_day_target t JOIN tg.count_sample cs ON cs.chat_id = t.chat_id
+                                                AND cs.sampled_at >= t.from_ts - interval '1 day'
+                                                AND cs.sampled_at <= :'as_of_ts'::timestamptz
   ORDER BY cs.chat_id, (cs.sampled_at AT TIME ZONE 'UTC')::date, cs.sampled_at DESC
+), s AS (            -- plus the events after that sample until the end of its day: the part of the day's net that
+                     -- belongs to the interval of the next sample
+  SELECT s0.*,
+         (SELECT count(*) FROM tg.membership m WHERE m.chat_id = s0.chat_id AND m.joined_at > s0.sample_at
+                                                 AND m.joined_at < (s0.day + 1)::timestamp AT TIME ZONE 'UTC')
+         - (SELECT count(*) FROM tg.membership m WHERE m.chat_id = s0.chat_id AND m.end_source = 'event'
+                                                  AND m.left_before > s0.sample_at
+                                                  AND m.left_before < (s0.day + 1)::timestamp AT TIME ZONE 'UTC') AS tail_net
+  FROM s0
 ), a AS (
   SELECT ad.chat_id, ad.day, sum(ad.messages) AS messages, count(*) AS active_users
   FROM chat_day_target t JOIN tg.activity_daily ad ON ad.chat_id = t.chat_id AND ad.day >= t.from_day
@@ -795,17 +914,25 @@ SELECT g.chat_id, g.day, coalesce(j.joins, 0), coalesce(j.rejoins, 0), coalesce(
        coalesce(f.corrections_in, 0), coalesce(x.corrections_out, 0), s.reported, s.known_open,
        coalesce(a.messages, 0) + coalesce(ua.messages, 0), coalesce(a.active_users, 0),
        coalesce(j.members_started, 0) + coalesce(f.members_started, 0), coalesce(x.members_ended, 0),
-       coalesce(x.unsure_started, 0), coalesce(x.unsure_ended, 0), now()
+       coalesce(x.unsure_started, 0) + coalesce(sp.unsure_started, 0), coalesce(x.unsure_ended, 0),
+       coalesce(j.mid_started, 0) + coalesce(f.mid_started, 0) - coalesce(x.mid_ended, 0),
+       coalesce(x.mid_unsure_started, 0) + coalesce(sp.mid_started, 0) - coalesce(x.mid_unsure_ended, 0),
+       s.sample_at,
+       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL
+            THEN coalesce(j.joins, 0) - coalesce(x.exits, 0) - s.tail_net + p.tail_net END,
+       now()
 FROM grid g
-LEFT JOIN j USING (chat_id, day) LEFT JOIN f USING (chat_id, day)
+LEFT JOIN j USING (chat_id, day) LEFT JOIN f USING (chat_id, day) LEFT JOIN sp USING (chat_id, day)
 LEFT JOIN x USING (chat_id, day) LEFT JOIN b USING (chat_id, day)
-LEFT JOIN s USING (chat_id, day) LEFT JOIN a USING (chat_id, day) LEFT JOIN ua USING (chat_id, day);
+LEFT JOIN s USING (chat_id, day) LEFT JOIN a USING (chat_id, day) LEFT JOIN ua USING (chat_id, day)
+LEFT JOIN s p ON p.chat_id = g.chat_id AND p.day = g.day - 1;
 
 \else
 :explain
 INSERT INTO stats.chat_day (chat_id, day, joins, rejoins, exits, kicks, bans_from_out, net, short_stays,
                             corrections_in, corrections_out, reported_eod, known_eod, messages, active_users,
-                            members_started, members_ended, unsure_started, unsure_ended, refreshed_at)
+                            members_started, members_ended, unsure_started, unsure_ended,
+                            members_midnight, unsure_midnight, sample_at, sample_net, refreshed_at)
 WITH grid AS (
   SELECT t.chat_id, g::date AS day
   FROM chat_day_target t, generate_series(t.from_day, (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date, interval '1 day') g
@@ -813,8 +940,14 @@ WITH grid AS (
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT (m.joined_at AT TIME ZONE 'UTC')::date AS day, count(*) AS joins,
            count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started,
+           count(*) FILTER (WHERE m.joined_at AT TIME ZONE 'UTC' = (m.joined_at AT TIME ZONE 'UTC')::date
+                              AND m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS mid_started,
            count(*) FILTER (WHERE EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
-                                            AND p.user_id = m.user_id AND p.known_from < m.known_from)) AS rejoins,
+                                            AND p.user_id = m.user_id AND p.known_from < m.known_from)
+                               OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
+                                            AND p.user_id = m.user_id AND p.known_from = m.known_from
+                                            AND p.membership_id <> m.membership_id
+                                            AND tg.spell_order(p.membership_id) < tg.spell_order(m.membership_id))) AS rejoins,
            count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                               m.joined_at + interval '48 hours') = 'out') AS short_stays
     FROM tg.membership m WHERE m.chat_id = t.chat_id AND m.joined_at >= t.from_ts GROUP BY 1) z
@@ -822,9 +955,18 @@ WITH grid AS (
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT (m.known_from AT TIME ZONE 'UTC')::date AS day,
            count(*) FILTER (WHERE m.start_source IN ('snapshot', 'probe')) AS corrections_in,
-           count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started
+           count(*) FILTER (WHERE m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS members_started,
+           count(*) FILTER (WHERE m.known_from AT TIME ZONE 'UTC' = (m.known_from AT TIME ZONE 'UTC')::date
+                              AND m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted)) AS mid_started
     FROM tg.membership m
     WHERE m.chat_id = t.chat_id AND m.start_source <> 'event' AND m.known_from >= t.from_ts GROUP BY 1) z
+), sp AS (           -- open stays under suspicion: unsure from suspect_since on
+  SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
+    SELECT (m.suspect_since AT TIME ZONE 'UTC')::date AS day, count(*) AS unsure_started,
+           count(*) FILTER (WHERE m.suspect_since AT TIME ZONE 'UTC' = (m.suspect_since AT TIME ZONE 'UTC')::date) AS mid_started
+    FROM tg.membership m
+    WHERE m.chat_id = t.chat_id AND m.end_source IS NULL AND m.suspect_since >= t.from_ts
+      AND m.user_id NOT IN (SELECT n.user_id FROM tg.tg_user n WHERE n.is_bot OR n.is_deleted) GROUP BY 1) z
 ), x AS (            -- one pass over the ends: by left_before day, and bounded exits by left_after day
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     WITH e AS MATERIALIZED (
@@ -833,26 +975,42 @@ WITH grid AS (
       WHERE m.chat_id = t.chat_id AND m.end_source IS NOT NULL AND m.left_before >= t.from_ts)
     SELECT u.day, sum(u.exits) AS exits, sum(u.kicks) AS kicks, sum(u.corrections_out) AS corrections_out,
            sum(u.members_ended) AS members_ended, sum(u.unsure_ended) AS unsure_ended,
-           sum(u.unsure_started) AS unsure_started
+           sum(u.unsure_started) AS unsure_started, sum(u.mid_ended) AS mid_ended,
+           sum(u.mid_unsure_ended) AS mid_unsure_ended, sum(u.mid_unsure_started) AS mid_unsure_started
     FROM (SELECT (e.left_before AT TIME ZONE 'UTC')::date AS day, (e.end_source = 'event')::int AS exits,
                  (e.end_source = 'event' AND e.end_reason = 'kicked')::int AS kicks,
                  (e.end_source IN ('probe', 'inferred'))::int AS corrections_out, e.human::int AS members_ended,
-                 (e.human AND e.end_source <> 'event')::int AS unsure_ended, 0 AS unsure_started
+                 (e.human AND e.end_source <> 'event')::int AS unsure_ended, 0 AS unsure_started,
+                 (e.human AND e.left_before AT TIME ZONE 'UTC' = (e.left_before AT TIME ZONE 'UTC')::date)::int AS mid_ended,
+                 (e.human AND e.end_source <> 'event'
+                    AND e.left_before AT TIME ZONE 'UTC' = (e.left_before AT TIME ZONE 'UTC')::date)::int AS mid_unsure_ended,
+                 0 AS mid_unsure_started
           FROM e
           UNION ALL
-          SELECT (e.left_after AT TIME ZONE 'UTC')::date, 0, 0, 0, 0, 0, 1
+          SELECT (e.left_after AT TIME ZONE 'UTC')::date, 0, 0, 0, 0, 0, 1, 0, 0,
+                 (e.left_after AT TIME ZONE 'UTC' = (e.left_after AT TIME ZONE 'UTC')::date)::int
           FROM e WHERE e.human AND e.end_source <> 'event' AND e.left_after >= t.from_ts) u
     GROUP BY u.day) z
 ), b AS (
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT (e.event_at AT TIME ZONE 'UTC')::date AS day, count(*) AS bans_from_out
     FROM tg.member_event e WHERE e.chat_id = t.chat_id AND e.event_at >= t.from_ts AND e.kind = 'ban_out' GROUP BY 1) z
-), s AS (            -- the last count sample of each day
+), s0 AS (           -- the last finalized count sample of each day, from the day before the range (for its interval)
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT DISTINCT ON ((cs.sampled_at AT TIME ZONE 'UTC')::date)
-           (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.reported, cs.known_open
-    FROM tg.count_sample cs WHERE cs.chat_id = t.chat_id AND cs.sampled_at >= t.from_ts
+           (cs.sampled_at AT TIME ZONE 'UTC')::date AS day, cs.sampled_at AS sample_at, cs.reported, cs.known_open
+    FROM tg.count_sample cs WHERE cs.chat_id = t.chat_id AND cs.sampled_at >= t.from_ts - interval '1 day'
+                              AND cs.sampled_at <= :'as_of_ts'::timestamptz
     ORDER BY (cs.sampled_at AT TIME ZONE 'UTC')::date, cs.sampled_at DESC) z
+), s AS (            -- plus the events after that sample until the end of its day: the part of the day's net that
+                     -- belongs to the interval of the next sample
+  SELECT s0.*,
+         (SELECT count(*) FROM tg.membership m WHERE m.chat_id = s0.chat_id AND m.joined_at > s0.sample_at
+                                                 AND m.joined_at < (s0.day + 1)::timestamp AT TIME ZONE 'UTC')
+         - (SELECT count(*) FROM tg.membership m WHERE m.chat_id = s0.chat_id AND m.end_source = 'event'
+                                                  AND m.left_before > s0.sample_at
+                                                  AND m.left_before < (s0.day + 1)::timestamp AT TIME ZONE 'UTC') AS tail_net
+  FROM s0
 ), a AS (
   SELECT t.chat_id, z.* FROM chat_day_target t CROSS JOIN LATERAL (
     SELECT ad.day, sum(ad.messages) AS messages, count(*) AS active_users
@@ -867,14 +1025,24 @@ SELECT g.chat_id, g.day, coalesce(j.joins, 0), coalesce(j.rejoins, 0), coalesce(
        coalesce(f.corrections_in, 0), coalesce(x.corrections_out, 0), s.reported, s.known_open,
        coalesce(a.messages, 0) + coalesce(ua.messages, 0), coalesce(a.active_users, 0),
        coalesce(j.members_started, 0) + coalesce(f.members_started, 0), coalesce(x.members_ended, 0),
-       coalesce(x.unsure_started, 0), coalesce(x.unsure_ended, 0), now()
+       coalesce(x.unsure_started, 0) + coalesce(sp.unsure_started, 0), coalesce(x.unsure_ended, 0),
+       coalesce(j.mid_started, 0) + coalesce(f.mid_started, 0) - coalesce(x.mid_ended, 0),
+       coalesce(x.mid_unsure_started, 0) + coalesce(sp.mid_started, 0) - coalesce(x.mid_unsure_ended, 0),
+       s.sample_at,
+       CASE WHEN s.sample_at IS NOT NULL AND p.sample_at IS NOT NULL
+            THEN coalesce(j.joins, 0) - coalesce(x.exits, 0) - s.tail_net + p.tail_net END,
+       now()
 FROM grid g
-LEFT JOIN j USING (chat_id, day) LEFT JOIN f USING (chat_id, day)
+LEFT JOIN j USING (chat_id, day) LEFT JOIN f USING (chat_id, day) LEFT JOIN sp USING (chat_id, day)
 LEFT JOIN x USING (chat_id, day) LEFT JOIN b USING (chat_id, day)
-LEFT JOIN s USING (chat_id, day) LEFT JOIN a USING (chat_id, day) LEFT JOIN ua USING (chat_id, day);
+LEFT JOIN s USING (chat_id, day) LEFT JOIN a USING (chat_id, day) LEFT JOIN ua USING (chat_id, day)
+LEFT JOIN s p ON p.chat_id = g.chat_id AND p.day = g.day - 1;
 
 \endif
-DELETE FROM tg.rollup_dirty r USING chat_day_target t WHERE r.chat_id = t.chat_id AND r.marked_at <= now();
+DELETE FROM tg.rollup_dirty r USING (
+  SELECT d.chat_id FROM tg.rollup_dirty d JOIN chat_day_target t ON t.chat_id = d.chat_id AND d.version = t.dirty_version
+  FOR UPDATE OF d SKIP LOCKED) x
+WHERE r.chat_id = x.chat_id;
 INSERT INTO stats.rollup_run (rollup, started_at, finished_at, as_of, row_count)
 SELECT 'chat_day', now(), clock_timestamp(), :'as_of_ts', count(*)
 FROM stats.chat_day d JOIN chat_day_target t ON t.chat_id = d.chat_id AND d.day >= t.from_day;
@@ -889,11 +1057,14 @@ SELECT :'only' IN ('R2') AS run \gset
 \if :run
 \echo == R2. refresh user_chats and chat_set, then the pair matrix from the distinct chat sets
 -- The pair work is sum over distinct chat sets of k^2, not over people: most people share a few sets.
--- One transaction, so overlap, unique and chats_per_user describe the same user_chats; readers see the old
--- rows until the commit.
-SELECT ispopulated AS user_chats_populated FROM pg_matviews WHERE schemaname = 'tg' AND matviewname = 'user_chats' \gset
-BEGIN;
+-- One REPEATABLE READ transaction: every statement reads the snapshot of the first one (the matview refresh
+-- included), so overlap, unique and chats_per_user describe the same user_chats, the same tracked chats and the
+-- same side of a migration (tg.move_chat_history); readers see the old rows until the commit. Every row is
+-- published with :as_of (the time the run was asked to describe). The service runs this in tgaud.jobs.audience
+-- (the CLI's forget-user calls audience.refresh) and picks the refresh branch in Python.
+BEGIN ISOLATION LEVEL REPEATABLE READ;
 SET LOCAL work_mem = '64MB';
+SELECT ispopulated AS user_chats_populated FROM pg_matviews WHERE schemaname = 'tg' AND matviewname = 'user_chats' \gset
 \if :user_chats_populated
 REFRESH MATERIALIZED VIEW CONCURRENTLY tg.user_chats;
 \else
@@ -901,7 +1072,7 @@ REFRESH MATERIALIZED VIEW tg.user_chats;
 \endif
 DELETE FROM tg.chat_set;
 INSERT INTO tg.chat_set (chat_ids, chat_count, users, as_of)
-SELECT chat_ids, chat_count, count(*), now() FROM tg.user_chats GROUP BY chat_ids, chat_count;
+SELECT chat_ids, chat_count, count(*), :'as_of_ts'::timestamptz FROM tg.user_chats GROUP BY chat_ids, chat_count;
 DELETE FROM stats.overlap;
 :explain
 INSERT INTO stats.overlap (chat_a, chat_b, shared, as_of)
@@ -912,20 +1083,20 @@ pairs AS (
   WHERE a.chat_id <= b.chat_id
   GROUP BY 1, 2
 )
-SELECT ta.chat_id, tb.chat_id, coalesce(p.shared, 0), now()
+SELECT ta.chat_id, tb.chat_id, coalesce(p.shared, 0), :'as_of_ts'::timestamptz
 FROM tracked ta JOIN tracked tb ON ta.chat_id <= tb.chat_id
 LEFT JOIN pairs p ON p.chat_a = ta.chat_id AND p.chat_b = tb.chat_id;
 DELETE FROM stats.unique_per_chat;
 INSERT INTO stats.unique_per_chat (chat_id, members, exclusive, as_of)
-SELECT o.chat_a, o.shared, coalesce(x.exclusive, 0), now()
+SELECT o.chat_a, o.shared, coalesce(x.exclusive, 0), :'as_of_ts'::timestamptz
 FROM stats.overlap o
 LEFT JOIN (SELECT chat_ids[1] AS chat_id, users AS exclusive FROM tg.chat_set WHERE chat_count = 1) x ON x.chat_id = o.chat_a
 WHERE o.chat_a = o.chat_b;
 DELETE FROM stats.chats_per_user;
 INSERT INTO stats.chats_per_user (chat_count, users, as_of)
-SELECT chat_count, sum(users), now() FROM tg.chat_set GROUP BY chat_count;
+SELECT chat_count, sum(users), :'as_of_ts'::timestamptz FROM tg.chat_set GROUP BY chat_count;
 INSERT INTO stats.rollup_run (rollup, started_at, finished_at, as_of, row_count)
-SELECT 'audience', now(), clock_timestamp(), now(), count(*) FROM stats.overlap;
+SELECT 'audience', now(), clock_timestamp(), :'as_of_ts', count(*) FROM stats.overlap;
 COMMIT;
 \endif
 

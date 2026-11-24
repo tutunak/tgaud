@@ -731,68 +731,189 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, tg AS $$
          THEN 'not covered' END), '')
 $$;
 
+-- The order of the spells of one person in one chat that start at the same instant (join, leave, join in one
+-- second), as a bigint[] {update_id, rank, membership_id} that compares lexicographically. Replay order is
+-- (event_at, update_id), events before sightings before probes (design.md 4). An exact spell is ordered by its
+-- join event. An inferred start (E6, E9) has no join event of its own: the function replays the events of that
+-- instant the way the rebuild does (a join opens an exact stay; an exit or an in -> in event with no stay open
+-- opens an inferred one; an exit, a join over an open stay or an out -> out event closes one) and so knows, for
+-- each inferred stay of the replay, the update id of the event that opened it and how it ended: closed by an
+-- exit event (that event's update id), closed by inference (-1), or not at all within that instant (0). The
+-- stored spell is matched to its replayed stay by that ending (its left event, or left_before = the instant, or
+-- later), so it is the provenance of a stored stay, never the order of the membership ids, that decides; only
+-- stays with the very same ending (several inferred closes) fall back to the order of their ids, and those are
+-- interchangeable for every count. Snapshot starts follow the events (rank 2), probes follow those (rank 3).
+-- Callers compare two stays of the same instant: tg.spell_order(a) < tg.spell_order(b).
+CREATE FUNCTION tg.spell_order(p_membership_id bigint) RETURNS bigint[]
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  s record;
+  e record;
+  v_kind text;                       -- the stay open during the replay: none | exact | inferred
+  v_cur integer := 0;                -- its index in the arrays, when inferred
+  v_opener bigint[] := '{}';         -- inferred stays of the replay: the opening event's update id ...
+  v_closer bigint[] := '{}';         -- ... and how it ended: an exit's update id, -1 by inference, 0 not within the instant
+  v_key bigint;
+  v_k integer;
+  v_i integer;
+  v_seen integer := 0;
+BEGIN
+  SELECT m.chat_id, m.user_id, m.known_from, m.start_source, m.join_event_id, m.joined_at, m.end_source,
+         m.left_event_id, m.left_at, m.left_before INTO s
+    FROM tg.membership m WHERE m.membership_id = p_membership_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  ELSIF s.join_event_id IS NOT NULL THEN
+    RETURN ARRAY[coalesce((SELECT x.update_id FROM tg.member_event x
+                            WHERE x.event_id = s.join_event_id AND x.event_at = s.joined_at), 9223372036854775807),
+                 0, p_membership_id];
+  ELSIF s.start_source = 'snapshot' THEN
+    RETURN ARRAY[9223372036854775807, 2, p_membership_id];
+  ELSIF s.start_source = 'probe' THEN
+    RETURN ARRAY[9223372036854775807, 3, p_membership_id];
+  END IF;
+  v_kind := CASE WHEN EXISTS (SELECT 1 FROM tg.membership x
+                               WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from < s.known_from
+                                 AND (x.left_before IS NULL OR x.left_before >= s.known_from))
+                 THEN 'exact' ELSE 'none' END;
+  FOR e IN SELECT x.update_id, x.kind FROM tg.member_event x
+            WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.event_at = s.known_from
+            ORDER BY x.update_id LOOP
+    IF e.kind = 'join' THEN
+      IF v_kind = 'inferred' THEN v_closer[v_cur] := -1; END IF;      -- E4: the old stay ends by inference
+      v_kind := 'exact';
+    ELSIF e.kind IN ('ban_out', 'unban', 'out_change') THEN
+      IF v_kind = 'inferred' THEN v_closer[v_cur] := -1; END IF;      -- E10 closes, E11 changes nothing
+      v_kind := 'none';
+    ELSIF e.kind IN ('leave', 'kick', 'restrict_out') THEN
+      IF v_kind = 'none' THEN                                         -- E6, E7: inferred, closed by this event
+        v_opener := v_opener || e.update_id;
+        v_closer := v_closer || e.update_id;
+      ELSIF v_kind = 'inferred' THEN
+        v_closer[v_cur] := e.update_id;                               -- E5
+      END IF;
+      v_kind := 'none';
+    ELSIF v_kind = 'none' THEN                                        -- E9: a missed join opens an inferred stay
+      v_opener := v_opener || e.update_id;
+      v_closer := v_closer || 0::bigint;
+      v_cur := cardinality(v_opener);
+      v_kind := 'inferred';
+    END IF;
+  END LOOP;
+  -- how this stored stay ended, in the replay's terms
+  v_key := CASE WHEN s.end_source IS NULL OR s.left_before > s.known_from THEN 0
+                WHEN s.left_event_id IS NOT NULL AND s.left_at = s.known_from
+                  THEN coalesce((SELECT x.update_id FROM tg.member_event x
+                                  WHERE x.event_id = s.left_event_id AND x.event_at = s.left_at), -1)
+                ELSE -1 END;
+  SELECT count(*) + 1 INTO v_k FROM tg.membership x            -- among stays with the same ending: by id
+   WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from = s.known_from
+     AND x.start_source = 'inferred' AND x.membership_id < p_membership_id
+     AND (CASE WHEN x.end_source IS NULL OR x.left_before > x.known_from THEN 0
+               WHEN x.left_event_id IS NOT NULL AND x.left_at = x.known_from
+                 THEN coalesce((SELECT y.update_id FROM tg.member_event y
+                                 WHERE y.event_id = x.left_event_id AND y.event_at = x.left_at), -1)
+               ELSE -1 END) = v_key;
+  FOR v_i IN 1 .. cardinality(v_opener) LOOP
+    IF v_closer[v_i] = v_key THEN
+      v_seen := v_seen + 1;
+      IF v_seen = v_k THEN
+        RETURN ARRAY[v_opener[v_i], 1, p_membership_id];
+      END IF;
+    END IF;
+  END LOOP;
+  RETURN ARRAY[9223372036854775807, 1, p_membership_id];             -- the stored stays do not match the replay
+END $$;
+REVOKE EXECUTE ON FUNCTION tg.spell_order(bigint) FROM PUBLIC;
+
 -- Giveaway entrants of one campaign (analytics item 4), one row per (chat, user): the earliest spell with
--- an exact join inside [starts_at, draw_at], and its outcomes. Text outcomes: yes | no | unknown | immature,
--- n/a when the question does not apply. Only confirmed evidence counts as an exit (bounds decide).
+-- an exact join inside [starts_at, min(draw_at, as_of)] (tied starts by the opening event's order), and its
+-- outcomes. Every entrant is reported; first_time = no earlier stay of the person in the chat (returners
+-- apart); eligible = not only_new_members, or first_time (a campaign with only_new_members does not admit
+-- returners). A campaign that starts after as_of has no entrants. Text outcomes: yes | no | unknown | immature,
+-- n/a when the question does not apply. Only confirmed evidence counts as an exit (bounds decide), and an
+-- outcome after as_of is never counted: it is immature (the quick exit and the exit after the draw look only
+-- as far as as_of; still_in is the person's state at as_of, not today's open row).
 CREATE FUNCTION tg.campaign_entrant(p_campaign_id bigint, p_hours numeric, p_as_of timestamptz)
 RETURNS TABLE (campaign_id bigint, chat_id bigint, user_id bigint, joined_at timestamptz, first_time boolean,
-               quick_exit text, exit_reason text, at_draw text, exit_after_draw text, still_in text)
+               quick_exit text, exit_reason text, at_draw text, exit_after_draw text, still_in text,
+               eligible boolean)
 LANGUAGE sql STABLE AS $$
 WITH g AS (
-  SELECT c.campaign_id, c.starts_at, c.draw_at, make_interval(secs => p_hours * 3600) AS h
+  SELECT c.campaign_id, c.starts_at, c.draw_at, c.only_new_members, make_interval(secs => p_hours * 3600) AS h
   FROM tg.campaign c WHERE c.campaign_id = p_campaign_id
 ), entrant AS (
   SELECT DISTINCT ON (m.chat_id, m.user_id)
-         g.campaign_id, g.draw_at, g.h, m.chat_id, m.user_id, m.joined_at, m.known_from, m.left_after,
-         m.left_before, m.end_source, m.end_reason, m.suspect_since
+         g.campaign_id, g.draw_at, g.h, g.only_new_members, m.membership_id, m.join_event_id, m.chat_id, m.user_id,
+         m.joined_at, m.known_from, m.left_after, m.left_before, m.end_source, m.end_reason, m.suspect_since
   FROM g
   JOIN tg.campaign_chat cc ON cc.campaign_id = g.campaign_id
   JOIN tg.membership m ON m.chat_id = cc.chat_id
                       AND m.joined_at >= g.starts_at AND m.joined_at <= least(g.draw_at, p_as_of)
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
-  ORDER BY m.chat_id, m.user_id, m.joined_at
+  ORDER BY m.chat_id, m.user_id, m.joined_at,
+           tg.spell_order(m.membership_id)
 ), outcome AS (
   SELECT e.*,
          tg.state_at(e.known_from, e.left_after, e.left_before, e.end_source, e.suspect_since,
-                     e.joined_at + e.h) AS quick_state,
+                     least(e.joined_at + e.h, p_as_of)) AS quick_state,
          CASE WHEN e.draw_at > p_as_of THEN 'immature'
               ELSE coalesce(tg.state_at(d.known_from, d.left_after, d.left_before, d.end_source, d.suspect_since,
                                         e.draw_at), 'out') END AS draw_state,
          tg.state_at(d.known_from, d.left_after, d.left_before, d.end_source, d.suspect_since,
-                     e.draw_at + e.h) AS after_draw_state,
-         (SELECT CASE WHEN o.suspect_since IS NULL THEN 'in' ELSE 'unknown' END
-            FROM tg.membership o
-           WHERE o.chat_id = e.chat_id AND o.user_id = e.user_id AND o.end_source IS NULL) AS open_state
+                     least(e.draw_at + e.h, p_as_of)) AS after_draw_state,
+         coalesce(tg.state_at(n.known_from, n.left_after, n.left_before, n.end_source, n.suspect_since,
+                              p_as_of), 'out') AS as_of_state
   FROM entrant e
   LEFT JOIN LATERAL (                                      -- the spell that holds the draw time
     SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
     FROM tg.membership s
     WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= e.draw_at
-    ORDER BY s.known_from DESC LIMIT 1) d ON true
+    ORDER BY (s.stay @> e.draw_at) DESC, s.known_from DESC, tg.spell_order(s.membership_id) DESC
+    LIMIT 1) d ON true
+  LEFT JOIN LATERAL (                                      -- the latest spell that had started by as_of
+    SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
+    FROM tg.membership s
+    WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= p_as_of
+    ORDER BY (s.stay @> p_as_of) DESC, s.known_from DESC, tg.spell_order(s.membership_id) DESC
+    LIMIT 1) n ON true
+), flagged AS (
+  SELECT o.*,
+         NOT EXISTS (SELECT 1 FROM tg.membership p
+                      WHERE p.chat_id = o.chat_id AND p.user_id = o.user_id AND p.membership_id <> o.membership_id
+                        AND (p.known_from < o.joined_at
+                             OR (p.known_from = o.joined_at          -- the same instant: the replay order
+                                 AND tg.spell_order(p.membership_id) < tg.spell_order(o.membership_id)))) AS first_time
+  FROM outcome o
 )
-SELECT o.campaign_id, o.chat_id, o.user_id, o.joined_at,
-       NOT EXISTS (SELECT 1 FROM tg.membership p
-                   WHERE p.chat_id = o.chat_id AND p.user_id = o.user_id AND p.known_from < o.joined_at),
-       CASE o.quick_state WHEN 'out' THEN 'yes' WHEN 'unknown' THEN 'unknown'
-            ELSE CASE WHEN o.joined_at + o.h > p_as_of THEN 'immature' ELSE 'no' END END,
-       CASE WHEN o.quick_state = 'out' THEN o.end_reason END,
-       o.draw_state,
-       CASE o.draw_state
-            WHEN 'in' THEN CASE o.after_draw_state WHEN 'out' THEN 'yes' WHEN 'unknown' THEN 'unknown'
-                           ELSE CASE WHEN o.draw_at + o.h > p_as_of THEN 'immature' ELSE 'no' END END
+SELECT f.campaign_id, f.chat_id, f.user_id, f.joined_at, f.first_time,
+       CASE WHEN f.quick_state = 'out' THEN 'yes'
+            WHEN f.joined_at + f.h > p_as_of THEN 'immature'
+            WHEN f.quick_state = 'unknown' THEN 'unknown'
+            ELSE 'no' END,
+       CASE WHEN f.quick_state = 'out' THEN f.end_reason END,
+       f.draw_state,
+       CASE f.draw_state
+            WHEN 'in' THEN CASE WHEN f.after_draw_state = 'out' THEN 'yes'
+                                WHEN f.draw_at + f.h > p_as_of THEN 'immature'
+                                WHEN f.after_draw_state = 'unknown' THEN 'unknown'
+                                ELSE 'no' END
             WHEN 'out' THEN 'n/a'
-            ELSE o.draw_state END,
-       coalesce(o.open_state, 'out')
-FROM outcome o
+            ELSE f.draw_state END,
+       f.as_of_state,
+       NOT f.only_new_members OR f.first_time
+FROM flagged f
 $$;
 REVOKE EXECUTE ON FUNCTION tg.campaign_entrant(bigint, numeric, timestamptz) FROM PUBLIC;
 
 -- Per-chat campaign summary for BI and the CLI (item 4a). Aggregates only; security definer so bi_reader
--- can read it through stats.v_campaign_summary without access to tg.
+-- can read it through stats.v_campaign_summary without access to tg. entrants = everyone who joined in the
+-- window (first_time and returners apart); eligible is filled only for a campaign with only_new_members and
+-- counts the first-time joiners (returners are not eligible), else NULL.
 CREATE FUNCTION stats.campaign_summary(p_hours numeric DEFAULT 48, p_as_of timestamptz DEFAULT now(),
                                        p_campaign_id bigint DEFAULT NULL)
 RETURNS TABLE (campaign_id bigint, campaign text, origin text, only_new_members boolean, chat_id bigint,
-               entrants bigint, first_time bigint, returners bigint,
+               entrants bigint, first_time bigint, returners bigint, eligible bigint,
                quick_exit bigint, quick_exit_kicked bigint, quick_exit_unknown bigint, quick_exit_immature bigint,
                in_at_draw bigint, in_at_draw_unknown bigint,
                exit_after_draw bigint, exit_after_draw_unknown bigint, exit_after_draw_immature bigint,
@@ -800,6 +921,7 @@ RETURNS TABLE (campaign_id bigint, campaign text, origin text, only_new_members 
 LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, tg AS $$
   SELECT c.campaign_id, c.name, c.origin, c.only_new_members, cc.chat_id,
          count(e.user_id), count(*) FILTER (WHERE e.first_time), count(*) FILTER (WHERE NOT e.first_time),
+         CASE WHEN c.only_new_members THEN count(*) FILTER (WHERE e.eligible) END,
          count(*) FILTER (WHERE e.quick_exit = 'yes'),
          count(*) FILTER (WHERE e.quick_exit = 'yes' AND e.exit_reason = 'kicked'),
          count(*) FILTER (WHERE e.quick_exit = 'unknown'),
@@ -808,8 +930,9 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, tg AS $$
          count(*) FILTER (WHERE e.exit_after_draw = 'yes'), count(*) FILTER (WHERE e.exit_after_draw = 'unknown'),
          count(*) FILTER (WHERE e.exit_after_draw = 'immature'),
          count(*) FILTER (WHERE e.still_in = 'in'), count(*) FILTER (WHERE e.still_in = 'unknown'),
-         tg.window_flags(cc.chat_id, tstzrange(c.starts_at,
-                         least(c.draw_at + make_interval(secs => p_hours * 3600), p_as_of))),
+         CASE WHEN c.starts_at < p_as_of THEN              -- a campaign still to start has no window yet
+           tg.window_flags(cc.chat_id, tstzrange(c.starts_at,
+                           least(c.draw_at + make_interval(secs => p_hours * 3600), p_as_of))) END,
          p_hours, p_as_of
   FROM tg.campaign c
   JOIN tg.campaign_chat cc ON cc.campaign_id = c.campaign_id
@@ -945,13 +1068,61 @@ BEGIN
   RETURN v_events;
 END $$;
 
--- Erase one person (D17, optional CLI forget-user). Aggregates keep their counts until the next rebuild of
--- the affected days, which the dirty markers trigger.
+-- Erase one person (D17, CLI forget-user). The CLI runs it only under tgaud.db.maintenance (the service stopped)
+-- with lock_chats of every chat the person appears in, then refreshes the audience rollup (R2) itself; this
+-- function is the one transaction of the erasure itself:
+--  * the subject rows go: spells, events, sightings, probes, snapshot rows, join requests, activity counts,
+--    the tg_user row, and every raw payload that names the person anywhere (as subject, `from` or link creator);
+--  * secondary references are cut, never the other people's history: actor_id (actor_is_other keeps "kicked" and
+--    the "added" route), join_request.resolved_by, snapshot_member.inviter_id, invite_link.creator_id (a masked
+--    link row that would then equal another is merged into it);
+--  * tg.erasure records a hash of the id and the time, so old in-flight evidence (an update, a listing, a probe
+--    answer dated before it) is dropped by ingest and the reconciler (tg.is_erased);
+--  * every chat the person touched gets a dirty marker from the earliest affected day (chat_day counts them).
+-- It refuses while a snapshot is unfinished: the collect script would still write rows for the person.
 CREATE FUNCTION tg.forget_user(p_user_id bigint) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  r record;
 BEGIN
-  INSERT INTO tg.rollup_dirty (chat_id, from_day)
-    SELECT m.chat_id, min(m.known_from)::date FROM tg.membership m WHERE m.user_id = p_user_id GROUP BY m.chat_id
-  ON CONFLICT (chat_id) DO UPDATE SET from_day = least(tg.rollup_dirty.from_day, excluded.from_day), marked_at = now();
+  -- No page of the collect script can be committed from here to the end of this transaction: a page waiting
+  -- for the lock is checked against tg.erasure (trigger snapshot_member_skip_erased, migration 008) after it,
+  -- and a page in flight is waited for, so the delete below sees it.
+  LOCK TABLE tg.snapshot_member IN SHARE ROW EXCLUSIVE MODE;
+  IF EXISTS (SELECT 1 FROM tg.snapshot WHERE finished_at IS NULL) THEN
+    RAISE EXCEPTION 'a snapshot is still being written: finish or delete it before forget-user'
+      USING ERRCODE = 'object_not_in_prerequisite_state';
+  END IF;
+  INSERT INTO tg.erasure (user_hash, erased_at) VALUES (tg.erasure_hash(p_user_id), clock_timestamp())
+    ON CONFLICT (user_hash) DO UPDATE SET erased_at = excluded.erased_at;
+
+  PERFORM tg.mark_dirty(d.chat_id, d.day) FROM (
+    SELECT chat_id, min(day) AS day FROM (
+      SELECT chat_id, (least(known_from, left_after, left_before, suspect_since) AT TIME ZONE 'UTC')::date AS day
+        FROM tg.membership WHERE user_id = p_user_id
+      UNION ALL
+      SELECT chat_id, day FROM tg.activity_daily WHERE user_id = p_user_id
+    ) x GROUP BY chat_id) d;
+
+  UPDATE tg.member_event SET actor_id = NULL WHERE actor_id = p_user_id;
+  UPDATE tg.join_request SET resolved_by = NULL WHERE resolved_by = p_user_id;
+  UPDATE tg.snapshot_member SET inviter_id = NULL WHERE inviter_id = p_user_id;
+  -- A creator is cleared on its own row, so no link id, campaign or reference of anyone else changes. A masked
+  -- link (the redacted text is all the Bot API shows of other admins' links, and two links can share it) gets
+  -- its id appended: its identity was (chat, text, creator), and with the creator gone a later update for the
+  -- same text, which ingest resolves to "no creator", must open a link of unknown origin, not match and
+  -- rename this one or its twin. Bot-made links are found by their digest and keep it.
+  FOR r IN SELECT l.invite_link_id, l.masked_link FROM tg.invite_link l WHERE l.creator_id = p_user_id LOOP
+    IF r.masked_link IS NOT NULL THEN
+      UPDATE tg.invite_link SET creator_id = NULL, masked_link = masked_link || ' #' || invite_link_id
+       WHERE invite_link_id = r.invite_link_id;
+    ELSE
+      UPDATE tg.invite_link SET creator_id = NULL WHERE invite_link_id = r.invite_link_id;
+    END IF;
+  END LOOP;
+
+  DELETE FROM tg.raw_update
+   WHERE user_id = p_user_id
+      OR jsonb_path_exists(payload, '$.** ? (@.id == $uid)', jsonb_build_object('uid', p_user_id));
   DELETE FROM tg.membership WHERE user_id = p_user_id;
   DELETE FROM tg.member_event WHERE user_id = p_user_id;
   DELETE FROM tg.sighting WHERE user_id = p_user_id;
@@ -959,8 +1130,18 @@ BEGIN
   DELETE FROM tg.snapshot_member WHERE user_id = p_user_id;
   DELETE FROM tg.join_request WHERE user_id = p_user_id;
   DELETE FROM tg.activity_daily WHERE user_id = p_user_id;
-  DELETE FROM tg.raw_update WHERE user_id = p_user_id;
   DELETE FROM tg.tg_user WHERE user_id = p_user_id;
+
+  -- Reconciliation records that hold the id as a number: the diagnostic endpoints are cleared, and a live cursor
+  -- (every user_id <= it is applied) moves to the nearest surviving id below, which sorts the survivors alike.
+  UPDATE tg.reconcile_run SET from_user_id = NULL WHERE from_user_id = p_user_id;
+  UPDATE tg.reconcile_run SET through_user_id = NULL WHERE through_user_id = p_user_id;
+  UPDATE tg.snapshot s SET applied_through_user_id =
+      (SELECT max(u.user_id) FROM (SELECT m.user_id FROM tg.snapshot_member m WHERE m.snapshot_id = s.snapshot_id
+                                   UNION ALL SELECT t.user_id FROM tg.tg_user t) u WHERE u.user_id < p_user_id)
+   WHERE s.applied_through_user_id = p_user_id;
+  UPDATE tg.gap_progress g SET last_user_id = (SELECT max(t.user_id) FROM tg.tg_user t WHERE t.user_id < p_user_id)
+   WHERE g.last_user_id = p_user_id;
 END $$;
 
 ------------------------------------------------------------------------------------------------------------
