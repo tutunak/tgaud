@@ -1,0 +1,70 @@
+{% macro data_table(t, empty="No rows.", cards=true, count=true) %}
+{% if not t.rows %}
+<p class="empty">{{ empty }}</p>
+{% else %}
+<div class="scroll">
+<table class="data{% if cards %} cards{% else %} measures{% endif %}">
+  <thead><tr>{% for c in t.columns %}<th data-col="{{ c }}"{% if t.numeric[loop.index0] %} class="num"{% endif %}>{{ c|replace("_", " ") }}</th>{% endfor %}</tr></thead>
+  <tbody>
+  {% for row in t.rows %}
+    <tr>{% for cell in row %}<td{% if t.numeric[loop.index0] %} class="num"{% endif %} data-label="{{ t.columns[loop.index0]|replace('_', ' ') }}">{% if cell.href %}<a href="{{ cell.href }}">{{ cell.text }}</a>{% elif cell.time %}{% for part in cell.text.split(" ") %}<span class="nw">{{ part }}</span>{{ " " if not loop.last }}{% endfor %}{% elif cell.sub %}<span>{{ cell.text }} <span class="id">{{ cell.sub }}</span></span>{% else %}{{ cell.text }}{% endif %}</td>{% endfor %}</tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if count %}<p class="count">{{ t.total }} row{{ "" if t.total == 1 else "s" }}{% if t.cut %}; the first {{ t.rows|length }} are shown (the CLI's <code>--csv</code> has them all){% endif %}</p>{% endif %}
+{% endif %}
+{% endmacro %}
+
+{% macro window_text(w) %}{% if w %}{% if w.point %}{{ w.start|when }}{% else %}{{ w.start|when }} .. {{ w.end|when }}{% endif %}{% else %}none (current state){% endif %}{% endmacro %}
+
+{% macro report_header(h) %}
+<section class="report-header">
+  <dl class="facts">
+    <div><dt>As of</dt><dd>{{ h.as_of|when }}</dd></div>
+    {% if h.rollup %}
+    <div><dt>Audience rollup</dt><dd>{% if h.rollup_as_of %}{{ h.rollup_as_of|when }}{% else %}not run yet (the service refreshes it hourly){% endif %}</dd></div>
+    {% endif %}
+    <div><dt>Window</dt><dd>{{ window_text(h.window) }}</dd></div>
+    <div><dt>Chats in scope</dt><dd>{{ h.coverage|length }}</dd></div>
+  </dl>
+  {% for n in h.notes %}<p class="note">{{ n }}</p>{% endfor %}
+  {% if h.coverage %}
+  <details class="coverage"{% if h.coverage|length <= 6 %} open{% endif %}>
+    <summary>Coverage and gap flags</summary>
+    <div class="scroll">
+    <table class="data compact cards">
+      <thead><tr><th>Chat</th><th class="num">Known</th><th class="num">Reported</th><th class="num">Coverage</th><th class="num">Suspect</th><th>Gap flags</th></tr></thead>
+      <tbody>
+      {% for r in h.coverage %}
+        <tr>
+          <th scope="row" data-label="Chat">{{ r.title }} <span class="id">{{ r.chat_id }}</span></th>
+          {% if r.reported is none %}
+          <td colspan="4" class="muted" data-label="Coverage">no count sample yet</td>
+          {% else %}
+          <td class="num" data-label="Known">{{ r.known_open }}</td><td class="num" data-label="Reported">{{ r.reported }}</td>
+          <td class="num" data-label="Coverage">{% if r.coverage_pct is not none %}{{ r.coverage_pct }} %{% endif %}</td>
+          <td class="num" data-label="Suspect">{{ r.suspect_open }}</td>
+          {% endif %}
+          <td data-label="Gap flags">{% if r.flags %}<span class="flag">{{ r.flags }}</span>{% else %}<span class="muted">clean</span>{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    </div>
+  </details>
+  {% endif %}
+</section>
+{% endmacro %}
+
+{% macro scope_picker(chats, chosen, name="chat", label="Scope") %}
+<details class="scope">
+  <summary>{{ label }}: {% if chosen %}{{ chosen|length }} of {{ chats|length }} chats{% else %}all {{ chats|length }} tracked chats{% endif %}</summary>
+  <div class="checks">
+  {% for c in chats %}
+    <label><input type="checkbox" name="{{ name }}" value="{{ c.id }}"{% if c.id in chosen %} checked{% endif %}> {{ c.title }} <span class="id">{{ c.id }}</span></label>
+  {% endfor %}
+  </div>
+  <p class="hint">None ticked means every tracked chat.</p>
+</details>
+{% endmacro %}

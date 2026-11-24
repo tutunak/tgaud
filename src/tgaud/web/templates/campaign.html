@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% from "_macros.html" import data_table, report_header %}
+{% block main %}
+<p class="crumbs"><a href="/campaigns">Campaigns</a> › {{ campaign[0] }}</p>
+<h1>{{ campaign[1] }}</h1>
+<dl class="facts">
+  <div><dt>Kind</dt><dd>{{ campaign[2] }} ({{ campaign[3] }})</dd></div>
+  <div><dt>Entry window</dt><dd>{{ campaign[4]|when }} .. {{ campaign[5]|when }}</dd></div>
+  <div><dt>Eligible</dt><dd>{% if campaign[6] %}new members only{% else %}everyone{% endif %}</dd></div>
+  {% if campaign[7] %}<div><dt>Winners</dt><dd>{{ campaign[7] }}</dd></div>{% endif %}
+  {% if campaign[8] %}<div><dt>Note</dt><dd>{{ campaign[8] }}</dd></div>{% endif %}
+</dl>
+{% if problem %}<p class="problem">{{ problem }}</p>{% endif %}
+{% if made %}
+<section class="once">
+  <h2>Invite link "{{ made.name }}" for {{ made.chat.title }}</h2>
+  <p><code class="link">{{ made.link }}</code></p>
+  <p><strong>Copy it now: this is the only time it is shown.</strong> Only its HMAC digest and name are stored{% if made.id is defined %} (invite link {{ made.id }}){% endif %}.</p>
+</section>
+{% endif %}
+{{ report_header(header) }}
+<form method="get" action="/campaigns/{{ campaign[0] }}" class="controls inline">
+  <label>As of <input type="text" name="as_of" value="" placeholder="now"></label>
+  <label>Quick exit within (hours) <input type="text" name="hours" value="{{ hours if hours is not none else '' }}" placeholder="48" inputmode="decimal"></label>
+  <button type="submit">Recompute</button>
+</form>
+<h2>Per chat</h2>
+{{ data_table(per_chat, "No entrant yet.", cards=false, count=false) }}
+<h2>Per person</h2>
+{{ data_table(per_person, "No entrant yet.", cards=false, count=false) }}
+<p><a class="button" href="/campaigns/{{ campaign[0] }}/entrants.csv?{{ csv_query }}">Download the entrants (CSV)</a>
+<span class="hint">One row per chat and person, with user ids: for the owner only.</span></p>
+<h2 id="link">Make a named bot invite link</h2>
+<form method="post" action="/campaigns/{{ campaign[0] }}/link" class="stack">
+  <div class="row">
+    <label>Chat <select name="chat">{% for c in chats %}<option value="{{ c.id }}">{{ c.title }} ({{ c.id }})</option>{% endfor %}</select></label>
+    <label>Link name <input type="text" name="name" maxlength="{{ name_max }}" required placeholder="giveaway-dec"></label>
+  </div>
+  <p class="hint">Joins through the link are attributed to this campaign. The link is shown once; only its digest is kept.</p>
+  <button type="submit">Create link</button>
+</form>
+{% if links %}
+<h2>Bot links of this campaign</h2>
+<div class="scroll">
+<table class="data cards">
+  <thead><tr><th class="num">Id</th><th>Chat</th><th>Name</th><th>Made</th></tr></thead>
+  <tbody>{% for l in links %}<tr><td class="num" data-label="Id">{{ l[0] }}</td><td data-label="Chat">{{ titles.get(l[1], l[1]) }}</td><td data-label="Name">{{ l[2] }}</td><td data-label="Made">{{ l[3]|when }}</td></tr>{% endfor %}</tbody>
+</table>
+</div>
+{% endif %}
+{% endblock %}

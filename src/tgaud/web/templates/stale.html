@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block main %}
+<h1>The overlap was refreshed</h1>
+<p class="problem">This page belongs to the audience rollup as of {{ shown|when }}, but the published one is
+{% if published %}as of {{ published|when }}{% else %}gone (no rollup is published){% endif %}. A newer rollup
+describes different people, so this page is not answered from it.</p>
+<p><a class="button" href="{{ back }}">Reload the overlap matrix</a></p>
+{% endblock %}

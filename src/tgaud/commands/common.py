@@ -277,10 +277,12 @@ def when(value: dt.datetime | None) -> str:
 
 def print_header(out: TextIO, conn: psycopg.Connection, *, title: str, as_of: dt.datetime, scope: Sequence[int],
                  window: Window | None = None, rollup_as_of: dt.datetime | None = None, rollup: bool = False,
-                 notes: Sequence[str] = ()) -> None:
+                 notes: Sequence[str] = (), rows: list[dict[str, Any]] | None = None) -> None:
     """What every report says before its table: the title, the as-of time, the window, the chats in scope with
-    their coverage (our known members / Telegram's count, suspect spells) and the gap flags of the window."""
-    rows = coverage_rows(conn, scope, as_of, window)
+    their coverage (our known members / Telegram's count, suspect spells) and the gap flags of the window
+    (`rows`: coverage_rows already read in this transaction)."""
+    if rows is None:
+        rows = coverage_rows(conn, scope, as_of, window)
     print(f"== {title}", file=out)
     print(f"as of {when(as_of)}", file=out)
     if rollup:

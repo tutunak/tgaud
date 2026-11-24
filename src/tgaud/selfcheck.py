@@ -2,7 +2,8 @@
 
 It parses the config from the environment, filling dummy values only for unset variables (the secrets and
 TGAUD_DATABASE_URL; an explicitly empty value is validated as serve would), lexes every bundled migration and
-admin.sql, parses every block of queries.sql, imports every module of the package, and prints one line
+admin.sql, parses every block of queries.sql, imports every module of the package, compiles every web template,
+and prints one line
 starting `selfcheck ok:`. It never connects anywhere: socket
 creation and connects are refused for its duration, so a module that touches the network fails the check.
 """
@@ -80,9 +81,26 @@ def run(env: Mapping[str, str] | None = None, root: Traversable | None = None) -
         for info in pkgutil.walk_packages(tgaud.__path__, "tgaud."):
             importlib.import_module(info.name)
             modules += 1
+        templates = _web_templates()
     dummy_note = f" (dummy {', '.join(dummies)})" if dummies else ""
     return (f"selfcheck ok: config ok{dummy_note}, {len(migrations)} migrations (latest "
-            f"{migrations[-1].version:03d}), {len(qf.ids())} query blocks, {modules} modules")
+            f"{migrations[-1].version:03d}), {len(qf.ids())} query blocks, {modules} modules, "
+            f"{templates} web templates")
+
+
+def _web_templates() -> int:
+    """Compile every template of the web UI and find its stylesheet (both are package data of the wheel)."""
+    from tgaud.web import pages
+
+    env = pages.environment()
+    names = env.list_templates()
+    if not names:
+        raise SelfcheckError("no web templates bundled")
+    for name in names:
+        env.get_template(name)
+    if pages.static_file("style.css") is None:
+        raise SelfcheckError("the web stylesheet is not bundled")
+    return len(names)
 
 
 def _render(items) -> None:

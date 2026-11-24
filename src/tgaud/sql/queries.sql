@@ -11,7 +11,11 @@
 --   since          as_of - 90 d start of the history window (joins, exits, posts, requests)
 --   hours          48           H: a short stay / quick exit is an exit within H hours
 --   campaign       0            campaign id for item 4; 0 = every campaign
---   chat           0            one chat for item 16 (as-of membership)
+--   chat           0            one chat for item 16 (as-of membership); chat A of item 1b
+--   chat_b         0            item 1b: chat B of the pair
+--   side           shared       item 1b: shared (in both), only_a, only_b
+--   after_user     0            item 1b: the page starts after this user id
+--   page_size      100          item 1b: rows per page
 --   user           0            one user id for item 2b (lookup)
 --   day            as_of        the date D of item 16
 --   flow_days      7            item 10b: joined A, then B within this many days
@@ -36,6 +40,10 @@
 \if :{?hours}          \else \set hours 48           \endif
 \if :{?campaign}       \else \set campaign 0         \endif
 \if :{?chat}           \else \set chat 0             \endif
+\if :{?chat_b}         \else \set chat_b 0           \endif
+\if :{?side}           \else \set side shared        \endif
+\if :{?after_user}     \else \set after_user 0       \endif
+\if :{?page_size}      \else \set page_size 100      \endif
 \if :{?user}           \else \set user 0             \endif
 \if :{?day}            \else \set day ''             \endif
 \if :{?flow_days}      \else \set flow_days 7        \endif
@@ -74,6 +82,30 @@ WHERE o.chat_a = ANY (:'scope_ids'::bigint[]) AND o.chat_b = ANY (:'scope_ids'::
 ORDER BY o.chat_a, o.chat_b;
 \endif
 
+SELECT :'only' IN ('all', '1b') AS run \gset
+\if :run
+\echo == 1b. overlap drill-down: the people behind one pair, one page
+-- Q: who are the people of one cell of item 1: in both :chat and :chat_b (side shared), only in :chat
+-- (only_a) or only in :chat_b (only_b)? Reads tg.user_chats, which R2 refreshes in the transaction that
+-- publishes the matrix, so a cell and its list describe the same people (both as of the rollup's as_of; a
+-- join after the refresh changes neither until the next one). Paged by user id: :page_size rows after
+-- :after_user. as_of is the published generation of the pair's cell; the web UI answers only while it is
+-- the one its matrix page showed.
+:explain
+SELECT u.user_id, t.username, t.first_name, t.last_name, u.chat_count,
+       (SELECT o.as_of FROM stats.overlap o
+         WHERE o.chat_a = least(:chat, :chat_b) AND o.chat_b = greatest(:chat, :chat_b)) AS as_of
+FROM tg.user_chats u
+LEFT JOIN tg.tg_user t ON t.user_id = u.user_id
+WHERE u.user_id > :after_user
+  AND CASE :'side' WHEN 'shared' THEN u.chat_ids @> ARRAY[:chat, :chat_b]::bigint[]
+                   WHEN 'only_a' THEN :chat = ANY (u.chat_ids) AND NOT :chat_b = ANY (u.chat_ids)
+                   WHEN 'only_b' THEN :chat_b = ANY (u.chat_ids) AND NOT :chat = ANY (u.chat_ids)
+                   ELSE false END
+ORDER BY u.user_id
+LIMIT :page_size;
+\endif
+
 ------------------------------------------------------------------------------------------------------------
 -- 2. Chats per user
 ------------------------------------------------------------------------------------------------------------
@@ -109,6 +141,50 @@ JOIN tg.chat c ON c.chat_id = m.chat_id AND c.tracked
 LEFT JOIN tg.invite_link l ON l.invite_link_id = m.invite_link_id
 WHERE m.user_id = :user
 ORDER BY m.chat_id, m.known_from;
+\endif
+
+SELECT :'only' IN ('all', '2c') AS run \gset
+\if :run
+\echo == 2c. one user: the campaigns they entered (web user lookup)
+-- Q: in which campaigns did this person join a campaign chat inside the entry window, and what happened next
+-- (item 4 per entrant: first-time, quick exit within H, in at the draw, left after it, still in at as_of)?
+-- The rows of tg.campaign_entrant for :user; only campaigns where the person has a join in the window are
+-- evaluated (an index probe on membership_user_join), so the lookup does not compute every entrant list.
+:explain
+SELECT x.campaign_id, c.name AS campaign, c.kind, x.chat_id, ch.title, x.joined_at, x.first_time, x.eligible,
+       x.quick_exit, x.exit_reason, x.at_draw, x.exit_after_draw, x.still_in
+FROM tg.campaign c
+CROSS JOIN LATERAL tg.campaign_entrant(c.campaign_id, :hours, :'as_of_ts') x
+LEFT JOIN tg.chat ch ON ch.chat_id = x.chat_id
+WHERE x.user_id = :user
+  AND EXISTS (SELECT 1 FROM tg.membership m JOIN tg.campaign_chat cc ON cc.chat_id = m.chat_id AND cc.campaign_id = c.campaign_id
+              WHERE m.user_id = :user AND m.joined_at >= c.starts_at
+                AND m.joined_at <= least(c.draw_at, :'as_of_ts'::timestamptz))
+ORDER BY c.starts_at, x.campaign_id, x.chat_id;
+\endif
+
+SELECT :'only' IN ('all', '2d') AS run \gset
+\if :run
+\echo == 2d. one user: messages per group (web user lookup)
+-- Q: how much did this person write in each group: days with a message and messages, in all and in the last
+-- active_days, first and last day? Daily counts only, no text. As in 14: when as_of is earlier than the last
+-- update ingest committed, only complete UTC days up to activity_through count.
+:explain
+WITH lim AS (
+  SELECT CASE WHEN :'as_of_ts'::timestamptz >= coalesce((SELECT max(b.last_poll_ok_at) FROM tg.bot_state b), '-infinity'::timestamptz)
+              THEN (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date
+              ELSE (:'as_of_ts'::timestamptz AT TIME ZONE 'UTC')::date - 1 END AS last_day
+)
+SELECT a.chat_id, ch.title, count(*) AS days_active, sum(a.messages) AS messages,
+       count(*) FILTER (WHERE a.day > lim.last_day - :active_days) AS days_active_recent,
+       coalesce(sum(a.messages) FILTER (WHERE a.day > lim.last_day - :active_days), 0) AS messages_recent,
+       min(a.day) AS first_day, max(a.day) AS last_day, lim.last_day AS activity_through
+FROM tg.activity_daily a
+CROSS JOIN lim
+JOIN tg.chat ch ON ch.chat_id = a.chat_id AND ch.tracked
+WHERE a.user_id = :user AND a.day <= lim.last_day
+GROUP BY a.chat_id, ch.title, lim.last_day
+ORDER BY a.chat_id;
 \endif
 
 ------------------------------------------------------------------------------------------------------------

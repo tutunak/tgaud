@@ -13,7 +13,8 @@ NOW = "2026-11-23 12:00+00"
 AD = [A, B, C, D]
 # The parameters of docs/design/evidence/40-run-queries.sh, per block.
 RUNS = [
-    ("1", dict(scope=AD)), ("2a", {}), ("2a", dict(scope=AD)), ("2b", dict(user=1001)), ("2b", dict(user=1006)),
+    ("1", dict(scope=AD)), ("1b", dict(chat=A, chat_b=B)), ("1b", dict(chat=A, chat_b=B, side="only_a")),
+    ("2a", {}), ("2c", dict(user=1001)), ("2d", dict(user=1001)), ("2a", dict(scope=AD)), ("2b", dict(user=1001)), ("2b", dict(user=1006)),
     ("3", dict(scope=AD)), ("3", dict(scope=[A, B])), ("4", {}), ("5", dict(scope=AD, since="2026-08-01")),
     ("6", dict(scope=AD, since="2026-08-01", burst_users=2)), ("7a", dict(scope=AD)),
     ("7b", dict(scope=[A, B], since="2026-08-01")), ("8", dict(scope=[A], since="2026-08-01")),
@@ -37,7 +38,7 @@ def fx(history_fixture):
 
 def test_every_block_id_loads():
     ids = sql.ids()
-    assert len(ids) == 37
+    assert len(ids) == 40
     assert {"1", "2", "2a", "2b", "4a", "16c", "16d", "R1", "R2", "R3", "R4"} <= set(ids)
     for block_id in ids:
         if block_id in ("R1", "R2"):

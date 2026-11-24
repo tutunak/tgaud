@@ -40,13 +40,16 @@ from psycopg.types.numeric import Int4, Int8
 from tgaud import sqlscript
 
 # Header inputs bound as psql quoted literals (str), and the values the header derives with \gset.
-QUOTED_INPUTS = ("as_of", "scope", "since", "day")
+QUOTED_INPUTS = ("as_of", "scope", "since", "day", "side")
 DERIVED = ("as_of_ts", "since_ts", "day_ts", "scope_ids")
 # `:name` parameters and the type they are bound with (psql interpolates their text as a number literal).
 PARAM_TYPES: dict[str, type] = {
     "hours": Decimal,
     "campaign": Int8,
     "chat": Int8,
+    "chat_b": Int8,
+    "after_user": Int8,
+    "page_size": Int4,
     "user": Int8,
     "flow_days": Int4,
     "burst_minutes": Int4,

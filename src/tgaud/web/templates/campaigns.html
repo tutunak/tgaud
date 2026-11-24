@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% from "_macros.html" import data_table %}
+{% block main %}
+<h1>Campaigns</h1>
+{{ data_table(list, "No campaign yet.") }}
+<h2 id="new">New owner campaign</h2>
+{% if problem %}<p class="problem">{{ problem }}</p>{% endif %}
+<form method="post" action="/campaigns" class="stack">
+  <label>Name <input type="text" name="name" value="{{ form.get('name', '') }}" required maxlength="200"></label>
+  <div class="row">
+    <label>Kind <select name="kind">{% for k in kinds %}<option value="{{ k }}"{% if form.get('kind', 'giveaway') == k %} selected{% endif %}>{{ k }}</option>{% endfor %}</select></label>
+    <label>Winners <input type="number" name="winners" min="1" value="{{ form.get('winners', '') }}"></label>
+  </div>
+  <div class="row">
+    <label>Entry window starts <input type="text" name="starts" value="{{ form.get('starts', '') }}" placeholder="2026-12-01T10:00" required></label>
+    <label>Draw <input type="text" name="draw" value="{{ form.get('draw', '') }}" placeholder="2026-12-08T18:00" required></label>
+  </div>
+  <p class="hint">Times are UTC unless they carry an offset (2026-12-01T10:00+02:00); a date alone means 00:00 UTC.</p>
+  <label class="check"><input type="checkbox" name="only_new_members" value="1"{% if form.get('only_new_members') %} checked{% endif %}> Only new members are eligible (returners are reported apart)</label>
+  <fieldset>
+    <legend>Chats it covers</legend>
+    <div class="checks">
+    {% for c in chats %}
+      <label><input type="checkbox" name="chat" value="{{ c.id }}"{% if (c.id|string) in form.get('chats', []) %} checked{% endif %}> {{ c.title }} <span class="id">{{ c.id }}</span></label>
+    {% endfor %}
+    </div>
+  </fieldset>
+  <label>Note <textarea name="note" rows="2" maxlength="2000">{{ form.get('note', '') }}</textarea></label>
+  <button type="submit">Add campaign</button>
+</form>
+{% endblock %}

@@ -24,7 +24,8 @@ def test_wheel_installs_and_runs_outside_the_checkout(tmp_path):
     wheel = next(dist.glob("*.whl"))
     names = zipfile.ZipFile(wheel).namelist()
     for path in ("tgaud/sql/queries.sql", "tgaud/sql/admin.sql", "tgaud/sql/migrations/001_initial.sql",
-                 "tgaud/sql/migrations/002_shared.sql", "tgaud/jobs/ingest.py", "tgstats/cli.py"):
+                 "tgaud/sql/migrations/002_shared.sql", "tgaud/jobs/ingest.py", "tgaud/web/templates/base.html",
+                 "tgaud/web/static/style.css", "tgstats/cli.py"):
         assert path in names, path
     venv = tmp_path / "venv"
     run([uv, "venv", "--python", sys.executable, str(venv)])

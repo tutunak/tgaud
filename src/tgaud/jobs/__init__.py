@@ -5,6 +5,7 @@
                     connection (which holds the service lock)
     worker thread   Scheduler over tgaud.jobs.reconciler, .prober, .sampler
     batch thread    Scheduler over tgaud.jobs.chat_day, .audience, .partitions
+    web threads     tgaud.web, only when TGAUD_WEB_LISTEN is set: one thread per request, one connection
 
 Each scheduled job module exports `make(ctx: JobContext) -> Job`. A Job has `name`, `due(now) -> bool` and
 `step(conn) -> None`: a bounded piece of work (target under 5 s) that commits. The scheduler runs due jobs
@@ -47,7 +48,7 @@ import psycopg
 
 from tgaud import db, metrics
 from tgaud.botapi import BotApi
-from tgaud.config import Config
+from tgaud.config import Config, ConfigError
 
 log = logging.getLogger(__name__)
 
@@ -335,6 +336,13 @@ def serve(config: Config, supervisor: Supervisor, *, health_window: float | None
         stop.set()
         supervisor.request(code, reason)
 
+    web_token = None
+    if config.web_listen is not None:
+        try:
+            web_token = config.web_proxy_token_or_fail()
+        except ConfigError as e:
+            log.error("configuration: %s", e)
+            return 2
     supervisor.add_stop_action(stop.set)
     health = Health(window=health_window or HEALTH_WINDOW, activation_id=config.activation_id)
     api = BotApi(str(config.bot_token.reveal()), config.bot_api_url) if config.bot_token else None
@@ -399,8 +407,16 @@ def serve(config: Config, supervisor: Supervisor, *, health_window: float | None
             log.error("cannot listen on %s: %s", config.metrics_listen, e)
             return 1
         supervisor.add_stop_action(server.close)
-        # The web UI (phase 2) starts here when config.web_listen is set; it calls
-        # config.web_proxy_token_or_fail() first.
+        if config.web_listen is not None:  # the web UI (phase 2): its own listener and its one connection
+            from tgaud import web
+
+            try:
+                web_server = web.WebServer(config, web_token, lambda: db.connect(config, "web"), fence=ctx.fence,
+                                           fatal=fatal).start()
+            except OSError as e:
+                log.error("cannot listen on %s: %s", config.web_listen, e)
+                return 1
+            supervisor.add_stop_action(web_server.close)
 
         for name, jobs in (("worker", WORKER_JOBS), ("batch", BATCH_JOBS)):
             made = [load_job_module(j).make(ctx) for j in jobs]

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% from "_macros.html" import data_table, report_header %}
+{% block main %}
+<p class="crumbs"><a href="/reports">Reports</a> › asof</p>
+<h1>Who was in a chat at a moment</h1>
+<form method="get" action="/reports/asof" class="controls">
+  <div class="row">
+    <label>Chat <select name="chat">{% for c in chats %}<option value="{{ c.id }}"{% if (c.id|string) == form.chat %} selected{% endif %}>{{ c.title }} ({{ c.id }})</option>{% endfor %}</select></label>
+    <label>Moment <input type="text" name="date" value="{{ form.date }}" placeholder="2026-11-07" required></label>
+    <label>Show <select name="mode">
+      <option value="counts"{% if form.mode == "counts" %} selected{% endif %}>counts (16a)</option>
+      <option value="list"{% if form.mode == "list" %} selected{% endif %}>the members (16b)</option>
+      <option value="eod"{% if form.mode == "eod" %} selected{% endif %}>end of that UTC day (16d)</option>
+    </select></label>
+    <label>As of <input type="text" name="as_of" value="{{ form.as_of }}" placeholder="now"></label>
+  </div>
+  <button type="submit">Show</button>
+</form>
+<p class="hint">Not here: {{ note }}.</p>
+{% if header %}
+{{ report_header(header) }}
+{{ data_table(table) }}
+{% endif %}
+{% endblock %}
