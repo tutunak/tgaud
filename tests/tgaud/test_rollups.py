@@ -344,6 +344,86 @@ def test_a_rejoin_in_the_second_of_a_left_censored_exit_is_counted(migrated_dsn,
         assert [(r["rejoins"], r["observed"], r["possible"]) for r in res] == [(1, 1, 0)]  # the observed join, not E6
 
 
+@pytest.mark.parametrize("inferred_first", [True, False], ids=["inferred-spell-first", "join-spell-first"])
+@pytest.mark.parametrize("mode", ["full", "chat"])
+def test_a_rejoin_in_the_second_of_an_inferred_start_is_counted(migrated_dsn, mode, inferred_first):
+    """E9 then E4: member -> administrator (update 221) opens an inferred spell, left -> member (222) in the same
+    second closes it as a missed leave and opens the observed rejoin. The inferred spell has no event ids."""
+    t = "2026-11-20 10:00:00+00"
+    with psycopg.connect(migrated_dsn) as c:
+        _tiny_chat(c)
+        _event(c, -100777, 1, t, 221, "member", "administrator")
+        joined = _event(c, -100777, 1, t, 222, "left", "member")
+
+        def inferred() -> None:
+            c.execute("INSERT INTO tg.membership (chat_id, user_id, start_source, known_from, last_confirmed_at, "
+                      "end_source, end_reason, left_after, left_before) VALUES (-100777, 1, 'inferred', %s, %s, "
+                      "'inferred', 'gone', %s, %s)", (t, t, t, t))
+        if inferred_first:
+            inferred()
+            _stay(c, -100777, 1, (joined, t))
+        else:
+            _stay(c, -100777, 1, (joined, t))
+            inferred()
+        c.commit()
+        rollups.refresh_chat_days(c, [-100777], NOW, mode=mode)
+        row = c.execute("SELECT joins, rejoins FROM stats.chat_day WHERE chat_id = -100777 AND day = '2026-11-20'"
+                        ).fetchone()
+        assert row == (1, 1)
+        res = sql.run(c, "10a", as_of="2026-11-23 12:00+00", since="2026-11-01", scope=[-100777]).dicts()
+        assert [(r["rejoins"], r["observed"], r["possible"]) for r in res] == [(1, 1, 0)]
+
+
+def test_r1_does_not_wait_for_a_marker_a_live_migration_holds(clone):
+    """The foreign key makes R1 hold KEY SHARE on the chat after its first rows; M1 deletes the marker, then waits
+    for the chat row. R1 must not wait for that marker (a deadlock): it skips it and commits, M1 goes on."""
+    dsn = clone()
+    with psycopg.connect(dsn) as c:
+        c.execute("SELECT tg.mark_dirty(%s, '2026-11-01')", (C,))                # a cold chat with a marker
+        c.commit()
+    new_chat = -1001999999997
+    outcome: dict = {}
+
+    def m1() -> None:
+        try:
+            with psycopg.connect(dsn, application_name="rollups-test-m1") as s:
+                s.execute("INSERT INTO tg.chat (chat_id, chat_type, title, tracked) VALUES (%s, 'supergroup', 'n', true)",
+                          (new_chat,))
+                s.execute("SELECT tg.move_chat_history(%s, %s, '2026-11-23 11:00+00')", (C, new_chat))
+                s.commit()
+            outcome["m1"] = "ok"
+        except Exception as e:                                                  # a deadlock aborts one of the two
+            outcome["m1"] = repr(e)
+
+    thread = threading.Thread(target=m1)
+    with HookConnection.connect(dsn) as c, psycopg.connect(dsn) as spy:
+        def start_m1_and_let_it_block(query: str) -> None:
+            if not query.lstrip().startswith("INSERT INTO stats.chat_day") or thread.is_alive() or outcome:
+                return
+            thread.start()
+            for _ in range(200):                                                # until M1 waits for the chat row
+                if spy.execute("SELECT count(*) FROM pg_stat_activity WHERE application_name = 'rollups-test-m1' "
+                               "AND wait_event_type = 'Lock'").fetchone()[0]:
+                    return
+                spy.rollback()
+                time.sleep(0.05)
+            raise AssertionError("M1 never waited for the chat")
+        c.after = start_m1_and_let_it_block
+        res = rollups.refresh_chat_days(c, [C], NOW)
+        c.after = None
+        assert res.markers_cleared == 0                                         # M1 holds the marker: skipped
+        c.commit()
+    thread.join(30)
+    assert outcome == {"m1": "ok"}
+    with psycopg.connect(dsn) as c:
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (C,)).fetchone()[0] == 0
+        assert c.execute("SELECT count(*) FROM tg.chat WHERE chat_id = %s", (C,)).fetchone()[0] == 0
+        rollups.refresh_chat_days(c, [new_chat], NOW)                           # the move's own marker is intact
+        assert c.execute("SELECT count(*) FROM stats.chat_day WHERE chat_id = %s", (new_chat,)).fetchone()[0] > 0
+        assert c.execute("SELECT count(*) FROM tg.rollup_dirty WHERE chat_id IN (%s, %s)",
+                         (C, new_chat)).fetchone()[0] == 0
+
+
 def _migrate_c(dsn: str) -> int:
     """M1 in its own session: C moves to a new supergroup (the old chat and its daily rows are deleted)."""
     new_chat = -1001999999998

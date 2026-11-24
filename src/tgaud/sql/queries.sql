@@ -416,9 +416,9 @@ WHERE m.known_from >= :'since_ts' AND m.known_from < :'as_of_ts' AND m.chat_id =
                   WHERE p.chat_id = m.chat_id       -- opening event's order (update_id) decides; events come
                     AND p.user_id = m.user_id       -- before sightings and probes
                     AND p.known_from = m.known_from AND p.membership_id <> m.membership_id
-                    AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
+                    AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT min(px.update_id) FROM tg.member_event px WHERE p.start_source = 'inferred' AND px.chat_id = p.chat_id AND px.user_id = p.user_id AND px.event_at = p.known_from), 9223372036854775807),
                          p.membership_id)
-                      < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
+                      < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT min(mx.update_id) FROM tg.member_event mx WHERE m.start_source = 'inferred' AND mx.chat_id = m.chat_id AND mx.user_id = m.user_id AND mx.event_at = m.known_from), 9223372036854775807),
                          m.membership_id)))
 GROUP BY m.chat_id ORDER BY m.chat_id;
 \endif
@@ -713,7 +713,9 @@ SELECT :'only' IN ('R1') AS run \gset
 -- is before the chat's first rollup row or its first coverage (the grid then starts there); a chat without rows
 -- is built from its first coverage or evidence day (or an earlier dirty day). Late events, reconciliation fixes,
 -- rebuilds and migrations call tg.mark_dirty (least from_day, a new version on every write). The markers read
--- here are cleared at the end only where their version is unchanged: a marker written while this ran stays.
+-- here are cleared at the end only where their version is unchanged: a marker written while this ran stays,
+-- and a marker another transaction holds is skipped, never waited for (a migration that deleted it waits for
+-- the chat row this run's foreign key holds: waiting here would be a deadlock).
 -- Readers see the old rows until the commit. The service runs this per chat (scope = one chat; far-back
 -- chats together in one set-based pass) in tgaud.jobs.chat_day and gives the same rows.
 --
@@ -721,7 +723,8 @@ SELECT :'only' IN ('R1') AS run \gset
 --  * joins, exits, net, short_stays, rejoins, corrections: calendar (UTC) day of the event. A rejoin is a stay
 --    with an earlier stay of the same person in the chat; at the same instant the opening event's order
 --    (event_at, update_id) decides, so join, leave, join in one second counts one rejoin, whatever the
---    spells' ids. A left-censored spell (inferred start at its own exit, E6) is ordered by that exit event.
+--    spells' ids. A spell with an inferred start (E6, E9) has no
+--    opening event of its own: it is ordered by the pair's first event at that instant.
 --  * reported_eod, known_eod, sample_at: the day's last count sample at or before as_of. sample_net: exact joins
 --    minus exact exits in (previous day's sample, this day's sample], so the residual (v_chat_day) compares
 --    Telegram's count with the events between the same two samples, not with the calendar day.
@@ -775,9 +778,9 @@ WITH grid AS (
                              OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
                                           AND p.user_id = m.user_id AND p.known_from = m.known_from
                                           AND p.membership_id <> m.membership_id
-                                          AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
+                                          AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT min(px.update_id) FROM tg.member_event px WHERE p.start_source = 'inferred' AND px.chat_id = p.chat_id AND px.user_id = p.user_id AND px.event_at = p.known_from), 9223372036854775807),
                                                p.membership_id)
-                                            < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
+                                            < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT min(mx.update_id) FROM tg.member_event mx WHERE m.start_source = 'inferred' AND mx.chat_id = m.chat_id AND mx.user_id = m.user_id AND mx.event_at = m.known_from), 9223372036854775807),
                                                m.membership_id))) AS rejoins,
          count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                             m.joined_at + interval '48 hours') = 'out') AS short_stays
@@ -888,9 +891,9 @@ WITH grid AS (
                                OR EXISTS (SELECT 1 FROM tg.membership p WHERE p.chat_id = m.chat_id
                                             AND p.user_id = m.user_id AND p.known_from = m.known_from
                                             AND p.membership_id <> m.membership_id
-                                            AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT px.update_id FROM tg.member_event px WHERE px.event_id = p.left_event_id AND px.event_at = p.left_at AND p.start_source = 'inferred' AND p.left_at = p.known_from), 9223372036854775807),
+                                            AND (coalesce((SELECT pe.update_id FROM tg.member_event pe WHERE pe.event_id = p.join_event_id AND pe.event_at = p.joined_at), (SELECT min(px.update_id) FROM tg.member_event px WHERE p.start_source = 'inferred' AND px.chat_id = p.chat_id AND px.user_id = p.user_id AND px.event_at = p.known_from), 9223372036854775807),
                                                  p.membership_id)
-                                              < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT mx.update_id FROM tg.member_event mx WHERE mx.event_id = m.left_event_id AND mx.event_at = m.left_at AND m.start_source = 'inferred' AND m.left_at = m.known_from), 9223372036854775807),
+                                              < (coalesce((SELECT me.update_id FROM tg.member_event me WHERE me.event_id = m.join_event_id AND me.event_at = m.joined_at), (SELECT min(mx.update_id) FROM tg.member_event mx WHERE m.start_source = 'inferred' AND mx.chat_id = m.chat_id AND mx.user_id = m.user_id AND mx.event_at = m.known_from), 9223372036854775807),
                                                  m.membership_id))) AS rejoins,
            count(*) FILTER (WHERE tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since,
                                               m.joined_at + interval '48 hours') = 'out') AS short_stays
@@ -983,7 +986,10 @@ LEFT JOIN s USING (chat_id, day) LEFT JOIN a USING (chat_id, day) LEFT JOIN ua U
 LEFT JOIN s p ON p.chat_id = g.chat_id AND p.day = g.day - 1;
 
 \endif
-DELETE FROM tg.rollup_dirty r USING chat_day_target t WHERE r.chat_id = t.chat_id AND r.version = t.dirty_version;
+DELETE FROM tg.rollup_dirty r USING (
+  SELECT d.chat_id FROM tg.rollup_dirty d JOIN chat_day_target t ON t.chat_id = d.chat_id AND d.version = t.dirty_version
+  FOR UPDATE OF d SKIP LOCKED) x
+WHERE r.chat_id = x.chat_id;
 INSERT INTO stats.rollup_run (rollup, started_at, finished_at, as_of, row_count)
 SELECT 'chat_day', now(), clock_timestamp(), :'as_of_ts', count(*)
 FROM stats.chat_day d JOIN chat_day_target t ON t.chat_id = d.chat_id AND d.day >= t.from_day;
