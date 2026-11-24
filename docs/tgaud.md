@@ -62,7 +62,7 @@ the day and the few things shortened for the test (job intervals; count samples 
   order with the same flags: build, `--selfcheck` with `--network=none`, `migrate` against a fresh test database
   (twice: the second is a no-op), `serve` with the fake Bot API (`tests/tgaud/container_env.py` provides both: the fake and a relay
   to the database on the host's 127.0.0.1, which the containers reach through pasta's `--map-host-loopback`; the
-  relay forwards to the server wherever `TGAUD_TEST_ADMIN_URL` points), `/health` 200 within 60 s through
+  relay forwards over TCP to the server wherever `TGAUD_TEST_ADMIN_URL` points, never to a Unix socket), `/health` 200 within 60 s through
   the published port, and SIGTERM ends it with exit 0 within 10 s.
 - **CI** (`.forgejo/workflows/ci.yml`, the pattern of `~/projects/helpers/sui`): no `uses:` actions. Job `test` runs
   `uv run pytest -rs` on Python 3.13 with `TGAUD_TEST_NO_DATABASE=1`: the database tests skip with that reason, because
