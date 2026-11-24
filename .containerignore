@@ -1,5 +1,6 @@
 # The Containerfile copies only pyproject.toml, uv.lock, README.md and src/. These patterns keep secrets, session
-# and database files, tests and docs out of the build context even if a COPY grows.
+# and database files, tests and docs out of the build context even if a COPY grows. Env files are matched at every
+# depth, whatever their name before the suffix (src/tgaud/production.env).
 .git
 **/.venv
 **/__pycache__
@@ -13,6 +14,7 @@ docs
 tests
 **/.env
 **/.env.*
+**/*.env
 **/*.session
 **/*.session-journal
 **/*.db

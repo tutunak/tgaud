@@ -48,16 +48,20 @@ The fake Bot API (`tests/tgaud/botapi_fake.py`, never the real Telegram): `FakeB
   project is one distribution (`tgstats`, see `pyproject.toml`), so the image also carries the `tgstats` package;
   `tgaud` never imports it.
 - **Build context** (`.containerignore`): the Containerfile copies only `pyproject.toml`, `uv.lock`, `README.md`
-  and `src/`; the ignore list also keeps `.env`, `*.session`, `*.db`, `.venv`, `tests/` and `docs/` out.
-- **Container check** (`mise run image-test`, part of `mise run ci`): builds the image with podman and runs it as
-  the deploy role will, `--network=none --read-only --tmpfs /tmp --cap-drop=all --security-opt=no-new-privileges`.
-  `--selfcheck` must print `selfcheck ok:`; `migrate` with a database URL that refuses connections must exit 1 with
-  one line and no traceback; no `.env`, session or database file may be in the image.
-- **CI** (`.forgejo/workflows/ci.yml`, the pattern of `~/projects/helpers/sui`): no `uses:` actions. Job `test`
-  runs `uv run pytest` on Python 3.13 with a `postgres:18.6` service (`TGAUD_TEST_ADMIN_URL`) and the `psql` client
-  the fixture needs. Job `image` builds with buildah (vfs storage, chroot isolation) tagged `:$GITHUB_SHA` and
-  `:latest`, runs `tgaud --selfcheck` in it, and pushes to `git.firr.co/company/tgaud` on a push to `main` only
-  (secret `REGISTRY_TOKEN`, variable `REGISTRY_USER`).
+  and `src/`; the ignore list also keeps `.env`, `*.env` (at any depth), `*.session`, `*.db`, `.venv`, `tests/` and `docs/` out.
+- **Container check** (`mise run image-test`, part of `mise run ci`): builds the image with podman, names it by the
+  ID that build printed, and runs it as the deploy role will, `--network=none --read-only --tmpfs /tmp --cap-drop=all
+  --security-opt=no-new-privileges`. `--selfcheck` must print one `selfcheck ok:` line; `migrate` with a database URL
+  that refuses connections must exit 1 with one connection-failure line (no traceback, no empty message); no `.env`,
+  `*.env`, session or database file may be in the image.
+- **CI** (`.forgejo/workflows/ci.yml`, the pattern of `~/projects/helpers/sui`): no `uses:` actions. Job `test` runs
+  `uv run pytest -rs` on Python 3.13 with `TGAUD_TEST_NO_DATABASE=1`: the database tests skip with that reason, because
+  the runner's job network is the host's and a PostgreSQL service is not reachable by name there. The local
+  `mise run ci` runs them all against PostgreSQL 18.6. Job `image` builds with buildah (vfs storage, chroot isolation)
+  tagged `:$GITHUB_SHA` and `:latest`, then gates the image: it is pushed to the job as a docker archive, loaded through
+  the runner's container socket, and run with the same flags as the container check; the one `selfcheck ok:` line must
+  print before anything is pushed. It pushes to `git.firr.co/company/tgaud` on a push to `main` only (secret
+  `REGISTRY_TOKEN`, variable `REGISTRY_USER`).
 - **Release**: a push to `main` publishes `:$GITHUB_SHA` and `:latest`; the deploy repo pins the digest it resolves
   (deploy order in the contract). The schema is never rolled back, so an image rollback needs no database step.
 

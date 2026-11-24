@@ -49,7 +49,7 @@ def test_install_uses_the_lock_without_dev_dependencies():
 def test_containerignore_keeps_secrets_state_tests_and_docs_out():
     patterns = {line.strip() for line in read(".containerignore").splitlines()
                 if line.strip() and not line.startswith("#")}
-    for required in ("**/.env", "**/*.session", "**/*.db", "**/.venv", "tests", "docs"):
+    for required in ("**/.env", "**/*.env", "**/*.session", "**/*.db", "**/.venv", "tests", "docs"):
         assert required in patterns, required
 
 
@@ -60,3 +60,18 @@ def test_ci_uses_no_actions_and_pushes_only_from_main():
     assert "secrets.REGISTRY_TOKEN" in text
     assert "vars.REGISTRY_USER" in text
     assert "IMAGE: git.firr.co/company/tgaud" in text
+
+
+def test_ci_gate_runs_the_published_image_before_the_push():
+    text = read(".forgejo/workflows/ci.yml")
+    gate = text.index("docker run --rm --network=none --read-only --tmpfs /tmp --cap-drop=all "
+                      "--security-opt=no-new-privileges")
+    assert gate < text.index("buildah push \"$IMAGE:$GITHUB_SHA\"")
+    assert "buildah push -q \"$IMAGE:$GITHUB_SHA\" docker-archive:" in text
+
+
+def test_ci_database_tests_are_skipped_only_on_the_runner():
+    text = read(".forgejo/workflows/ci.yml")
+    assert 'TGAUD_TEST_NO_DATABASE: "1"' in text
+    assert "services:" not in text
+    assert "TGAUD_TEST_ADMIN_URL" not in text

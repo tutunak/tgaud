@@ -19,6 +19,9 @@ Fixtures:
                        docs/design/evidence/run-fixture.sh does (session; read it inside a transaction you roll
                        back)
 psql runs from the local binary if there is one, else from the postgres image with podman (--network=host).
+
+TGAUD_TEST_NO_DATABASE=1 skips every test that needs the server (the Forgejo CI test job: its runner's job network
+is the host's, so a service is not reachable by name). The local `mise run ci` runs them all.
 """
 
 from __future__ import annotations
@@ -148,6 +151,8 @@ def _wait_ready(dsn: str, timeout: float = 90.0) -> None:
 
 @pytest.fixture(scope="session")
 def pg(tmp_path_factory: pytest.TempPathFactory) -> Iterator[PgServer]:
+    if os.environ.get("TGAUD_TEST_NO_DATABASE"):
+        pytest.skip("TGAUD_TEST_NO_DATABASE is set: no PostgreSQL in this run, the database tests are skipped")
     tag = secrets.token_hex(4)
     container = None
     admin_dsn = os.environ.get("TGAUD_TEST_ADMIN_URL", "").strip()
