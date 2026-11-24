@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import psycopg
 import pytest
@@ -125,7 +125,8 @@ def test_prober_queue_read_with_100k_pending(scale_dsn, record_property):
         c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, 999, 'manual')", (BIG - 1,))
         heads, took = _timed_heads(p, c, NOW.timestamp())
         plan = "\n".join(r[0] for r in c.execute("EXPLAIN (ANALYZE, BUFFERS) " + prober._HEADS,  # noqa: SLF001
-                                                   {"now": NOW, "per_chat": prober.PER_CHAT}))
+                                                   {"now": NOW, "per_chat": prober.PER_CHAT, "many": prober.MANY},
+                                                   prepare=False))
         c.rollback()
     print(f"prober queue read, 100 996 pending in 200 chats: {took * 1000:.1f} ms, {len(heads)} candidates (every "
           f"step)\n{plan}")
@@ -189,42 +190,58 @@ def test_prober_sees_raised_probes_and_a_rebuilt_spell_with_100k_pending(scale_d
     assert outage[0] == 1 and raised < 0.05 and respelled < 0.05
 
 
-def test_prober_read_with_the_big_chat_in_backoff(scale_dsn, record_property):
-    """prober-simplify review 1: every pending probe of the big chat but one (99 999) waits in backoff, as does every
-    probe of the other chats, and one new manual probe is ready. The read skips the waiting ones by index (they hold no
-    place in probe_ready) and stays under 50 ms. When all their deadlines have passed at once (after a long stop), each
-    step clears RELEASE_PER_STEP of them, the earliest first, well inside a step."""
+def _deadlines(dsn: str, sql: str, params: tuple) -> None:
+    """Set retry deadlines on the fixture's pending probes and vacuum (what autovacuum does as failures come in)."""
+    with psycopg.connect(dsn) as c:
+        c.execute(sql, params)
+    with psycopg.connect(dsn, autocommit=True) as c:
+        c.execute("VACUUM ANALYZE tg.probe")
+
+
+@pytest.mark.parametrize("state", ["ahead", "passed", "mixed"])
+def test_prober_read_with_retry_deadlines(scale_dsn, record_property, state):
+    """prober-simplify reviews 1 and 2: the whole selection (heads()) with the 100 996 pending probes in backoff.
+    ahead: every deadline but two is still ahead (the probes are skipped by index); passed: every deadline has
+    passed (a restart after a long stop: all are ready, at their place, nothing is written); mixed: in the big chat
+    the newest half of the spells is still in backoff and the older half has passed (the read passes over the waiting
+    half in queue order). One manual retry of another chat has passed too: it is first. Under 50 ms in each."""
     p = prober.Prober(_ctx(), rate=5)
-    later = datetime.fromtimestamp(NOW.timestamp() + 600, timezone.utc)
+    ahead, passed = NOW + timedelta(minutes=10), NOW - timedelta(minutes=10)
     with psycopg.connect(scale_dsn) as c:
-        c.execute("""UPDATE tg.probe SET attempts = 2, last_attempt_at = %s, next_attempt_at = %s
-                     WHERE outcome = 'pending' AND NOT (chat_id = %s AND user_id = 1)""", (NOW, later, BIG))
-        c.execute("UPDATE tg.probe SET next_attempt_at = %s WHERE chat_id = %s AND user_id = 1", (NOW, BIG))
         manual = c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, 999, 'manual') "
                            "RETURNING probe_id", (BIG - 1,)).fetchone()[0]
-        c.commit()
     try:
-        with psycopg.connect(scale_dsn, autocommit=True) as c:
-            c.execute("VACUUM ANALYZE tg.probe")  # what autovacuum does after the failures came in, one by one
+        _deadlines(scale_dsn, """
+            UPDATE tg.probe SET attempts = 2, last_attempt_at = %(at)s - interval '10 minutes',
+                   next_attempt_at = CASE
+                     WHEN probe_id = %(manual)s THEN %(passed)s
+                     WHEN %(state)s = 'ahead' THEN CASE WHEN chat_id = %(big)s AND user_id = 1 THEN %(passed)s
+                                                       ELSE %(ahead)s END
+                     WHEN %(state)s = 'passed' THEN %(passed)s
+                     ELSE CASE WHEN chat_id = %(big)s AND user_id %% 86400 >= 43200 THEN %(ahead)s ELSE %(passed)s END
+                   END
+            WHERE outcome = 'pending'""", {"at": NOW, "manual": manual, "passed": passed, "ahead": ahead,
+                                           "state": state, "big": BIG})
         with psycopg.connect(scale_dsn) as c:
             heads, took = _timed_heads(p, c, NOW.timestamp())
             plan = "\n".join(r[0] for r in c.execute("EXPLAIN (ANALYZE, BUFFERS) " + prober._HEADS,  # noqa: SLF001
-                                                       {"per_chat": prober.PER_CHAT}))
-            t = time.perf_counter()
-            p.heads(c, later.timestamp())  # every deadline has passed: the first RELEASE_PER_STEP are cleared
-            cleared = time.perf_counter() - t
-            backlog = p.backlog
-            c.rollback()
+                                                       {"now": NOW, "per_chat": prober.PER_CHAT, "many": prober.MANY},
+                                                       prepare=False))
+            pending_ahead = c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending' "
+                                      "AND next_attempt_at > %s", (NOW,)).fetchone()[0]
     finally:
         with psycopg.connect(scale_dsn) as c:  # the fixture as it was, for the tests after this one
             c.execute("DELETE FROM tg.probe WHERE probe_id = %s", (manual,))
-            c.execute("UPDATE tg.probe SET attempts = 0, last_attempt_at = NULL, next_attempt_at = NULL "
-                      "WHERE outcome = 'pending'")
-        with psycopg.connect(scale_dsn, autocommit=True) as c:
-            c.execute("VACUUM ANALYZE tg.probe")
-    print(f"prober read, 100 994 probes in backoff and 2 ready: {took * 1000:.1f} ms\n{plan}\nall deadlines passed: "
-          f"{prober.RELEASE_PER_STEP} cleared in {cleared:.2f} s (one step)")
-    record_property("prober_read_backoff_seconds", took)
-    record_property("prober_release_step_seconds", cleared)
-    assert [(h.chat_id, h.reason) for h in heads] == [(BIG - 1, "manual"), (BIG, "outage")]
-    assert took < 0.05 and backlog and cleared < 1.0
+        _deadlines(scale_dsn, "UPDATE tg.probe SET attempts = 0, last_attempt_at = NULL, next_attempt_at = NULL "
+                              "WHERE outcome = 'pending'", ())
+    print(f"prober read, deadlines {state} ({pending_ahead} still ahead): {took * 1000:.1f} ms, {len(heads)} heads\n"
+          f"{plan}")
+    record_property(f"prober_read_deadlines_{state}_seconds", took)
+    assert (heads[0].chat_id, heads[0].reason) == (BIG - 1, "manual")
+    big = [h.user_id for h in heads if h.chat_id == BIG]
+    if state == "ahead":
+        assert len(heads) == 2 and big == [1]
+    else:
+        assert heads[1].reason == "conflict" and len(heads) == 1 + 199 * 5 + prober.PER_CHAT
+        assert big[0] % 86400 == (86391 if state == "passed" else 43191)  # the newest spells that are ready
+    assert took < 0.05

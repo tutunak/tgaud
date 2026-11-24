@@ -5,8 +5,9 @@
 -- the queue order of design.md 6: manual, conflict, outage by the pair's open spell (newest first; a pair without
 -- an open spell after those with one), snapshot_absent, sample; ties by queued_at, probe_id. Only probes whose
 -- retry deadline has passed are taken. The two columns below make that order and that deadline part of the row, so
--- one index range per chat returns its heads in order: a probe in backoff is outside that index until the prober
--- clears its deadline once it has passed.
+-- each chat's heads come from index ranges in that order: the probes without a deadline from probe_ready, those whose
+-- deadline has passed from probe_chat_due (a few, sorted) or probe_waiting (many, in order); see _HEADS in
+-- tgaud.jobs.prober. Nothing is written to make a probe ready again: a passed deadline is ready as it is.
 
 ------------------------------------------------------------------------------------------------------------
 -- Retry deadline
@@ -14,21 +15,16 @@
 
 ALTER TABLE tg.probe ADD COLUMN next_attempt_at timestamptz;
 COMMENT ON COLUMN tg.probe.next_attempt_at IS
-  'A pending probe is not asked before this time; NULL = now (the probes the prober reads, index probe_ready). The '
+  'A pending probe is not asked before this time; NULL = now. The '
   'prober sets it with every failure (1 min, 10 min and 1 h after the 1st, 2nd and 3rd: tgaud.jobs.prober.BACKOFF; '
   'a write of attempts or last_attempt_at that leaves it as it was, such as an older image''s, gets it from the '
   'trigger probe_next_attempt) and to the next second after an answer that straddled an event of the pair (not an '
-  'attempt); it clears it once passed, before its read. A probe queued again or raised in place keeps it.';
+  'attempt). A probe queued again or raised in place keeps it.';
 
 -- the deadlines of probes that failed before this migration (the backoff of their attempts, as the prober had it)
 UPDATE tg.probe
 SET next_attempt_at = last_attempt_at + make_interval(secs => (ARRAY[60, 600, 3600])[least(attempts, 3)])
 WHERE outcome = 'pending' AND attempts > 0 AND last_attempt_at IS NOT NULL;
-
-CREATE INDEX probe_retry_due ON tg.probe (next_attempt_at) WHERE outcome = 'pending' AND next_attempt_at IS NOT NULL;
-COMMENT ON INDEX tg.probe_retry_due IS
-  'the deadlines that have passed (the prober clears them before each read) and the earliest one ahead (when it has '
-  'nothing ready, it reads the queue again then)';
 
 CREATE FUNCTION tg.probe_next_attempt() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
@@ -109,5 +105,17 @@ CREATE TRIGGER membership_probe_spell_from_del AFTER DELETE ON tg.membership
 CREATE INDEX probe_ready ON tg.probe (chat_id, tg.probe_rank(reason), spell_from DESC NULLS LAST, queued_at, probe_id)
   INCLUDE (user_id, reason) WHERE outcome = 'pending' AND next_attempt_at IS NULL;
 COMMENT ON INDEX tg.probe_ready IS
-  'each chat''s ready probes (no deadline ahead) in the prober''s queue order: its read takes the first ones of every '
-  'chat from one range each (tgaud.jobs.prober._HEADS), however many of the chat''s probes wait in backoff';
+  'each chat''s probes without a deadline in the prober''s queue order: the read takes the first ones of every chat '
+  'from one range each (tgaud.jobs.prober._HEADS), however many of the chat''s probes wait in backoff';
+
+CREATE INDEX probe_waiting ON tg.probe (chat_id, tg.probe_rank(reason), spell_from DESC NULLS LAST, queued_at, probe_id)
+  INCLUDE (user_id, reason, next_attempt_at) WHERE outcome = 'pending' AND next_attempt_at IS NOT NULL;
+COMMENT ON INDEX tg.probe_waiting IS
+  'each chat''s probes with a deadline in the prober''s queue order: when many deadlines of a chat have passed, the '
+  'read takes the first passed ones from here, in order, instead of sorting them all';
+
+CREATE INDEX probe_chat_due ON tg.probe (chat_id, next_attempt_at)
+  INCLUDE (probe_id, user_id, reason, spell_from, queued_at) WHERE outcome = 'pending' AND next_attempt_at IS NOT NULL;
+COMMENT ON INDEX tg.probe_chat_due IS
+  'per chat, the probes with a deadline by deadline: how many have passed (up to a bound), all of them when few, and '
+  'the earliest one ahead (when nothing is ready the prober reads the queue again then)';

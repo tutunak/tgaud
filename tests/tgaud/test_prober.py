@@ -1106,68 +1106,66 @@ def test_a_failure_written_without_its_deadline_gets_the_backoff_of_its_attempts
     assert asked(e) == [(CHAT, 1)] and probe_row(e, pid)["outcome"] == "in"
 
 
-def test_a_locked_probe_past_its_deadline_does_not_hold_up_the_step(env):
-    """Clearing passed deadlines skips rows another transaction holds (the reconciler raising one in place, the CLI
-    cancelling it): the step neither waits nor fails, the other probes are asked, and the held one becomes ready by a
-    later step once the lock is gone, at its place."""
+# --- prober-simplify review 2: passed deadlines are ready at their place, without a write --------------------------
+
+def _overdue(e: Env, ids: list[int], deadline: datetime) -> None:
+    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s "
+                  "WHERE probe_id = ANY(%s)", (deadline - timedelta(minutes=1), deadline, ids))
+
+
+def test_after_a_restart_every_passed_deadline_is_ready_at_its_place_and_in_the_share(env):
+    """review 2, finding 1: after a long stop every probe's deadline has passed: CHAT has 400 outage retries (more than
+    MANY: read in queue order) and one conflict retry whose deadline is the latest of all; OTHER has a manual and a
+    conflict retry and 300 sample retries (fewer than MANY: sorted). The manual goes first, then the conflicts, and
+    OTHER keeps its half while it has ready probes. Nothing is cleared: the deadlines stay as they were."""
     e = env
-    held = queue(e, 1, queued=START - timedelta(hours=3))
-    for u in (2, 3):
-        queue(e, u)
-    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
-                  (START - timedelta(minutes=1), START, held))
+    w = e.w
+    w.add_chat(OTHER)
+    for u in range(1, 401):
+        w.join(u, at(u))
+    w.rebuild()
+    mine = [queue(e, u, "outage", queued=START - timedelta(hours=5)) for u in range(1, 401)]
+    late_conflict = queue(e, 500, "conflict", queued=START - timedelta(hours=1))
+    theirs = [queue(e, 2000 + u, "sample", chat=OTHER, queued=START - timedelta(hours=5)) for u in range(1, 301)]
+    manual = queue(e, 1999, "manual", chat=OTHER, queued=START - timedelta(hours=1))
+    conflict = queue(e, 1998, "conflict", chat=OTHER, queued=START - timedelta(hours=1))
+    _overdue(e, mine + theirs, START - timedelta(hours=3))
+    _overdue(e, [manual, conflict], START - timedelta(hours=2))
+    _overdue(e, [late_conflict], START - timedelta(seconds=1))
+    w.c.commit()
+    answer(e)
+    p = prober.Prober(e.ctx, rate=100.0)
+    e.run(p, 4.0, dt=0.02)
+    calls = asked(e)
+    assert calls[:3] == [(OTHER, 1999), (CHAT, 500), (OTHER, 1998)] or \
+        calls[:3] == [(OTHER, 1999), (OTHER, 1998), (CHAT, 500)], calls[:3]
+    assert [u for c, u in calls if c == CHAT][1:6] == [400, 399, 398, 397, 396]  # outage: newest spell first
+    both = [c for c, _ in calls[:2 * 300]]  # while OTHER has ready probes
+    assert 0.4 * len(both) <= both.count(OTHER) <= 0.6 * len(both), both.count(OTHER)
+    with psycopg.connect(e.dsn) as c:  # only the probes asked changed
+        assert c.execute("SELECT count(*) FROM tg.probe WHERE outcome = 'pending' AND next_attempt_at IS NULL"
+                         ).fetchone()[0] == 0
+
+
+def test_a_few_passed_deadlines_rank_among_probes_without_one(env):
+    """Fewer than MANY passed deadlines in a chat (sorted with its probes without a deadline): a conflict retry goes
+    before 50 fresh sample probes, a sample retry after the older fresh ones, and a deadline still ahead waits."""
+    e = env
+    fresh = [queue(e, u, "sample", queued=START - timedelta(hours=2) + timedelta(minutes=u)) for u in range(1, 51)]
+    retry_conflict = queue(e, 100, "conflict", queued=START - timedelta(minutes=5))
+    retry_sample = queue(e, 101, "sample", queued=START - timedelta(hours=2) + timedelta(minutes=25, seconds=30))
+    ahead = queue(e, 102, "manual")
+    _overdue(e, [retry_conflict, retry_sample], START - timedelta(seconds=10))
+    _overdue(e, [ahead], START + timedelta(minutes=10))
     e.w.c.commit()
     answer(e)
     p = prober.make(e.ctx)
-    other = psycopg.connect(e.dsn)
-    try:
-        other.execute("SELECT 1 FROM tg.probe WHERE probe_id = %s FOR UPDATE", (held,))
-        t = _step_in_thread(e, p)
-        t.join(10)
-        assert not t.is_alive() and not t.errors
-        assert asked(e) == [(CHAT, 2), (CHAT, 3)]
-        assert probe_row(e, held)["next_attempt_at"] == START  # not cleared: someone else holds it
-    finally:
-        other.close()  # its transaction ends without a change
-    e.clock.advance(1.0)
-    e.run(p, 1.0)
-    assert asked(e)[2:] == [(CHAT, 1)] and probe_row(e, held)["outcome"] == "in"
-
-
-def test_a_step_interrupted_after_clearing_deadlines_leaves_them_for_the_next(env):
-    """The clearing commits with the read: a step that fails before it commits (a lost connection, a stale
-    generation) leaves the deadlines as they were, and the next step clears them again and asks the probe."""
-    e = env
-    pid = queue(e, 1)
-    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s WHERE probe_id = %s",
-                  (START - timedelta(minutes=1), START, pid))
-    e.w.c.commit()
-    answer(e)
-    p = prober.make(e.ctx)
-    e.ctx.fence(e.conn)
-    assert [c.probe_id for c in p.heads(e.conn, e.clock())] == [pid]
-    e.conn.rollback()  # the step failed before its commit
-    assert probe_row(e, pid)["next_attempt_at"] == START
-    e.run(p, 1.0)
-    assert asked(e) == [(CHAT, 1)] and probe_row(e, pid)["outcome"] == "in"
-
-
-def test_passed_deadlines_beyond_one_steps_share_are_cleared_by_the_next_steps(env, monkeypatch):
-    """After a long stop every deadline has passed: a step clears RELEASE_PER_STEP of them (the earliest first) and
-    the job reads again at once, without the idle wait, until all are cleared; every probe is asked once."""
-    e = env
-    monkeypatch.setattr(prober, "RELEASE_PER_STEP", 3)
-    ids = [queue(e, u) for u in range(1, 11)]
-    e.w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s, next_attempt_at = %s - (probe_id * "
-                  "interval '1 second') WHERE probe_id = ANY(%s)", (START - timedelta(hours=1), START, ids))
-    e.w.c.commit()
-    answer(e)
-    p = prober.make(e.ctx)
-    e.tick(p)
-    assert p.backlog and p.next_read <= e.clock() and len(asked(e)) == 3
-    assert sorted(u for _, u in asked(e)) == [8, 9, 10]  # the earliest deadlines (the highest ids)
-    e.run(p, 3.0)
-    assert sorted(u for _, u in asked(e)) == list(range(1, 11)) and not p.backlog
+    assert [c.user_id for c in p.heads(e.conn, e.clock())] == [100, *range(1, 20)]  # PER_CHAT of them
+    e.conn.rollback()
+    e.run(p, 12.0)
+    calls = [u for _, u in asked(e)]
+    assert calls[:28] == [100, *range(1, 26), 101, 26] and 102 not in calls
+    assert len(fresh) == 50
 
 
 def test_no_transaction_is_open_during_the_call(env):
