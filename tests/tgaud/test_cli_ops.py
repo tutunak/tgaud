@@ -3,11 +3,13 @@
 Each test works on its own copy of the fixture (clidb.fresh_db): the commands commit.
 """
 
+import datetime as dt
 import hashlib
 import hmac
 import io
 import json
 import logging
+import threading
 
 import psycopg
 import pytest
@@ -15,7 +17,7 @@ from botapi_fake import FakeBotApi
 from clidb import A, B, C, LINK_KEY, TOKEN, Builder, cli_for, fresh_db, report_db, run_rollups, ts  # noqa: F401
 
 from tgaud import db, history
-from tgaud.commands import campaigns, common
+from tgaud.commands import campaigns, common, ops
 
 SECRET = "https://t.me/+Zq9SecretInviteToken"
 
@@ -212,6 +214,12 @@ def build_person(dsn):
         c.execute("UPDATE tg.snapshot SET finished_at = '2026-11-20 00:30+00', fetched = 2, complete = true WHERE snapshot_id = %s", (snap,))
         c.execute("INSERT INTO tg.sighting (chat_id, user_id, first_seen_at, first_snapshot_id, last_seen_at, last_snapshot_id) "
                   "VALUES (%s, %s, '2026-11-20 00:01+00', %s, '2026-11-20 00:01+00', %s)", (B, U, snap, snap))
+        # reconciliation records that hold the id as a number: a live cursor, chunk endpoints, a gap cursor (chat C)
+        c.execute("UPDATE tg.snapshot SET applied_through_user_id = %s WHERE snapshot_id = %s", (U, snap))
+        c.execute("INSERT INTO tg.reconcile_run (chat_id, snapshot_id, from_user_id, through_user_id) VALUES "
+                  "(%s, %s, 1003, %s), (%s, %s, %s, %s)", (B, snap, U, C, snap, U, U))
+        c.execute("INSERT INTO tg.gap_progress (gap_id, chat_id, last_user_id) SELECT gap_id, %s, %s FROM tg.gap "
+                  "ORDER BY gap_id LIMIT 1", (C, U))
         c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, %s, 'manual')", (B, U))
         c.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, %s, '2026-11-16', 3)", (B, U))
         for update_id, subject, payload in [
@@ -275,10 +283,17 @@ def test_forget_user_erases_the_person_everywhere_and_keeps_other_peoples_histor
     with psycopg.connect(fresh_db) as c:
         day_joins = c.execute("SELECT joins FROM stats.chat_day WHERE chat_id = %s AND day = '2026-11-15'", (A,)).fetchone()[0]
     assert day_joins >= 1
+    with psycopg.connect(fresh_db) as c:  # the lock set covers the chats of the reconciliation records too
+        assert {r[0] for r in c.execute(ops._CHATS_OF_USER, {"u": U})} >= {A, B, C}
     out = cli_for(fresh_db).run("forget-user", str(U), "--yes")
     assert out.code == 0, out.err
     assert f"erased user {U}" in out.out and "audience rollup refreshed" in out.out
     assert ids_found(fresh_db, U) == []  # no table, no payload, no rollup holds the id any more
+    # the cursors moved to the nearest surviving id below, the chunk endpoints are cleared
+    assert q(fresh_db, "SELECT applied_through_user_id FROM tg.snapshot WHERE applied_through_user_id IS NOT NULL") == [(3002,)]
+    assert q(fresh_db, "SELECT last_user_id FROM tg.gap_progress") == [(3002,)]
+    assert q(fresh_db, "SELECT from_user_id, through_user_id FROM tg.reconcile_run WHERE snapshot_id = "
+                       "(SELECT max(snapshot_id) FROM tg.snapshot) ORDER BY reconcile_run_id") == [(1003, None), (None, None)]
     # the other member: his kicked exit, who did it (actor_is_other) and his join route survive, and so does a rebuild
     assert v_state(fresh_db) == kicked_before
     (kick,) = [e for e in v_state(fresh_db)[1] if e[0] == "kick"]
@@ -289,11 +304,14 @@ def test_forget_user_erases_the_person_everywhere_and_keeps_other_peoples_histor
         history.rebuild_pairs(c, [(B, V)])
         c.commit()
     assert v_state(fresh_db) == kicked_before
-    # the twin link took over the references of the link that lost its creator; the other link lost only its creator
-    assert q(fresh_db, "SELECT count(*) FROM tg.invite_link WHERE masked_link = 'https://t.me/+Mm…'") == [(1,)]
+    # the link that lost its creator keeps its id and V's attribution; its text got its id because a twin has the same
+    assert q(fresh_db, "SELECT count(*) FROM tg.invite_link WHERE name IN ('mine', 'twin')") == [(2,)]
+    assert q(fresh_db, "SELECT masked_link, creator_id FROM tg.invite_link WHERE name = 'twin'") == [("https://t.me/+Mm…", None)]
+    (mine,) = q(fresh_db, "SELECT masked_link, creator_id FROM tg.invite_link WHERE name = 'mine'")
+    assert mine[0].startswith("https://t.me/+Mm… #") and mine[1] is None
     assert {n for (n,) in q(fresh_db, "SELECT i.name FROM tg.member_event e JOIN tg.invite_link i USING (invite_link_id) "
-                                     "WHERE e.user_id = %s", (V,))} == {"twin"}
-    assert q(fresh_db, "SELECT i.name FROM tg.membership m JOIN tg.invite_link i USING (invite_link_id) WHERE m.user_id = %s", (V,)) == [("twin",)]
+                                     "WHERE e.user_id = %s", (V,))} == {"mine"}
+    assert q(fresh_db, "SELECT i.name FROM tg.membership m JOIN tg.invite_link i USING (invite_link_id) WHERE m.user_id = %s", (V,)) == [("mine",)]
     assert q(fresh_db, "SELECT creator_id FROM tg.invite_link WHERE name = 'only mine'") == [(None,)]
     assert q(fresh_db, "SELECT resolved_by, outcome FROM tg.join_request WHERE user_id = %s", (V,)) == [(None, "approved")]
     assert q(fresh_db, "SELECT update_id FROM tg.raw_update WHERE update_id IN (60001, 60002, 60003)") == [(60003,)]  # only the one without U stays
@@ -338,3 +356,94 @@ def test_forget_user_needs_the_service_stopped_and_no_unfinished_snapshot(cli_fo
     assert unfinished.code == 1 and "snapshot is still being written" in unfinished.err
     assert snapshot_of_rows(fresh_db) == before  # the function raised: the erasure record rolled back with the rest
 
+
+
+def test_erasing_a_link_creator_keeps_every_link_id_and_attribution(cli_for, fresh_db):
+    """Two masked links with the same redacted text, different creators and campaigns: erasing one creator must not
+    turn the other's members over to the other link."""
+    u2 = 7777000999
+    with psycopg.connect(fresh_db) as c:
+        b = Builder(c)
+        b.user(u2)
+        b.stay(B, 8888000555, ts("2026-11-17 09:00"), update_id=51001)
+        l1 = c.execute("INSERT INTO tg.invite_link (chat_id, masked_link, creator_id, name, campaign_id) VALUES "
+                       "(%s, 'https://t.me/+Dd…', %s, 'first', 1) RETURNING invite_link_id", (B, u2)).fetchone()[0]
+        l2 = c.execute("INSERT INTO tg.invite_link (chat_id, masked_link, creator_id, name, campaign_id) VALUES "
+                       "(%s, 'https://t.me/+Dd…', 9100, 'second', 2) RETURNING invite_link_id", (B,)).fetchone()[0]
+        c.execute("UPDATE tg.member_event SET invite_link_id = %s WHERE user_id = 8888000555", (l1,))
+        c.execute("UPDATE tg.membership SET invite_link_id = %s WHERE user_id = 8888000555", (l1,))
+        c.commit()
+    assert cli_for(fresh_db).run("forget-user", str(u2), "--yes").code == 0
+    assert q(fresh_db, "SELECT invite_link_id, creator_id, campaign_id, masked_link FROM tg.invite_link "
+                       "WHERE invite_link_id IN (%s, %s) ORDER BY invite_link_id", (l1, l2)) == [
+        (l1, None, 1, "https://t.me/+Dd…"), (l2, 9100, 2, "https://t.me/+Dd…")]  # no twin without a creator: plain NULL
+    assert q(fresh_db, "SELECT invite_link_id FROM tg.membership WHERE user_id = 8888000555") == [(l1,)]
+    assert q(fresh_db, "SELECT DISTINCT invite_link_id FROM tg.member_event WHERE user_id = 8888000555") == [(l1,)]
+
+
+def test_a_collector_page_dated_before_the_erasure_cannot_bring_the_person_back(fresh_db):
+    """The erasure holds its transaction open after its checks; a collector opens a snapshot (allowed: it is not
+    unfinished when the check runs) and inserts a page collected before the erasure. The page waits for the
+    erasure, then is checked against its record: the erased person is skipped, an erased inviter cleared."""
+    build_person(fresh_db)
+    erase = psycopg.connect(fresh_db)
+    erase.execute("SELECT tg.forget_user(%s)", (U,))  # not committed yet
+    coll = psycopg.connect(fresh_db)
+    snap = coll.execute("INSERT INTO tg.snapshot (chat_id, started_at, method) VALUES (%s, '2026-11-23 11:00+00', 'listing') "
+                        "RETURNING snapshot_id", (B,)).fetchone()[0]
+    coll.commit()
+    done: list = []
+
+    def page():
+        coll.execute("INSERT INTO tg.snapshot_member (snapshot_id, user_id, seen_at, username, inviter_id) VALUES "
+                     "(%s, %s, '2026-11-23 11:01+00', 'gone', NULL), (%s, 1003, '2026-11-23 11:01+00', 'stays', %s)",
+                     (snap, U, snap, U))
+        coll.commit()
+        done.append(True)
+
+    t = threading.Thread(target=page)
+    t.start()
+    t.join(0.7)
+    assert t.is_alive() and not done  # waiting for the erasure's lock
+    erase.commit()
+    erase.close()
+    t.join(10)
+    assert done and not t.is_alive()
+    assert q(fresh_db, "SELECT user_id, username, inviter_id FROM tg.snapshot_member WHERE snapshot_id = %s", (snap,)) == [
+        (1003, "stays", None)]
+    erased_at = q(fresh_db, "SELECT erased_at FROM tg.erasure")[0][0]
+    with coll.cursor() as cur:  # evidence dated after the erasure is new: the person listed again is stored
+        cur.execute("INSERT INTO tg.snapshot_member (snapshot_id, user_id, seen_at) VALUES (%s, %s, %s), (%s, %s, %s)",
+                    (snap, U, erased_at + dt.timedelta(minutes=1), snap, 1004, erased_at))
+        coll.commit()
+    coll.close()
+    assert q(fresh_db, "SELECT user_id FROM tg.snapshot_member WHERE snapshot_id = %s ORDER BY user_id", (snap,)) == [(1003,), (1004,), (U,)]
+
+
+def test_the_collect_role_can_insert_pages_through_the_erasure_trigger(fresh_db):
+    build_person(fresh_db)
+    with psycopg.connect(fresh_db) as c:
+        c.execute("SELECT tg.forget_user(%s)", (U,))
+        c.commit()
+    with psycopg.connect(fresh_db) as c:  # the script's role cannot read tg.erasure: the trigger is security definer
+        c.execute("SET ROLE collect_writer")
+        snap = c.execute("INSERT INTO tg.snapshot (chat_id, started_at, method) VALUES (%s, '2026-11-23 11:00+00', 'listing') "
+                         "RETURNING snapshot_id", (A,)).fetchone()[0]
+        c.execute("INSERT INTO tg.snapshot_member (snapshot_id, user_id, seen_at) VALUES (%s, %s, '2026-11-23 11:01+00'), "
+                  "(%s, 1001, '2026-11-23 11:01+00')", (snap, U, snap))
+        c.commit()
+    assert q(fresh_db, "SELECT user_id FROM tg.snapshot_member WHERE snapshot_id = %s", (snap,)) == [(1001,)]
+
+
+def test_a_failing_rollup_refresh_after_the_erasure_is_reported_and_repeatable(cli_for, fresh_db, monkeypatch):
+    from tgaud.jobs import audience
+
+    build_person(fresh_db)
+    real = audience.refresh
+    monkeypatch.setattr(audience, "refresh", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = cli_for(fresh_db).run("forget-user", str(U), "--yes")
+    assert out.code == 1 and "is erased from the history" in out.err and "run this command again" in out.err
+    assert q(fresh_db, "SELECT count(*) FROM tg.tg_user WHERE user_id = %s", (U,)) == [(0,)]  # the erasure itself committed
+    monkeypatch.setattr(audience, "refresh", real)
+    assert cli_for(fresh_db).run("forget-user", str(U), "--yes").code == 0
+    assert ids_found(fresh_db, U) == []

@@ -67,6 +67,9 @@ UNION SELECT chat_id FROM tg.probe WHERE user_id = %(u)s
 UNION SELECT chat_id FROM tg.join_request WHERE user_id = %(u)s OR resolved_by = %(u)s
 UNION SELECT chat_id FROM tg.activity_daily WHERE user_id = %(u)s
 UNION SELECT chat_id FROM tg.invite_link WHERE creator_id = %(u)s
+UNION SELECT chat_id FROM tg.snapshot WHERE applied_through_user_id = %(u)s
+UNION SELECT chat_id FROM tg.reconcile_run WHERE from_user_id = %(u)s OR through_user_id = %(u)s
+UNION SELECT chat_id FROM tg.gap_progress WHERE last_user_id = %(u)s
 UNION SELECT s.chat_id FROM tg.snapshot s
        WHERE EXISTS (SELECT 1 FROM tg.snapshot_member m WHERE m.snapshot_id = s.snapshot_id
                       AND (m.user_id = %(u)s OR m.inviter_id = %(u)s))

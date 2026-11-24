@@ -104,7 +104,8 @@ def _scope_ids(text: str) -> list[int]:
 
 def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, chats: list[common.Chat], *,
                scope: list[int] | None, params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
-               rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None) -> sql.Result:
+               rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
+               header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None) -> sql.Result:
     """Header, then the block: both in the caller's transaction, with one as-of time and one scope."""
     params = dict(params)
     if getattr(args, "as_of", None):
@@ -116,6 +117,8 @@ def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, c
     since = _ts(conn, vals["since_ts"])
     params["as_of"] = vals["as_of_ts"]  # frozen: header and table agree
     in_scope = scope if scope is not None else _scope_ids(vals["scope_ids"])
+    if header_scope is not None:  # the chats the table reads beyond the scope (a channel's discussion group)
+        in_scope = header_scope(conn, in_scope)
     ra = common.rollup_as_of(conn) if rollup else None
     common.print_header(common.header_stream(args), conn, title=title or sql.title(block), as_of=as_of, scope=in_scope,
                         window=window(as_of, since), rollup_as_of=ra, rollup=rollup, notes=notes)
@@ -130,6 +133,14 @@ def _supplied(args: argparse.Namespace, names: tuple[str, ...]) -> dict[str, Any
 
 def _since_window(as_of: dt.datetime, since: dt.datetime) -> Window:
     return Window(since, as_of)
+
+
+def _with_discussion_groups(conn: psycopg.Connection, scope: list[int]) -> list[int]:
+    """The scope and the tracked discussion groups linked to its channels (item 11 reads both)."""
+    groups = conn.execute("SELECT g.chat_id FROM tg.chat ch JOIN tg.chat g ON g.chat_id = ch.linked_chat_id AND g.tracked "
+                          "WHERE ch.chat_type = 'channel' AND ch.tracked AND ch.chat_id = ANY (%s::bigint[])",
+                          (scope,)).fetchall()
+    return sorted(set(scope) | {r[0] for r in groups})
 
 
 def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], Callable[[argparse.Namespace], int]]:
@@ -149,7 +160,12 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
             params = _supplied(args, spec.params)
             if "since" in params:
                 params["since"] = common.parse_time(params["since"], "--since").isoformat()
-            if spec.window == "raid":
+            header_scope = None
+            if spec.block == "11":  # the table also reads each channel's discussion group and its activity
+                header_scope = _with_discussion_groups
+                days = params.get("active_days", 30)
+                window = lambda as_of, _since: Window(as_of - dt.timedelta(days=days), as_of)  # noqa: E731
+            elif spec.window == "raid":
                 hours = params.get("raid_hours", 24)
                 window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=hours), as_of)  # noqa: E731
             elif spec.window == "day":
@@ -158,7 +174,8 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
                 window = lambda as_of, _since: None  # noqa: E731
             else:
                 window = _since_window
-            run_report(conn, args, spec.block, chats, scope=scope, params=params, window=window, rollup=spec.rollup)
+            run_report(conn, args, spec.block, chats, scope=scope, params=params, window=window, rollup=spec.rollup,
+                       header_scope=header_scope)
         return 0
 
     return add, run

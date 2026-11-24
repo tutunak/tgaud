@@ -10,7 +10,7 @@ import pytest
 from clidb import A, NOW_ARG, UTC, Builder, cli_for, fresh_db, report_db, ts  # noqa: F401
 from clidb import copy_db
 
-from tgaud import sql
+from tgaud import rollups, sql
 
 T = ts("2026-11-10 09:00:00")  # the instant of the same-second cases
 
@@ -86,6 +86,47 @@ def cases_db(pg, report_db):
         p, q = b.chat(-1003000000040, "flow P"), b.chat(-1003000000041, "flow Q")
         b.stay(p, 4401, ts("2026-11-12 08:00"), update_id=4000)
         b.stay(q, 4401, ts("2026-11-12 10:00"), update_id=4010)
+
+        # --- the five-event second: join, leave, join, leave, promote: two exact stays, then an inferred open one
+        e = b.chat(-1003000000050, "tie E")
+        ev = [b.event(e, 4501, T, o, n, 100 + i) for i, (o, n) in enumerate(
+            [("left", "member"), ("member", "left"), ("left", "member"), ("member", "left"), ("member", "administrator")])]
+        b.spell(e, 4501, T)  # the inferred stay (opened by the promote) is stored first: its id is the smallest
+        b.spell(e, 4501, T, join_ev=ev[0], left_at=T, left_ev=ev[1])
+        b.spell(e, 4501, T, join_ev=ev[2], left_at=T, left_ev=ev[3])
+        c.execute("INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at) VALUES "
+                  "('five events', 'giveaway', 'annotation', '2026-11-10 00:00+00', '2026-11-12 00:00+00') RETURNING campaign_id")
+        c.execute("INSERT INTO tg.campaign_chat SELECT campaign_id, %s FROM tg.campaign WHERE name = 'five events'", (e,))
+
+        # --- 4b: a person who returns to one chat and is first-time in the other is not eligible
+        w1, w2 = b.chat(-1003000000060, "multi 1"), b.chat(-1003000000061, "multi 2")
+        b.stay(w1, 4601, ts("2026-09-01 10:00"), ts("2026-09-02 10:00"), update_id=6000)
+        b.stay(w1, 4601, ts("2026-11-10 10:00"), update_id=6010)
+        b.stay(w2, 4601, ts("2026-11-10 11:00"), update_id=6020)
+        b.stay(w1, 4602, ts("2026-11-10 12:00"), update_id=6030)
+        b.stay(w2, 4602, ts("2026-11-10 13:00"), update_id=6040)
+        cid = c.execute("INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at, only_new_members) VALUES "
+                        "('multi', 'giveaway', 'annotation', '2026-11-10 00:00+00', '2026-11-12 00:00+00', true) "
+                        "RETURNING campaign_id").fetchone()[0]
+        c.execute("INSERT INTO tg.campaign_chat VALUES (%s, %s), (%s, %s)", (cid, w1, cid, w2))
+
+        # --- activity: a member of a group whose only message is at day 11-12; a channel with its discussion group
+        k = b.chat(-1003000000070, "activity K")
+        b.stay(k, 4701, ts("2026-11-01 10:00"), update_id=7000)
+        c.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, 4701, '2026-11-12', 1)", (k,))
+        ch = b.chat(-1003000000080, "disc channel", "channel")
+        gp = b.chat(-1003000000081, "disc group")
+        c.execute("UPDATE tg.chat SET linked_chat_id = %s WHERE chat_id = %s", (gp, ch))
+        c.execute("UPDATE tg.chat SET linked_chat_id = %s WHERE chat_id = %s", (ch, gp))
+        b.stay(gp, 4801, ts("2026-11-01 10:00"), update_id=8000)
+        c.execute("INSERT INTO tg.activity_daily (chat_id, user_id, day, messages) VALUES (%s, 4801, '2026-11-12', 1)", (gp,))
+        # a gap and a poor coverage for the header cases
+        c.execute("INSERT INTO tg.gap (chat_id, period, reason) VALUES (%s, tstzrange('2026-11-12 00:00+00', '2026-11-13 00:00+00'), 'not_admin')", (gp,))
+        c.execute("INSERT INTO tg.count_sample (chat_id, sampled_at, reported, known_open, net_events) "
+                  "VALUES (%s, '2026-11-23 10:00+00', 1000, 10, 0)", (z,))
+        # the rollup for the new chats, as the job would have made it
+        new = [r[0] for r in c.execute("SELECT chat_id FROM tg.chat WHERE tracked AND chat_id < -1002999999999 ORDER BY chat_id")]
+        rollups.refresh_chat_days(c, new, ts("2026-11-23 12:00"))
         c.commit()
     return dsn
 
@@ -97,7 +138,7 @@ def cases(cli_for, cases_db):
 
 def campaign_ids(dsn):
     with psycopg.connect(dsn) as c:
-        return dict(c.execute("SELECT name, campaign_id FROM tg.campaign WHERE name IN ('only new', 'everyone')").fetchall())
+        return dict(c.execute("SELECT name, campaign_id FROM tg.campaign WHERE name IN ('only new', 'everyone', 'five events', 'multi')").fetchall())
 
 
 # ------------------------------------------------------------------------------------------------------
@@ -247,3 +288,81 @@ def test_block_12_an_answer_after_as_of_leaves_the_request_pending(cases, cases_
     before = pick(cases.rows("requests", "--among", str(chat), "--since", "2026-08-01",
                              as_of=(resolved_at - dt.timedelta(minutes=1)).isoformat()), week=week)
     assert int(after["approved"]) == int(before["approved"]) + 1 and int(before["pending"]) == int(after["pending"]) + 1
+
+
+# ------------------------------------------------------------------------------------------------------
+# Review round 1
+# ------------------------------------------------------------------------------------------------------
+
+
+def test_campaign_entrant_follows_the_replay_of_an_inferred_stay_after_two_exact_ones(cases, cases_db):
+    """join, leave, join, leave, promote in one second: the exact stays come first, the inferred one is open."""
+    (row,) = cases.rows("campaign", "report", str(campaign_ids(cases_db)["five events"]), "--entrants")
+    assert row["first_time"] == "true" and row["quick_exit"] == "yes"  # the entrant is the first exact stay
+    assert row["at_draw"] == "in" and row["still_in"] == "in"  # the last stay of the second is the open inferred one
+
+
+def test_growth_rejoins_agree_with_rejoiners_in_the_same_second_cases(cases):
+    day = "2026-11-10"
+    for chat, rejoins in [(-1003000000001, "0"), (-1003000000002, "0"), (-1003000000003, "1"),
+                          (-1003000000004, "1"), (-1003000000005, "1")]:
+        (g,) = [r for r in cases.rows("growth", "--among", str(chat), "--since", "2026-11-01") if r["day"] == day]
+        (r,) = cases.rows("rejoiners", "--among", str(chat), "--since", "2026-11-01")
+        assert g["rejoins"] == rejoins, chat
+        assert r["observed"] == rejoins, chat  # 10a counts the same rejoin, whatever the spells' ids
+
+
+def test_per_person_eligibility_needs_a_first_time_join_in_every_chat(cases, cases_db):
+    cid = str(campaign_ids(cases_db)["multi"])
+    (people,) = cases.rows("campaign", "report", cid, "--people")
+    assert [people[k] for k in ("persons", "multi_chat", "first_time", "eligible")] == ["2", "2", "1", "1"]
+    rows = cases.rows("campaign", "report", cid)
+    by_chat = {r["chat_id"]: (r["entrants"], r["first_time"], r["eligible"]) for r in rows}
+    assert by_chat == {"-1003000000060": ("2", "1", "1"), "-1003000000061": ("2", "2", "2")}
+
+
+def test_growth_withholds_what_a_historical_as_of_cannot_know(cases):
+    z = str(-1003000000020)  # joined 11-12 10:00, left 20:00
+    noon = [r for r in cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-12T12:00:00+00:00")
+            if r["day"] == "2026-11-12"]
+    (row,) = noon
+    assert row["withheld"] == "day" and row["exits"] == "" and row["short_stays"] == "" and row["joins"] == ""
+    next_day = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-13T12:00:00+00:00"), day="2026-11-12")
+    assert (next_day["joins"], next_day["exits"]) == ("1", "1")  # the day is over: its movement is known
+    assert next_day["short_stays"] == "" and next_day["withheld"] == "short_stays"  # its 48 h are not
+    late = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01", as_of="2026-11-16T00:00:00+00:00"), day="2026-11-12")
+    assert (late["short_stays"], late["withheld"]) == ("1", "")
+    now = pick(cases.rows("growth", "--among", z, "--since", "2026-11-01"), day="2026-11-12")
+    assert (now["exits"], now["short_stays"], now["withheld"]) == ("1", "1", "")
+
+
+def test_activity_and_discussion_count_only_complete_days_at_a_historical_as_of(cases):
+    k = str(-1003000000070)
+    noon = "2026-11-12T12:00:00+00:00"
+    early = pick(cases.rows("activity", "--among", k, "--since", "2026-11-01", as_of=noon), chat_id=k)
+    assert (early["active"], early["activity_through"]) == ("0", "2026-11-11")  # the message at 20:00 is after as_of
+    later = pick(cases.rows("activity", "--among", k, "--since", "2026-11-01", as_of="2026-11-13T12:00:00+00:00"), chat_id=k)
+    assert (later["active"], later["activity_through"]) == ("1", "2026-11-12")
+    now = pick(cases.rows("activity", "--among", k, "--since", "2026-11-01"), chat_id=k)
+    assert (now["active"], now["activity_through"]) == ("1", "2026-11-23")
+    disc = lambda when: pick(cases.rows("discussion", "--among", "disc channel", as_of=when), channel_id=-1003000000080)  # noqa: E731
+    assert (disc(noon)["active_in_group"], disc(noon)["activity_through"]) == ("0", "2026-11-11")
+    assert disc("2026-11-13T12:00:00+00:00")["active_in_group"] == "1"
+
+
+def test_the_header_lists_every_chat_with_its_coverage_even_in_a_big_scope(cases):
+    out = cases.run("flow", "--since", "2026-11-01", "--as-of", NOW_ARG)
+    assert out.code == 0, out.err
+    head = out.out.partition("\n\n")[0]
+    n = int(head.split("chats in scope: ")[1].split()[0])
+    assert n > 25 and sum(line.startswith("  ") for line in head.splitlines()) == n
+    assert "short stay Z" in head and "known 10 of 1000 reported (1.0 %)" in head  # poorly covered: still there
+
+
+def test_the_discussion_header_covers_the_group_and_the_activity_window(cases):
+    out = cases.run("discussion", "--among", "disc channel", "--as-of", NOW_ARG)
+    assert out.code == 0, out.err
+    head = out.out.partition("\n\n")[0]
+    assert "chats in scope: 2" in head and "disc channel" in head and "disc group" in head
+    assert "window 2026-10-24" in head and "gap:not_admin" in head  # the gap of the group, 11-12, lies in the window
+    assert "window: none" not in head

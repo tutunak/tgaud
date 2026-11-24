@@ -732,28 +732,60 @@ LANGUAGE sql STABLE SECURITY DEFINER SET search_path = pg_catalog, tg AS $$
 $$;
 
 -- The order of the spells of one person in one chat that start at the same instant (join, leave, join in one
--- second), as a bigint[] that compares lexicographically; append the membership id to break the last tie.
--- Replay order is (event_at, update_id), events before sightings before probes (design.md 4). An exact spell
--- is ordered by its opening event. An inferred start (E6, E9) has no join event of its own: it comes from the
--- first spell-opening event at that instant, and out -> out events (ban_out, unban, out_change) open nothing,
--- so they are skipped; the inferred spell takes that event's update id one rank after an exact join, so an
--- exact join that opened the first stay stays first whatever the update ids around it.
-CREATE FUNCTION tg.spell_order(p_chat_id bigint, p_user_id bigint, p_join_event_id bigint, p_joined_at timestamptz,
-                               p_start_source text, p_known_from timestamptz) RETURNS bigint[]
-LANGUAGE sql STABLE AS $$
-  SELECT CASE
-    WHEN p_join_event_id IS NOT NULL THEN
-      ARRAY[coalesce((SELECT e.update_id FROM tg.member_event e
-                       WHERE e.event_id = p_join_event_id AND e.event_at = p_joined_at), 9223372036854775807), 0]
-    WHEN p_start_source = 'inferred' THEN
-      ARRAY[coalesce((SELECT min(e.update_id) FROM tg.member_event e
-                       WHERE e.chat_id = p_chat_id AND e.user_id = p_user_id AND e.event_at = p_known_from
-                         AND e.kind NOT IN ('ban_out', 'unban', 'out_change')), 9223372036854775807), 1]
-    WHEN p_start_source = 'snapshot' THEN ARRAY[9223372036854775807, 2]
-    ELSE ARRAY[9223372036854775807, 3]
-  END
-$$;
-REVOKE EXECUTE ON FUNCTION tg.spell_order(bigint, bigint, bigint, timestamptz, text, timestamptz) FROM PUBLIC;
+-- second), as a bigint[] {update_id, rank, membership_id} that compares lexicographically. Replay order is
+-- (event_at, update_id), events before sightings before probes (design.md 4). An exact spell is ordered by its
+-- join event. An inferred start (E6, E9) has no join event of its own: the function replays the events of
+-- that instant the way the rebuild does (an open stay is closed by an exit and by an out -> out event, opened by
+-- a join; an exit or an in -> in event with no stay open opens an inferred stay) and gives each inferred stay the
+-- update id of the event that opened it (the k-th inferred opening for the k-th inferred stay by id: stays of
+-- one kind are interchangeable for every count). Snapshot starts follow the events (rank 2), probes follow
+-- those (rank 3). Callers compare two stays of the same instant: tg.spell_order(a) < tg.spell_order(b).
+CREATE FUNCTION tg.spell_order(p_membership_id bigint) RETURNS bigint[]
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+  s record;
+  e record;
+  v_open boolean;
+  v_inferred bigint[] := '{}';
+  v_k integer;
+BEGIN
+  SELECT m.chat_id, m.user_id, m.known_from, m.start_source, m.join_event_id, m.joined_at INTO s
+    FROM tg.membership m WHERE m.membership_id = p_membership_id;
+  IF NOT FOUND THEN
+    RETURN NULL;
+  ELSIF s.join_event_id IS NOT NULL THEN
+    RETURN ARRAY[coalesce((SELECT x.update_id FROM tg.member_event x
+                            WHERE x.event_id = s.join_event_id AND x.event_at = s.joined_at), 9223372036854775807),
+                 0, p_membership_id];
+  ELSIF s.start_source = 'snapshot' THEN
+    RETURN ARRAY[9223372036854775807, 2, p_membership_id];
+  ELSIF s.start_source = 'probe' THEN
+    RETURN ARRAY[9223372036854775807, 3, p_membership_id];
+  END IF;
+  v_open := EXISTS (SELECT 1 FROM tg.membership x
+                     WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from < s.known_from
+                       AND (x.left_before IS NULL OR x.left_before >= s.known_from));
+  FOR e IN SELECT x.update_id, x.kind FROM tg.member_event x
+            WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.event_at = s.known_from
+            ORDER BY x.update_id LOOP
+    IF e.kind = 'join' THEN
+      v_open := true;                                           -- E1, E2, E4: an exact stay is open now
+    ELSIF e.kind IN ('ban_out', 'unban', 'out_change') THEN
+      v_open := false;                                          -- E10 closes an open stay, E11 changes nothing
+    ELSIF e.kind IN ('leave', 'kick', 'restrict_out') THEN
+      IF NOT v_open THEN v_inferred := v_inferred || e.update_id; END IF;   -- E6, E7: inferred, closed at once
+      v_open := false;
+    ELSE
+      IF NOT v_open THEN v_inferred := v_inferred || e.update_id; END IF;   -- E9: a missed join
+      v_open := true;
+    END IF;
+  END LOOP;
+  SELECT count(*) + 1 INTO v_k FROM tg.membership x
+   WHERE x.chat_id = s.chat_id AND x.user_id = s.user_id AND x.known_from = s.known_from
+     AND x.start_source = 'inferred' AND x.membership_id < p_membership_id;
+  RETURN ARRAY[coalesce(v_inferred[least(v_k, cardinality(v_inferred))], 9223372036854775807), 1, p_membership_id];
+END $$;
+REVOKE EXECUTE ON FUNCTION tg.spell_order(bigint) FROM PUBLIC;
 
 -- Giveaway entrants of one campaign (analytics item 4), one row per (chat, user): the earliest spell with
 -- an exact join inside [starts_at, min(draw_at, as_of)] (tied starts by the opening event's order), and its
@@ -781,8 +813,7 @@ WITH g AS (
                       AND m.joined_at >= g.starts_at AND m.joined_at <= least(g.draw_at, p_as_of)
   JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS NOT TRUE
   ORDER BY m.chat_id, m.user_id, m.joined_at,
-           (tg.spell_order(m.chat_id, m.user_id, m.join_event_id, m.joined_at, m.start_source, m.known_from)
-            || m.membership_id)
+           tg.spell_order(m.membership_id)
 ), outcome AS (
   SELECT e.*,
          tg.state_at(e.known_from, e.left_after, e.left_before, e.end_source, e.suspect_since,
@@ -799,28 +830,21 @@ WITH g AS (
     SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
     FROM tg.membership s
     WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= e.draw_at
-    ORDER BY s.known_from DESC,
-             (tg.spell_order(s.chat_id, s.user_id, s.join_event_id, s.joined_at, s.start_source, s.known_from)
-              || s.membership_id) DESC
+    ORDER BY s.known_from DESC, tg.spell_order(s.membership_id) DESC
     LIMIT 1) d ON true
   LEFT JOIN LATERAL (                                      -- the latest spell that had started by as_of
     SELECT s.known_from, s.left_after, s.left_before, s.end_source, s.suspect_since
     FROM tg.membership s
     WHERE s.chat_id = e.chat_id AND s.user_id = e.user_id AND s.known_from <= p_as_of
-    ORDER BY s.known_from DESC,
-             (tg.spell_order(s.chat_id, s.user_id, s.join_event_id, s.joined_at, s.start_source, s.known_from)
-              || s.membership_id) DESC
+    ORDER BY s.known_from DESC, tg.spell_order(s.membership_id) DESC
     LIMIT 1) n ON true
 ), flagged AS (
   SELECT o.*,
          NOT EXISTS (SELECT 1 FROM tg.membership p
                       WHERE p.chat_id = o.chat_id AND p.user_id = o.user_id AND p.membership_id <> o.membership_id
                         AND (p.known_from < o.joined_at
-                             OR (p.known_from = o.joined_at          -- the same instant: the opening event's order
-                                 AND (tg.spell_order(p.chat_id, p.user_id, p.join_event_id, p.joined_at,
-                                                     p.start_source, p.known_from) || p.membership_id)
-                                   < (tg.spell_order(o.chat_id, o.user_id, o.join_event_id, o.joined_at,
-                                                     'event', o.known_from) || o.membership_id)))) AS first_time
+                             OR (p.known_from = o.joined_at          -- the same instant: the replay order
+                                 AND tg.spell_order(p.membership_id) < tg.spell_order(o.membership_id)))) AS first_time
   FROM outcome o
 )
 SELECT f.campaign_id, f.chat_id, f.user_id, f.joined_at, f.first_time,
@@ -945,8 +969,11 @@ END $$;
 CREATE FUNCTION tg.forget_user(p_user_id bigint) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
   r record;
-  v_dup bigint;
 BEGIN
+  -- No page of the collect script can be committed from here to the end of this transaction: a page waiting
+  -- for the lock is checked against tg.erasure (trigger snapshot_member_skip_erased, migration 008) after it,
+  -- and a page in flight is waited for, so the delete below sees it.
+  LOCK TABLE tg.snapshot_member IN SHARE ROW EXCLUSIVE MODE;
   IF EXISTS (SELECT 1 FROM tg.snapshot WHERE finished_at IS NULL) THEN
     RAISE EXCEPTION 'a snapshot is still being written: finish or delete it before forget-user'
       USING ERRCODE = 'object_not_in_prerequisite_state';
@@ -965,19 +992,17 @@ BEGIN
   UPDATE tg.member_event SET actor_id = NULL WHERE actor_id = p_user_id;
   UPDATE tg.join_request SET resolved_by = NULL WHERE resolved_by = p_user_id;
   UPDATE tg.snapshot_member SET inviter_id = NULL WHERE inviter_id = p_user_id;
+  -- A creator is cleared on its own row, so no link id, campaign or reference of anyone else changes. Masked
+  -- links of one chat can share their redacted text and differ only in the creator (unique index
+  -- invite_link_masked): when another row already has that text and no creator, the text gets the row's id.
   FOR r IN SELECT l.invite_link_id, l.chat_id, l.masked_link FROM tg.invite_link l WHERE l.creator_id = p_user_id LOOP
-    v_dup := NULL;
-    IF r.masked_link IS NOT NULL THEN
-      SELECT x.invite_link_id INTO v_dup FROM tg.invite_link x
-       WHERE x.chat_id = r.chat_id AND x.masked_link = r.masked_link AND x.creator_id IS NULL AND x.link_digest IS NULL;
-    END IF;
-    IF v_dup IS NULL THEN
-      UPDATE tg.invite_link SET creator_id = NULL WHERE invite_link_id = r.invite_link_id;
+    IF r.masked_link IS NOT NULL AND EXISTS (SELECT 1 FROM tg.invite_link x
+                                              WHERE x.chat_id = r.chat_id AND x.masked_link = r.masked_link
+                                                AND x.creator_id IS NULL AND x.link_digest IS NULL) THEN
+      UPDATE tg.invite_link SET creator_id = NULL, masked_link = masked_link || ' #' || invite_link_id
+       WHERE invite_link_id = r.invite_link_id;
     ELSE
-      UPDATE tg.member_event SET invite_link_id = v_dup WHERE invite_link_id = r.invite_link_id;
-      UPDATE tg.join_request SET invite_link_id = v_dup WHERE invite_link_id = r.invite_link_id;
-      UPDATE tg.membership SET invite_link_id = v_dup WHERE invite_link_id = r.invite_link_id;
-      DELETE FROM tg.invite_link WHERE invite_link_id = r.invite_link_id;
+      UPDATE tg.invite_link SET creator_id = NULL WHERE invite_link_id = r.invite_link_id;
     END IF;
   END LOOP;
 
@@ -992,6 +1017,17 @@ BEGIN
   DELETE FROM tg.join_request WHERE user_id = p_user_id;
   DELETE FROM tg.activity_daily WHERE user_id = p_user_id;
   DELETE FROM tg.tg_user WHERE user_id = p_user_id;
+
+  -- Reconciliation records that hold the id as a number: the diagnostic endpoints are cleared, and a live cursor
+  -- (every user_id <= it is applied) moves to the nearest surviving id below, which sorts the survivors alike.
+  UPDATE tg.reconcile_run SET from_user_id = NULL WHERE from_user_id = p_user_id;
+  UPDATE tg.reconcile_run SET through_user_id = NULL WHERE through_user_id = p_user_id;
+  UPDATE tg.snapshot s SET applied_through_user_id =
+      (SELECT max(u.user_id) FROM (SELECT m.user_id FROM tg.snapshot_member m WHERE m.snapshot_id = s.snapshot_id
+                                   UNION ALL SELECT t.user_id FROM tg.tg_user t) u WHERE u.user_id < p_user_id)
+   WHERE s.applied_through_user_id = p_user_id;
+  UPDATE tg.gap_progress g SET last_user_id = (SELECT max(t.user_id) FROM tg.tg_user t WHERE t.user_id < p_user_id)
+   WHERE g.last_user_id = p_user_id;
 END $$;
 
 ------------------------------------------------------------------------------------------------------------

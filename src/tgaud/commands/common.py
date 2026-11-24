@@ -29,7 +29,6 @@ UTC = dt.timezone.utc
 
 # Columns that hold a chat id: the table shows "title (id)" beside them unless the result names its chats itself.
 CHAT_COLUMNS = frozenset({"chat_id", "chat_a", "chat_b", "from_chat", "to_chat", "channel_id", "group_id"})
-HEADER_CHATS_FULL = 25  # more chats in scope than this: the header lists only those with something to flag
 
 
 class CliError(Exception):
@@ -294,10 +293,8 @@ def print_header(out: TextIO, conn: psycopg.Connection, *, title: str, as_of: dt
         print("window: none (current state)", file=out)
     for note in notes:
         print(note, file=out)
-    flagged = [r for r in rows if r["flags"] or r["suspect_open"]]
     print(f"chats in scope: {len(scope)}", file=out)
-    shown = rows if len(rows) <= HEADER_CHATS_FULL else flagged
-    for r in shown:
+    for r in rows:  # every chat: a low or missing coverage must never drop out of the header
         if r["reported"] is None:
             cov = "no count sample yet"
         else:
@@ -305,8 +302,6 @@ def print_header(out: TextIO, conn: psycopg.Connection, *, title: str, as_of: dt
             cov = f"known {r['known_open']} of {r['reported']} reported{pct}, suspect {r['suspect_open']}"
         flags = f"; window flags: {r['flags']}" if r["flags"] else ""
         print(f"  {r['title']} ({r['chat_id']}): {cov}{flags}", file=out)
-    if len(shown) < len(rows):
-        print(f"  ... {len(rows) - len(shown)} more chats without flags or suspect spells", file=out)
     print(file=out)
 
 
