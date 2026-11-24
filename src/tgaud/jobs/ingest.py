@@ -122,6 +122,13 @@ DIGEST_MARK = "hmac-sha256:"
 USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
 MEMBER_KEYS = ("new_chat_member", "old_chat_member")  # a ChatMember: holds the person at `user`
 NAME_KEYS = ("first_name", "last_name", "username")
+# User (Bot API 10.5): a person in a raw payload keeps only these fields, each only with its type, plus the
+# NAME_KEYS as strings when store_names is on; anything else (an unknown or future field) is dropped
+PERSON_FIELDS = {
+    "id": int, "is_bot": bool, "is_premium": bool, "language_code": str, "added_to_attachment_menu": bool,
+    "can_join_groups": bool, "can_read_all_group_messages": bool, "supports_inline_queries": bool,
+    "can_connect_to_business": bool, "has_main_web_app": bool,
+}
 # ChatInviteLink (Bot API 10.5): a link in a raw payload keeps only these fields, each only with its type
 LINK_FIELDS = {
     "invite_link": str, "creator": dict, "creates_join_request": bool, "is_primary": bool, "is_revoked": bool,
@@ -406,6 +413,15 @@ def post_kind(msg: dict) -> str:
 
 def _is_user_dict(d: dict) -> bool:
     return isinstance(d.get("id"), int) and "is_bot" in d
+
+
+def _person_field(key: Any, value: Any, store_names: bool) -> bool:
+    """Whether a person's raw payload keeps this field: a User field of its type, a name only when names are
+    stored. An allowlist, so a field Telegram adds later (or a malformed one) never carries a name through."""
+    if key in NAME_KEYS:
+        return store_names and isinstance(value, str)
+    kind = PERSON_FIELDS.get(key)
+    return kind is not None and isinstance(value, kind) and not (kind is int and isinstance(value, bool))
 
 
 def _expected_shape(holder: str | None, key: Any, value: Any) -> bool:
@@ -1403,7 +1419,7 @@ class Ingest:
             for k, x in v.items():
                 if k in ("bio", "user_chat_id"):
                     continue
-                if not self.store_names and person and k in NAME_KEYS:
+                if holder == "person" and not _person_field(k, x, self.store_names):
                     continue
                 if not _expected_shape(holder, k, x):
                     # a sensitive position holding something else (an array, a scalar): dropped, not walked,

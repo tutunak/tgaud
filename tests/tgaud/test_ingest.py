@@ -1270,6 +1270,28 @@ def without_is_bot(uid: int) -> dict:
     return u
 
 
+def test_a_person_keeps_only_user_fields_in_raw_payloads(make):
+    """The reviewer's cases: with names off, a name under a field the parser doesn't know (`name`) is dropped
+    from a person's raw payload: in a malformed sender with only a name, in a link's creator, and in an
+    otherwise valid sender. A person keeps only the Bot API User fields, each with its type."""
+    h = make(store_names=False).start()
+    tracked_channel(h)
+    only_name = join_request(10, 44, T0)
+    only_name["chat_join_request"]["from"] = {"name": "Name44 Surname44"}
+    creator_named = chat_member(11, 45, T0, link=dict(masked_link(), creator=dict(user(ADMIN), name="Name45")))
+    sender_named = chat_member(12, 46, T0)
+    sender_named["chat_member"]["from"] = dict(user(46), name="Name46", nickname="Nick46", is_premium="yes")
+    h.poll(only_name, creator_named, sender_named)
+    raw = [p for (p,) in h.q("SELECT payload::text FROM tg.raw_update WHERE update_id >= 10")]
+    assert len(raw) == 3
+    for leaked in ("Name44", "Name45", "Name46", "Nick46", '"is_premium": "yes"'):
+        assert not any(leaked in p for p in raw), leaked
+    sender = h.one("SELECT payload->'from' FROM tg.raw_update WHERE update_id = 12")
+    assert set(sender) <= {"id", "is_bot", "is_premium", "language_code", "added_to_attachment_menu",
+                           "can_join_groups", "can_read_all_group_messages", "supports_inline_queries",
+                           "can_connect_to_business", "has_main_web_app"} and sender["id"] == 46
+
+
 def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_payloads(make):
     h = make(store_names=False).start()
     tracked_channel(h)
