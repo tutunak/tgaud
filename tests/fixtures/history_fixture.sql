@@ -233,11 +233,15 @@ UPDATE tg.snapshot SET quality = CASE WHEN complete AND greatest(reported_at_sta
                                       THEN 'good' ELSE 'partial' END,
                        reconciled_at = finished_at + interval '5 minutes';
 
--- durable sightings (runs of consecutive sightings), folded from snapshot_member by the reconciler
-INSERT INTO tg.sighting (chat_id, user_id, first_seen_at, first_snapshot_id, last_seen_at, last_snapshot_id, times_seen, joined_date)
+-- durable sightings (runs of consecutive sightings), folded from snapshot_member by the reconciler: every user here
+-- is listed in every snapshot of the chat from its first to its last, with one Telegram date, so one run per pair;
+-- interior_seen_at holds the exact page times between the first and the last (migration 003)
+INSERT INTO tg.sighting (chat_id, user_id, first_seen_at, first_snapshot_id, last_seen_at, last_snapshot_id, times_seen,
+                         joined_date, interior_seen_at)
 SELECT s.chat_id, m.user_id, min(m.seen_at), (array_agg(s.snapshot_id ORDER BY s.started_at))[1],
        max(m.seen_at), (array_agg(s.snapshot_id ORDER BY s.started_at DESC))[1], count(*),
-       (array_agg(m.joined_date ORDER BY s.started_at DESC))[1]
+       (array_agg(m.joined_date ORDER BY s.started_at DESC))[1],
+       (array_agg(m.seen_at ORDER BY s.started_at))[2 : count(*) - 1]
 FROM tg.snapshot s JOIN tg.snapshot_member m USING (snapshot_id)
 GROUP BY s.chat_id, m.user_id;
 

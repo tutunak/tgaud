@@ -412,8 +412,8 @@ CREATE TABLE tg.sighting (
   last_seen_at         timestamptz NOT NULL,
   last_snapshot_id     bigint NOT NULL REFERENCES tg.snapshot,
   times_seen           integer NOT NULL DEFAULT 1 CHECK (times_seen >= 1),
-  joined_date          timestamptz,                        -- latest Telegram join date seen in this run
-  PRIMARY KEY (chat_id, user_id, first_seen_at),
+  joined_date          timestamptz,                        -- the Telegram join date every point of this run carried
+  PRIMARY KEY (chat_id, user_id, first_snapshot_id),      -- a run is identified by the snapshot that began it
   CHECK (first_seen_at <= last_seen_at)
 );
 COMMENT ON TABLE tg.sighting IS

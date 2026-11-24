@@ -7,6 +7,12 @@ import pytest
 from tgaud import db
 
 
+# every migration of the image (other tasks add theirs), and a version after the last one for synthetic files
+IMAGE = [m.version for m in db.load_migrations()]
+LATEST = IMAGE[-1]
+NEXT = LATEST + 1
+
+
 def _ledger(c):
     return c.execute("SELECT version, name, sha256, applied_at FROM public.tgaud_migration ORDER BY version").fetchall()
 
@@ -17,14 +23,15 @@ def test_migrate_empty_database_as_the_tenant_then_noop(empty_dsn):
         assert role == (False, False, False)
         c.rollback()
         first = db.migrate(c)
-        assert first.applied == [1, 2] and first.version == 2
+        assert first.applied == IMAGE and first.version == LATEST
         ledger = _ledger(c)
-        assert [(v, n) for v, n, _, _ in ledger] == [(1, "initial"), (2, "shared")]
+        assert [(v, n) for v, n, _, _ in ledger] == [(m.version, m.name) for m in db.load_migrations()]
+        assert [(v, n) for v, n, _, _ in ledger][:2] == [(1, "initial"), (2, "shared")]
         assert c.execute("SELECT to_regclass('tg.membership'), to_regclass('tg.erasure')").fetchone() == (
             "tg.membership", "tg.erasure")
         c.commit()
         second = db.migrate(c)
-        assert second.applied == [] and second.version == 2
+        assert second.applied == [] and second.version == LATEST
         assert _ledger(c) == ledger
         c.rollback()
 
@@ -45,19 +52,19 @@ def test_concurrent_migrate_applies_once(empty_dsn):
     for t in threads:
         t.join(120)
     assert not errors, errors
-    assert sorted(results) == [[], [1, 2]]
+    assert sorted(results) == [[], IMAGE]
 
 
 def test_changed_migration_is_refused_before_anything_applies(migrated_dsn):
     image = db.load_migrations()
     changed = [dataclasses.replace(image[0], sha256="0" * 64), *image[1:]]
-    extra = dataclasses.replace(image[1], version=3, name="later", filename="003_later.sql",
+    extra = dataclasses.replace(image[1], version=NEXT, name="later", filename=f"{NEXT:03d}_later.sql",
                                 text="CREATE TABLE tg.should_not_exist (x int);", sha256="1" * 64)
     with psycopg.connect(migrated_dsn) as c:
         with pytest.raises(db.MigrationError, match="001_initial.sql was changed"):
             db.migrate(c, [*changed, extra])
         assert c.execute("SELECT to_regclass('tg.should_not_exist')").fetchone()[0] is None
-        assert [r[0] for r in _ledger(c)] == [1, 2]
+        assert [r[0] for r in _ledger(c)] == IMAGE
         c.rollback()
         st = db.schema_status(c, changed)
         assert st.changed == [1]
@@ -76,17 +83,17 @@ def test_failure_after_the_last_statement_rolls_back_ddl_and_ledger(empty_dsn):
         assert c.execute("SELECT to_regnamespace('tg'), to_regclass('tg.membership')").fetchone() == (None, None)
         assert _ledger(c) == []
         c.rollback()
-        assert db.migrate(c).applied == [1, 2]
+        assert db.migrate(c).applied == IMAGE
 
 
 def test_schema_status_behind_current_ahead(empty_dsn):
     image = db.load_migrations()
     with psycopg.connect(empty_dsn) as c:
         st = db.schema_status(c)
-        assert (st.state, st.applied, st.missing) == ("behind", [], [1, 2])
+        assert (st.state, st.applied, st.missing) == ("behind", [], IMAGE)
         db.migrate(c, image[:1])
         st = db.schema_status(c)
-        assert (st.state, st.missing) == ("behind", [2])
+        assert (st.state, st.missing) == ("behind", IMAGE[1:])
         db.migrate(c)
         assert db.schema_status(c).state == "current"
         c.execute("INSERT INTO public.tgaud_migration (version, name, sha256) VALUES (999, 'future', 'x')")
@@ -147,12 +154,12 @@ def test_a_statement_that_ends_the_transaction_is_never_recorded(empty_dsn, monk
     from tgaud import sqlscript
 
     image = db.load_migrations()
-    sneaky = db.Migration(3, "sneaky", "003_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
+    sneaky = db.Migration(NEXT, "sneaky", f"{NEXT:03d}_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
     real = db.Migration.statements
 
     def statements(self):
         out = real(self)
-        if self.version == 3:
+        if self.version == NEXT:
             out = out + [sqlscript.Statement("COMMIT", 1, (), ";")]
         return out
 
@@ -160,9 +167,9 @@ def test_a_statement_that_ends_the_transaction_is_never_recorded(empty_dsn, monk
     with psycopg.connect(empty_dsn) as c:
         with pytest.raises(db.MigrationError, match="ended the runner's transaction"):
             db.migrate(c, [*image, sneaky])
-        assert [r[0] for r in _ledger(c)] == [1, 2]
+        assert [r[0] for r in _ledger(c)] == IMAGE
         c.rollback()
-        assert db.schema_status(c, [*image, sneaky]).missing == [3]
+        assert db.schema_status(c, [*image, sneaky]).missing == [NEXT]
 
 
 @pytest.mark.parametrize("chain", ["ROLLBACK AND CHAIN", "COMMIT AND CHAIN"])
@@ -172,19 +179,19 @@ def test_a_chained_transaction_is_never_recorded(empty_dsn, monkeypatch, chain):
     from tgaud import sqlscript
 
     image = db.load_migrations()
-    sneaky = db.Migration(3, "sneaky", "003_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
+    sneaky = db.Migration(NEXT, "sneaky", f"{NEXT:03d}_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
     real = db.Migration.statements
 
     def statements(self):
         out = real(self)
-        return out + [sqlscript.Statement(chain, 1, (), ";")] if self.version == 3 else out
+        return out + [sqlscript.Statement(chain, 1, (), ";")] if self.version == NEXT else out
 
     monkeypatch.setattr(db.Migration, "statements", statements)
     with psycopg.connect(empty_dsn) as c:
         with pytest.raises(db.MigrationError, match="ended the runner's transaction"):
             db.migrate(c, [*image, sneaky])
-        assert [r[0] for r in _ledger(c)] == [1, 2]
+        assert [r[0] for r in _ledger(c)] == IMAGE
         if chain.startswith("ROLLBACK"):
             assert c.execute("SELECT to_regclass('public.sneaky')").fetchone()[0] is None
         c.rollback()
-        assert db.schema_status(c, [*image, sneaky]).missing == [3]
+        assert db.schema_status(c, [*image, sneaky]).missing == [NEXT]

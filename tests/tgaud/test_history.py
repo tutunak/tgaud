@@ -67,6 +67,7 @@ def test_overlapping_lock_sets_in_any_order_do_not_deadlock(tgaud_dsn):
     assert sorted(done) == ["a", "b"]
 
 
-def test_rebuild_pairs_stub_is_empty(tgaud_dsn):
+def test_rebuild_pairs_without_evidence_is_empty(tgaud_dsn):
     with psycopg.connect(tgaud_dsn) as c:
         assert history.rebuild_pairs(c, [(1, 2)]) == history.RebuildResult(0, 0, 0)
+        c.rollback()
