@@ -20,7 +20,7 @@ import hmac
 import logging
 import os
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -216,7 +216,7 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
     bot_api_url = (get("TGAUD_BOT_API_URL") or "https://api.telegram.org").rstrip("/")
     if not _valid_api_url(bot_api_url):
         problems.append("TGAUD_BOT_API_URL must be an http(s) URL with a host, an optional port (1-65535), "
-                        "no credentials and no query")
+                        "no credentials, no query and no fragment")
 
     activation_id = env.get("TGAUD_ACTIVATION_ID", "").strip()
     if any(ch in activation_id for ch in "\r\n"):
@@ -260,8 +260,44 @@ def _parse_database_url(raw: str, problems: list[str]) -> tuple[dict[str, str], 
     port = str(info.get("port") or "")
     if port and not all(p.isdigit() and 0 < int(p) < 65536 for p in port.split(",")):
         problems.append("TGAUD_DATABASE_URL has an invalid port")
+    for key, value in info.items():
+        check = _CONN_OPTIONS.get(key)
+        if check is None:
+            # the name is a libpq keyword (conninfo_to_dict refuses others): safe to show, the value is not
+            problems.append(f"TGAUD_DATABASE_URL option {key} is not supported by tgaud")
+        elif value is not None and not check(str(value)):
+            problems.append(f"TGAUD_DATABASE_URL has an invalid value for {key}")
     clean = {k: str(v) for k, v in info.items() if v is not None}
     return clean, (str(url_password) if url_password else None), _display_url(clean)
+
+
+def _one_of(*allowed: str) -> Callable[[str], bool]:
+    return lambda v: v in allowed
+
+
+def _integer(v: str) -> bool:
+    return re.fullmatch(r"-?[0-9]{1,9}", v.strip()) is not None
+
+
+def _anything(v: str) -> bool:
+    return True
+
+
+# The libpq options tgaud accepts in TGAUD_DATABASE_URL, with the values libpq itself would accept at connect
+# time, so `--selfcheck` (offline) refuses what `migrate` would fail on. host/port/dbname are checked apart.
+_CONN_OPTIONS: dict[str, Callable[[str], bool]] = {
+    "host": _anything, "hostaddr": _anything, "port": _anything, "dbname": _anything, "user": _anything,
+    "password": _anything, "passfile": _anything, "application_name": _anything, "options": _anything,
+    "sslmode": _one_of("disable", "allow", "prefer", "require", "verify-ca", "verify-full"),
+    "sslrootcert": _anything, "sslcert": _anything, "sslkey": _anything, "sslcrl": _anything,
+    "sslcrldir": _anything, "sslsni": _one_of("0", "1"), "sslnegotiation": _one_of("postgres", "direct"),
+    "channel_binding": _one_of("disable", "prefer", "require"),
+    "gssencmode": _one_of("disable", "prefer", "require"),
+    "target_session_attrs": _one_of("any", "read-write", "read-only", "primary", "standby", "prefer-standby"),
+    "load_balance_hosts": _one_of("disable", "random"),
+    "connect_timeout": _integer, "keepalives": _integer, "keepalives_idle": _integer,
+    "keepalives_interval": _integer, "keepalives_count": _integer, "tcp_user_timeout": _integer,
+}
 
 
 _DISPLAY_KEYS = ("sslmode", "connect_timeout", "target_session_attrs")
@@ -279,6 +315,9 @@ def _display_url(info: Mapping[str, str]) -> str:
 
 def _valid_api_url(url: str) -> bool:
     """Checked with both parsers the client uses, so a URL accepted here is one httpx can request."""
+    if "?" in url or "#" in url:
+        # even an empty query or fragment would swallow the /bot<token>/<method> path the client appends
+        return False
     try:
         u = urlsplit(url)
         port = u.port  # raises on a non-numeric or out-of-range port

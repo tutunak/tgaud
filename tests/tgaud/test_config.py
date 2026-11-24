@@ -181,3 +181,59 @@ def test_botcheck_with_a_bad_api_url_fails_cleanly(monkeypatch, capsys):
     assert cli.main(["botcheck"]) == 1
     err = capsys.readouterr().err
     assert "TGAUD_BOT_API_URL" in err and "Traceback" not in err and TOKEN not in err
+
+
+SECRET_VALUE = "VALUE-SHOULD-NOT-SHOW"
+
+
+@pytest.mark.parametrize("option", ["sslmode", "connect_timeout", "target_session_attrs", "keepalives",
+                                    "channel_binding", "gssencmode"])
+def test_invalid_connection_option_values_are_refused_without_the_value(option):
+    with pytest.raises(config.ConfigError, match=f"invalid value for {option}") as e:
+        config.load(full_env(TGAUD_DATABASE_URL=f"postgresql://u@h/d?{option}={SECRET_VALUE}"))
+    assert SECRET_VALUE not in str(e.value)
+
+
+def test_unsupported_connection_options_are_refused_by_name():
+    with pytest.raises(config.ConfigError, match="option service is not supported"):
+        config.load(full_env(TGAUD_DATABASE_URL="postgresql://u@h/d?service=x"))
+
+
+@pytest.mark.parametrize("query,ok", [
+    ("sslmode=disable", True), ("sslmode=verify-full", True), ("sslmode=bogus", False),
+    ("connect_timeout=5", True), ("connect_timeout=x", False),
+    ("target_session_attrs=read-write", True), ("target_session_attrs=nope", False),
+    ("channel_binding=require", True), ("channel_binding=maybe", False),
+])
+def test_option_verdicts_agree_with_libpq(query, ok):
+    """What config accepts, libpq accepts at connect time (and the reverse): nothing listens on port 1, so an
+    accepted option fails with a refused connection, a refused one with libpq's own invalid-value error."""
+    url = f"postgresql://u@127.0.0.1:1/d?{query}"
+    accepted = True
+    try:
+        config.load({"TGAUD_DATABASE_URL": url})
+    except config.ConfigError:
+        accepted = False
+    assert accepted is ok
+    with pytest.raises(psycopg.Error) as e:  # psycopg itself checks connect_timeout before libpq
+        psycopg.connect(url, connect_timeout=2 if "connect_timeout" not in query else None)
+    text = str(e.value).lower()
+    libpq_refused_option = ("invalid" in text or "bad value" in text) and "refused" not in text
+    assert libpq_refused_option is (not ok), str(e.value)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:8081?", "http://127.0.0.1:8081#", "http://h/x?", "http://h/#"])
+def test_empty_query_or_fragment_delimiters_are_refused(url, monkeypatch, capsys):
+    from tgaud import cli, selfcheck
+
+    with pytest.raises(config.ConfigError, match="TGAUD_BOT_API_URL"):
+        config.load(full_env(TGAUD_BOT_API_URL=url))
+    with pytest.raises(config.ConfigError, match="TGAUD_BOT_API_URL"):
+        selfcheck.run(env={"TGAUD_BOT_API_URL": url})
+    for k in list(config.os.environ):
+        if k.startswith("TGAUD_"):
+            monkeypatch.delenv(k)
+    monkeypatch.setenv("TGAUD_BOT_TOKEN", TOKEN)
+    monkeypatch.setenv("TGAUD_BOT_API_URL", url)
+    assert cli.main(["botcheck"]) == 1
+    assert "TGAUD_BOT_API_URL" in capsys.readouterr().err

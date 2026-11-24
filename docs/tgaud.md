@@ -123,8 +123,9 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   transaction together with its row in `public.tgaud_migration(version, name, sha256, applied_at)`, under an
   advisory lock. The runner owns the transaction: an exact top-level `BEGIN;` first and `COMMIT;` last (as in
   001) are removed; any other transaction control (`PREPARE TRANSACTION`, `COMMIT PREPARED`, `END`,
-  `ROLLBACK`, a `BEGIN` with options, ...), psql meta command or psql variable is refused, and the ledger row
-  is written only while the runner's transaction is still open.
+  `ROLLBACK`, a `BEGIN` with options, ...), psql meta command or psql variable is refused (a `--` comment ends
+  at LF or a bare CR, as in PostgreSQL), and the ledger row is written only while the runner's own transaction
+  (same status and same transaction id, so `... AND CHAIN` is caught) is still open.
 - A recorded migration whose file changed is refused before anything is applied. Never edit a released
   migration; add a new one. (Nothing is released yet, so tasks of this run still change 001 objects their
   brief names, in place.)
@@ -179,6 +180,10 @@ psql does (`\gset`, `\if`), which the rollups task can compare its Python port a
   (which does not set it) stores NULL until the ingest task's fix of that function sets `moved_at = now()`.
 - **An empty scope** (`scope_ids` NULL because no chat is tracked) becomes `{}` in the loader, so a report
   on a fresh database returns no rows instead of failing.
+- **`TGAUD_DATABASE_URL` options are checked offline**: only the libpq options tgaud supports are accepted
+  (`sslmode`, `connect_timeout`, `target_session_attrs`, the `ssl*` files, `keepalives*`, ...), each with the
+  values libpq accepts, so `--selfcheck` refuses what `migrate` would fail on; errors name the option, never
+  its value. `TGAUD_BOT_API_URL` may not contain `?` or `#`, not even empty ones.
 - **`--selfcheck` fills dummies only for unset variables**: an explicitly empty value (say `TGAUD_BOT_TOKEN=`)
   is validated as `serve` would and fails the check.
 - **`tgaud_job_failures_total{job}`** is added to the metrics of design.md 9 (the scheduler counts failing

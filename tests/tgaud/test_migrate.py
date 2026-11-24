@@ -121,6 +121,7 @@ def test_runner_strips_only_the_outer_transaction():
     "BEGIN ISOLATION LEVEL SERIALIZABLE;\nCREATE TABLE a (x int);\nCOMMIT;",  # only an exact BEGIN is removable
     "BEGIN;\nCREATE TABLE a (x int);\nEND;",                 # only an exact COMMIT closes it
     "CREATE TABLE a (x int);\nROLLBACK;",
+    "CREATE TABLE a (x int); -- note\rROLLBACK AND CHAIN;\nCREATE TABLE b (x int);",  # a bare CR ends -- comments
 ])
 def test_runner_refuses_what_it_cannot_own(text):
     with pytest.raises(Exception) as e:
@@ -160,5 +161,30 @@ def test_a_statement_that_ends_the_transaction_is_never_recorded(empty_dsn, monk
         with pytest.raises(db.MigrationError, match="ended the runner's transaction"):
             db.migrate(c, [*image, sneaky])
         assert [r[0] for r in _ledger(c)] == [1, 2]
+        c.rollback()
+        assert db.schema_status(c, [*image, sneaky]).missing == [3]
+
+
+@pytest.mark.parametrize("chain", ["ROLLBACK AND CHAIN", "COMMIT AND CHAIN"])
+def test_a_chained_transaction_is_never_recorded(empty_dsn, monkeypatch, chain):
+    """A statement that ends the runner's transaction and starts a new one keeps the status INTRANS; the
+    transaction id tells them apart."""
+    from tgaud import sqlscript
+
+    image = db.load_migrations()
+    sneaky = db.Migration(3, "sneaky", "003_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
+    real = db.Migration.statements
+
+    def statements(self):
+        out = real(self)
+        return out + [sqlscript.Statement(chain, 1, (), ";")] if self.version == 3 else out
+
+    monkeypatch.setattr(db.Migration, "statements", statements)
+    with psycopg.connect(empty_dsn) as c:
+        with pytest.raises(db.MigrationError, match="ended the runner's transaction"):
+            db.migrate(c, [*image, sneaky])
+        assert [r[0] for r in _ledger(c)] == [1, 2]
+        if chain.startswith("ROLLBACK"):
+            assert c.execute("SELECT to_regclass('public.sneaky')").fetchone()[0] is None
         c.rollback()
         assert db.schema_status(c, [*image, sneaky]).missing == [3]

@@ -79,8 +79,7 @@ def strip_comments(text: str) -> str:
     while i < n:
         c = text[i]
         if c == "-" and text.startswith("--", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j
+            i = _comment_end(text, i)
             out.append(" ")
         elif c == "/" and text.startswith("/*", i):
             i = _skip_block_comment(text, i, "<text>", 1)
@@ -93,6 +92,15 @@ def strip_comments(text: str) -> str:
             out.append(c)
             i += 1
     return " ".join("".join(out).split())
+
+
+_NEWLINE = re.compile(r"[\n\r]")
+
+
+def _comment_end(text: str, i: int) -> int:
+    """End of a `--` comment starting at i: the next LF or CR, as in PostgreSQL's lexer (a bare CR ends it)."""
+    m = _NEWLINE.search(text, i)
+    return len(text) if m is None else m.start()
 
 
 def _line_at(text: str, pos: int) -> int:
@@ -234,8 +242,7 @@ def parse(text: str, name: str = "<sql>") -> list[Statement | Meta]:
     while i < n:
         c = text[i]
         if c == "-" and text.startswith("--", i):
-            j = text.find("\n", i)
-            i = n if j < 0 else j
+            i = _comment_end(text, i)
             continue
         if c == "/" and text.startswith("/*", i):
             i = _skip_block_comment(text, i, name, 1)

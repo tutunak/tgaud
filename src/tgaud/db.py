@@ -186,6 +186,9 @@ def migrate(conn: psycopg.Connection, migrations: list[Migration] | None = None,
                 continue
             stmts = m.statements()
             try:
+                # the runner's own transaction id: a statement that ends it and starts another (COMMIT/ROLLBACK
+                # AND CHAIN) leaves the status INTRANS, but not the id
+                xact = conn.execute("SELECT pg_current_xact_id()::text").fetchone()[0]
                 for s in stmts:
                     try:
                         conn.execute(s.text)
@@ -193,9 +196,10 @@ def migrate(conn: psycopg.Connection, migrations: list[Migration] | None = None,
                         raise MigrationError(f"{m.filename}:{s.line}: {e}".rstrip()) from e
                 if _before_record is not None:
                     _before_record(m)
-                if conn.info.transaction_status != pq.TransactionStatus.INTRANS:
+                if (conn.info.transaction_status != pq.TransactionStatus.INTRANS
+                        or conn.execute("SELECT pg_current_xact_id()::text").fetchone()[0] != xact):
                     # a statement ended the runner's transaction: the ledger must not record what may be
-                    # half applied, prepared or committed outside it
+                    # half applied, prepared, rolled back or committed outside it
                     raise MigrationError(f"{m.filename}: the migration ended the runner's transaction "
                                          f"(status {conn.info.transaction_status.name}); not recorded")
                 conn.execute("INSERT INTO public.tgaud_migration (version, name, sha256) VALUES (%s, %s, %s)",
