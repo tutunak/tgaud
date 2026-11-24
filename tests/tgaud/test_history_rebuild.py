@@ -459,3 +459,116 @@ def test_concurrent_writer_waits_and_the_result_equals_a_fresh_replay(migrated_d
         history.rebuild_pairs(c, [(CHAT, 25)])
         assert w.spells(25) == got and [(s.end_source, s.left_at) for s in got] == [("event", at(DAY))]
         c.rollback()
+
+
+# --- review 1: times compare as instants in any session zone ---------------------------------------------------
+
+FALL_JOIN = datetime(2026, 10, 25, 0, 55, tzinfo=timezone.utc)  # 02:55 CEST
+FALL_EXIT = datetime(2026, 10, 25, 1, 5, tzinfo=timezone.utc)  # 02:05 CET, after the fall-back at 01:00Z
+
+
+@pytest.mark.parametrize("set_zone", ["SET TimeZone = 'Europe/Belgrade'", "SET LOCAL TimeZone = 'Europe/Belgrade'"])
+def test_fall_back_in_a_local_session_gives_one_closed_stay_and_keeps_the_zone(tgaud_dsn, set_zone):
+    with psycopg.connect(tgaud_dsn) as c:
+        w = World(c)
+        c.execute(set_zone)
+        w.join(31, FALL_JOIN)
+        w.leave(31, FALL_EXIT)
+        assert w.rebuild([31]) == history.RebuildResult(opened=1)
+        assert c.execute("SHOW TimeZone").fetchone()[0] == "Europe/Belgrade"  # the caller's zone is back
+        (s,) = w.spells(31)
+        assert (s.joined_at, s.left_at, s.end_source) == (FALL_JOIN, FALL_EXIT, "event")
+        assert w.rebuild([31]) == history.RebuildResult()  # a second call in the local zone changes nothing
+        c.execute("SET LOCAL TimeZone = 'UTC'")
+        assert w.rebuild([31]) == history.RebuildResult()  # nor one in UTC
+        ev = history.load_evidence(c, [(CHAT, 31)])[(CHAT, 31)]
+        assert [e.event_at.tzinfo for e in ev.events] == [timezone.utc, timezone.utc]
+        c.rollback()
+
+
+def test_zone_is_restored_after_a_python_error_and_by_rollback_after_a_database_error(migrated_dsn, monkeypatch):
+    with psycopg.connect(migrated_dsn) as c:  # commits: a database of its own
+        c.execute("SET TimeZone = 'Europe/Belgrade'")
+        w = World(c)
+        w.join(32, FALL_JOIN)
+        c.commit()
+
+        def boom(ev):
+            raise RuntimeError("injected in the replay")
+
+        monkeypatch.setattr(history, "build_spells", boom)
+        with pytest.raises(RuntimeError, match="injected"):
+            w.rebuild([32])
+        assert c.execute("SHOW TimeZone").fetchone()[0] == "Europe/Belgrade"  # transaction usable, zone back
+        c.rollback()
+        monkeypatch.undo()
+
+        real = history._load_chunk
+
+        def fail(conn, pairs):
+            real(conn, pairs)
+            conn.execute("SELECT 1 / 0")
+
+        monkeypatch.setattr(history, "_load_chunk", fail)
+        with pytest.raises(psycopg.errors.DivisionByZero):
+            w.rebuild([32])
+        c.rollback()
+        assert c.execute("SHOW TimeZone").fetchone()[0] == "Europe/Belgrade"
+
+
+def test_golden_fixture_in_a_local_session_zone(history_fixture):
+    with psycopg.connect(history_fixture) as c:
+        hand = [history.Spell(*(v.astimezone(timezone.utc) if isinstance(v, datetime) else v for v in r))
+                for r in spells(c)]
+        c.execute("SET LOCAL TimeZone = 'America/New_York'")
+        c.execute("DELETE FROM tg.membership")
+        pairs = c.execute(ALL_PAIRS).fetchall()
+        history.rebuild_pairs(c, pairs)
+        rebuilt = [history.Spell(*(v.astimezone(timezone.utc) if isinstance(v, datetime) else v for v in r))
+                   for r in spells(c)]
+        assert sorted(rebuilt) == sorted(hand)
+        c.execute("SET LOCAL TimeZone = 'UTC'")
+        assert history.rebuild_pairs(c, pairs) == history.RebuildResult()
+        c.rollback()
+
+
+# --- review 1: a sighting counts only once its snapshot is applied to the user ---------------------------------
+
+def test_singleton_folded_above_the_cursor_is_not_evidence_until_the_cursor_passes(world):
+    w = world
+    # in one reconcile transaction: graded, cursor 4, but user 8's run already folded (ahead of the cursor)
+    sid = w.snapshot(at(0), {3: (at(5), H1), 8: (at(6), H1)}, through=4, fold_through="all")
+    assert w.c.execute("SELECT count(*) FROM tg.sighting WHERE user_id = 8").fetchone()[0] == 1
+    w.rebuild([3, 8])
+    assert w.spells(8) == [] and len(w.spells(3)) == 1
+    assert history.load_evidence(w.c, [(CHAT, 8)])[(CHAT, 8)].sightings == []
+    with w.c.transaction(force_rollback=True):  # a chunk that advances the cursor and is interrupted
+        w.c.execute("UPDATE tg.snapshot SET applied_through_user_id = 8 WHERE snapshot_id = %s", (sid,))
+        w.rebuild([8])
+        assert [s.start_source for s in w.spells(8)] == ["snapshot"]
+    assert w.rebuild([8]) == history.RebuildResult() and w.spells(8) == []  # rolled back: as before
+    w.c.execute("UPDATE tg.snapshot SET applied_through_user_id = 8 WHERE snapshot_id = %s", (sid,))
+    assert w.rebuild([8]) == history.RebuildResult(opened=1)
+    w.finish_reconcile(sid)
+    assert w.rebuild([3, 8]) == history.RebuildResult()  # finalization changes nothing
+
+
+def test_extension_above_the_cursor_keeps_the_applied_points(world):
+    w = world
+    w.snapshot(at(0), {9: (at(5), H1)})
+    w.rebuild([9])
+    assert w.spells(9)[0].last_confirmed_at == at(5)
+    # the next listing is mid-apply with cursor 4; user 9's run is extended ahead of the cursor
+    sid = w.snapshot(at(7 * DAY), {9: (at(7 * DAY + 5), H1)}, through=4, fold_through="all")
+    assert w.c.execute("SELECT times_seen FROM tg.sighting WHERE user_id = 9").fetchone()[0] == 2
+    assert w.rebuild([9]) == history.RebuildResult()
+    assert w.spells(9)[0].last_confirmed_at == at(5)
+    w.c.execute("UPDATE tg.snapshot SET applied_through_user_id = 9 WHERE snapshot_id = %s", (sid,))
+    assert w.rebuild([9]) == history.RebuildResult(changed=1)
+    assert w.spells(9)[0].last_confirmed_at == at(7 * DAY + 5)
+    w.c.execute("UPDATE tg.snapshot SET applied_through_user_id = NULL WHERE snapshot_id = %s", (sid,))
+    w.rebuild([9])
+    assert w.spells(9)[0].last_confirmed_at == at(5)  # a graded snapshot with nothing applied yet
+    w.finish_reconcile(sid)
+    w.rebuild([9])
+    assert w.spells(9)[0].last_confirmed_at == at(7 * DAY + 5)

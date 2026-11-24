@@ -7,7 +7,8 @@ differences. Every row of the state table is one branch below, named in a commen
 Evidence and its time order (design.md 4 and the plan reviews):
   rank 0  events            tg.member_event at event_at, ties by update_id
   rank 1  sighting points   every point of every tg.sighting run at its exact page time (first_seen_at,
-                            interior_seen_at, last_seen_at), with the run's joined_date as the hint
+                            interior_seen_at, last_seen_at), with the run's joined_date as the hint; an end point
+                            counts only once its snapshot is graded and applied to the user
   rank 2  probe answers     tg.probe in/out at answered_at; ignored when an event of the pair has
                             sent_at <= event_at <= answered_at (the answer may describe either side)
   rank 3  absences          good, applied snapshots of the chat that no run of the user covers, at started_at
@@ -17,19 +18,26 @@ Ranks 3-5 are this module's choice where design.md is silent: an absence or a ga
 the same instant ends in the same state either way, and an event dated the second of a migration happened
 before the service message. Aliases with this chat as chat_id (M1, history moved in) open the E3 echo windows.
 Snapshot evidence comes only from tg.sighting and tg.snapshot, never tg.snapshot_member, so pruning (R3) can
-never change a replay.
+never change a replay. A snapshot is evidence for a user once it is graded and applied to that user
+(reconciled_at set, or user_id <= applied_through_user_id).
+
+Every time is compared as a UTC instant. Python orders, subtracts and compares datetimes that share a tzinfo by
+wall time, so a zone with daylight saving (the session's, which psycopg loads timestamptz into) would misorder the
+hour of a fall-back: the replay converts its inputs to UTC, and the rebuild reads in a UTC session.
 """
 
 from __future__ import annotations
 
 import bisect
 from collections import Counter, defaultdict
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from typing import NamedTuple
 
 import psycopg
+from psycopg.pq import TransactionStatus
 from psycopg.rows import tuple_row
 
 GRACE = timedelta(minutes=10)  # S3: a sighting within G after an exit is stale, never a rejoin
@@ -38,6 +46,7 @@ CHUNK = 10_000  # pairs per set of load queries
 SMALL_INSERT = 50  # up to this many new spells per chunk go by executemany, more by COPY
 
 IN_STATUSES = frozenset({"creator", "administrator", "member"})
+UTC = timezone.utc
 
 
 def lock_chats(conn: psycopg.Connection, chat_ids: Iterable[int]) -> list[int]:
@@ -214,7 +223,33 @@ def _open_exact(e: Event) -> _Stay:
                  join_route=_join_route(e), invite_link_id=e.invite_link_id)
 
 
-_NO_HINT = datetime.min.replace(tzinfo=timezone.utc)
+_NO_HINT = datetime.min.replace(tzinfo=UTC)
+
+
+def _utc(t: datetime | None) -> datetime | None:
+    """t as a UTC datetime (None stays None); a naive time has no instant and is refused."""
+    if t is None or t.tzinfo is UTC:
+        return t
+    if t.tzinfo is None:
+        raise ValueError(f"naive datetime {t!r}: the history rules need aware times")
+    return t.astimezone(UTC)
+
+
+def _is_utc(t: datetime | None) -> bool:
+    return t is None or t.tzinfo is UTC
+
+
+def _in_utc(ev: Evidence) -> Evidence:
+    """`ev` with every time in UTC, so ordering, intervals and equality are on instants (see the module doc)."""
+    return Evidence(
+        ev.chat_id, ev.user_id,
+        [e if e.event_at.tzinfo is UTC else e._replace(event_at=_utc(e.event_at)) for e in ev.events],
+        [s if _is_utc(s.seen_at) and _is_utc(s.joined_date)
+         else s._replace(seen_at=_utc(s.seen_at), joined_date=_utc(s.joined_date)) for s in ev.sightings],
+        [p if _is_utc(p.answered_at) and _is_utc(p.sent_at)
+         else p._replace(answered_at=_utc(p.answered_at), sent_at=_utc(p.sent_at)) for p in ev.probes],
+        [a if a.started_at.tzinfo is UTC else a._replace(started_at=_utc(a.started_at)) for a in ev.absences],
+        [_utc(t) for t in ev.gaps], [_utc(t) for t in ev.migrations], [_utc(t) for t in ev.echo_from])
 
 Trace = list[tuple[str, datetime | None]]
 
@@ -227,7 +262,11 @@ def _probe_is_late(p: ProbeAnswer, event_times: Sequence[datetime]) -> bool:
 
 
 def replay(ev: Evidence, trace: Trace | None = None) -> list[Spell]:
-    """The state table of design.md 4 for one (chat, user); appends (rule, time) of every branch to `trace`."""
+    """The state table of design.md 4 for one (chat, user); appends (rule, time) of every branch to `trace`.
+
+    Times may be in any zone (aware); they are compared, and the spells returned, in UTC.
+    """
+    ev = _in_utc(ev)
     note = trace.append if trace is not None else None
     event_times = sorted(e.event_at for e in ev.events)
     items: list[tuple] = []
@@ -412,8 +451,12 @@ SELECT e.chat_id, e.user_id, e.event_id, e.event_at, e.update_id, e.old_status, 
        e.new_is_member, e.actor_is_other, e.invite_link_id, e.via_join_request, e.via_folder_link
 FROM {_PAIRS} JOIN tg.member_event e ON e.chat_id = p.chat_id AND e.user_id = p.user_id"""
 
+# a run's end snapshot counts once graded and applied to the user; only a chat's latest snapshot is ever mid-apply
+_APPLIED = ("coalesce({s}.quality IN ('good', 'partial') AND "
+            "({s}.reconciled_at IS NOT NULL OR p.user_id <= {s}.applied_through_user_id), false)")
 _Q_SIGHTINGS = f"""
-SELECT s.chat_id, s.user_id, s.first_snapshot_id, fs.started_at, s.last_snapshot_id, ls.started_at,
+SELECT s.chat_id, s.user_id, s.first_snapshot_id, fs.started_at, {_APPLIED.format(s="fs")},
+       s.last_snapshot_id, ls.started_at, {_APPLIED.format(s="ls")},
        s.first_seen_at, s.interior_seen_at, s.last_seen_at, s.times_seen, s.joined_date
 FROM {_PAIRS} JOIN tg.sighting s ON s.chat_id = p.chat_id AND s.user_id = p.user_id
 JOIN tg.snapshot fs ON fs.snapshot_id = s.first_snapshot_id
@@ -479,9 +522,13 @@ def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event]
               probes: list[ProbeAnswer]) -> Evidence:
     points: list[SightingPoint] = []
     covered: list[tuple[tuple[datetime, int], tuple[datetime, int]]] = []
-    for (first_id, first_started, last_id, last_started, first_seen, interior, last_seen, times_seen,
-         joined_date) in runs:
+    for (first_id, first_started, first_applied, last_id, last_started, last_applied, first_seen, interior,
+         last_seen, times_seen, joined_date) in runs:
         times = [first_seen] if times_seen == 1 else [first_seen, *interior, last_seen]
+        if not last_applied:
+            times.pop()  # plan review 2: the newest point's snapshot is not applied to this user yet
+        if times and not first_applied:
+            times.pop(0)  # (a run must not begin in a snapshot that is still being applied before its end)
         points.extend(SightingPoint(t, joined_date, first_id, i) for i, t in enumerate(times))
         covered.append(((first_started, first_id), (last_started, last_id)))
     ev = Evidence(chat_id, user_id, events, points, probes, migrations=ctx.migrations, echo_from=ctx.echo_from)
@@ -567,13 +614,34 @@ def _load_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]
     return evidence, stored
 
 
+@contextmanager
+def _utc_session(conn: psycopg.Connection) -> Iterator[None]:
+    """Read in UTC, so psycopg loads every timestamptz as a UTC datetime whatever the caller's zone.
+
+    The zone is switched with set_config(..., is_local) and put back afterwards (the caller's SET or SET LOCAL
+    value); after a database error the transaction is aborted and its rollback restores the zone.
+    """
+    zone = conn.info.parameter_status("TimeZone")
+    if zone in (None, "UTC"):  # psycopg loads UTC already
+        yield
+        return
+    conn.execute("SELECT set_config('TimeZone', 'UTC', true)")
+    try:
+        yield
+    finally:
+        if conn.info.transaction_status == TransactionStatus.INTRANS:
+            conn.execute("SELECT set_config('TimeZone', %s, true)", (zone,))
+
+
 def load_evidence(conn: psycopg.Connection, pairs: Iterable[tuple[int, int]]) -> dict[tuple[int, int], Evidence]:
-    """The evidence rebuild_pairs replays for each pair, as `Evidence` (absences and gap starts already bounded to
-    the ones that can change a stay). Takes no locks: inside a writer's transaction, call lock_chats first."""
+    """The evidence rebuild_pairs replays for each pair, as `Evidence` in UTC. Absences and gap starts are bounded
+    to the ones that can change a stay, so its absences are not a per-snapshot list. Takes no locks: inside a
+    writer's transaction, call lock_chats first."""
     todo = sorted({(int(c), int(u)) for c, u in pairs})
     out: dict[tuple[int, int], Evidence] = {}
-    for i in range(0, len(todo), CHUNK):
-        out.update(_load_chunk(conn, todo[i:i + CHUNK])[0])
+    with _utc_session(conn):
+        for i in range(0, len(todo), CHUNK):
+            out.update(_load_chunk(conn, todo[i:i + CHUNK])[0])
     return out
 
 
@@ -642,7 +710,8 @@ def rebuild_pairs(conn: psycopg.Connection, pairs: Iterable[tuple[int, int]]) ->
 
     - Runs inside the caller's transaction (READ COMMITTED, the default) and never commits or rolls back. It
       takes lock_chats() for every chat of `pairs` before it reads anything (a no-op for locks the caller holds;
-      callers should take them first themselves, in one call, so the order stays ascending).
+      callers should take them first themselves, in one call, so the order stays ascending). It reads and
+      compares in UTC: a session in another zone is switched to UTC for the call and switched back after it.
     - Loads the evidence of CHUNK pairs at a time with one pipelined set of queries, replays each pair
       (build_spells) and writes only the differences: changed spells deleted, new ones inserted (COPY for big
       chunks), then tg.mark_dirty per chat with the UTC day of the earliest known_from, left_after, left_before
@@ -659,6 +728,7 @@ def rebuild_pairs(conn: psycopg.Connection, pairs: Iterable[tuple[int, int]]) ->
         return RebuildResult()
     lock_chats(conn, (c for c, _ in todo))
     result = RebuildResult()
-    for i in range(0, len(todo), CHUNK):
-        result += _rebuild_chunk(conn, todo[i:i + CHUNK])
+    with _utc_session(conn):
+        for i in range(0, len(todo), CHUNK):
+            result += _rebuild_chunk(conn, todo[i:i + CHUNK])
     return result

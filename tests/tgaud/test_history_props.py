@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import psycopg
 import pytest
@@ -21,13 +22,16 @@ from history_world import CHAT, World
 from tgaud import history
 from tgaud.history import Absence, Event, Evidence, ProbeAnswer, SightingPoint
 
-T0 = datetime(2026, 9, 1, 10, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 24, 23, 0, tzinfo=timezone.utc)  # the 4 h around the EU fall-back (2026-10-25 01:00Z)
 INF = datetime.max.replace(tzinfo=timezone.utc)
 STATUSES = ["creator", "administrator", "member", "restricted", "left", "kicked"]
-HINTS = [None, datetime(2024, 1, 1, tzinfo=timezone.utc), datetime(2026, 8, 1, tzinfo=timezone.utc)]
+H1 = datetime(2024, 1, 1, tzinfo=timezone.utc)
+HINTS = [H1, H1, H1, None, datetime(2026, 8, 1, tzinfo=timezone.utc)]  # mostly one date: runs get extended
 USER = 4242
 OTHER_CHAT = -1009000000099
 OLD_CHAT = -4242
+ZONES = ["UTC", "Europe/Belgrade", "America/New_York"]
+BELGRADE = ZoneInfo("Europe/Belgrade")
 
 
 def t_of(minutes: int, ms: int) -> datetime:
@@ -70,11 +74,12 @@ def snapshots(draw):
     """(started_at, good, applied to the user, listed page time or None, hint), in started_at order."""
     starts = sorted(draw(st.lists(st.integers(0, 240), max_size=5, unique=True)))
     out = []
-    for s in starts:
-        listed = draw(st.booleans())
+    for k, s in enumerate(starts):
+        listed = draw(st.sampled_from([True, True, True, False]))
         page = t_of(s, 0) + timedelta(minutes=draw(st.integers(0, 15)), milliseconds=draw(st.sampled_from([0, 800])))
-        out.append((t_of(s, 0), draw(st.booleans()), draw(st.sampled_from([True, True, False])),
-                    page if listed else None, draw(st.sampled_from(HINTS))))
+        # only the latest snapshot can be mid-apply in practice; earlier ones are mostly applied
+        applied = draw(st.booleans() if k == len(starts) - 1 else st.sampled_from([True] * 5 + [False]))
+        out.append((t_of(s, 0), draw(st.booleans()), applied, page if listed else None, draw(st.sampled_from(HINTS))))
     return out
 
 
@@ -128,6 +133,16 @@ def test_pure_replay_satisfies_the_constraints_and_ignores_input_order(d, rnd):
     check_constraints(spells, ev)
     shuffled = Evidence(CHAT, USER, **{k: rnd.sample(v, len(v)) for k, v in vars(ev).items() if isinstance(v, list)})
     assert history.build_spells(shuffled) == spells
+    assert history.build_spells(in_zone(ev, BELGRADE)) == spells  # local wall times run backwards at 01:00Z
+
+
+def in_zone(ev: Evidence, zone) -> Evidence:
+    z = lambda t: t if t is None else t.astimezone(zone)  # noqa: E731
+    return Evidence(ev.chat_id, ev.user_id, [e._replace(event_at=z(e.event_at)) for e in ev.events],
+                    [s._replace(seen_at=z(s.seen_at), joined_date=z(s.joined_date)) for s in ev.sightings],
+                    [p._replace(answered_at=z(p.answered_at), sent_at=z(p.sent_at)) for p in ev.probes],
+                    [a._replace(started_at=z(a.started_at)) for a in ev.absences], [z(t) for t in ev.gaps],
+                    [z(t) for t in ev.migrations], [z(t) for t in ev.echo_from])
 
 
 def write(w: World, d: dict, rnd: random.Random) -> None:
@@ -155,10 +170,13 @@ def write(w: World, d: dict, rnd: random.Random) -> None:
             (CHAT, OTHER_CHAT, m)))
 
     def listings():
+        last = len(d["snapshots"]) - 1
         for k, (started, good, applied, page, hint) in enumerate(d["snapshots"]):
             listed = {USER: (page, hint)} if page is not None else {}
+            # the latest snapshot may be mid-apply with this user's run already folded ahead of the cursor
             w.snapshot(started, listed, finished=started + timedelta(minutes=30), good=good,
-                       through="all" if applied else USER - 1, snapshot_id=900 + k)
+                       through="all" if applied else USER - 1, snapshot_id=900 + k,
+                       fold_through="all" if k == last else "same")
     actions.append(listings)
     rnd.shuffle(actions)
     for a in actions:
@@ -180,6 +198,7 @@ def test_database_rebuild_is_valid_deterministic_idempotent_and_matches_the_defi
     results = []
     for _ in range(2):
         with conn.transaction(force_rollback=True):
+            conn.execute("SELECT set_config('TimeZone', %s, true)", (rnd.choice(ZONES),))
             w = World(conn)
             write(w, d, rnd)
             history.rebuild_pairs(conn, [(CHAT, USER)])  # every insert passes the real constraints

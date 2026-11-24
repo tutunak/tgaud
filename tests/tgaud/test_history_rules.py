@@ -329,3 +329,26 @@ def test_input_order_never_matters():
     for _ in range(20):
         shuffled = {k: rnd.sample(v, len(v)) for k, v in kw.items()}
         assert history.build_spells(Evidence(-100, 7, **shuffled)) == expected
+
+
+# --- times are instants (review 1: daylight-saving fall-back) --------------------------------------------------
+
+def test_fall_back_hour_in_a_local_zone_replays_as_utc():
+    from zoneinfo import ZoneInfo
+    belgrade = ZoneInfo("Europe/Belgrade")  # 2026-10-25 01:00Z: 03:00 CEST -> 02:00 CET
+    j, x = datetime(2026, 10, 25, 0, 55, tzinfo=timezone.utc), datetime(2026, 10, 25, 1, 5, tzinfo=timezone.utc)
+    assert j.astimezone(belgrade) > x.astimezone(belgrade).replace(tzinfo=belgrade)  # wall times run backwards
+    events = [join(j), leave(x)]
+    utc = history.build_spells(Evidence(-100, 7, events=events))
+    local_events = [e._replace(event_at=e.event_at.astimezone(belgrade)) for e in events]
+    local = history.build_spells(Evidence(-100, 7, events=local_events))
+    assert local == utc
+    (s,) = local
+    assert (s.joined_at, s.left_at, s.end_source) == (j, x, "event")
+    assert s.left_at.tzinfo is timezone.utc
+
+
+def test_naive_times_are_refused():
+    import pytest
+    with pytest.raises(ValueError, match="naive"):
+        history.build_spells(Evidence(-100, 7, events=[join(datetime(2026, 9, 1, 10, 0))]))

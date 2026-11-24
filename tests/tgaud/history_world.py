@@ -165,4 +165,6 @@ class World:
     def spells(self, user: int, chat: int | None = None) -> list[history.Spell]:
         rows = self.c.execute(f"SELECT {COLS} FROM tg.membership WHERE chat_id = %s AND user_id = %s "
                               "ORDER BY known_from, joined_at NULLS FIRST", (chat or self.chat_id, user)).fetchall()
-        return [history.Spell(*r) for r in rows]
+        # in UTC: in another session zone, datetimes of one tzinfo would compare by wall time
+        return [history.Spell(*(v.astimezone(timezone.utc) if isinstance(v, datetime) else v for v in r))
+                for r in rows]
