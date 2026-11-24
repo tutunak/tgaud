@@ -24,6 +24,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+import httpx
 import psycopg.conninfo
 
 NEEDS = frozenset({"database", "bot", "link_key"})
@@ -213,9 +214,9 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
         problems.append(f"TGAUD_LOG_LEVEL must be one of {', '.join(_LEVELS)}")
 
     bot_api_url = (get("TGAUD_BOT_API_URL") or "https://api.telegram.org").rstrip("/")
-    u = urlsplit(bot_api_url)
-    if u.scheme not in ("http", "https") or not u.hostname or u.username or u.password or u.query:
-        problems.append("TGAUD_BOT_API_URL must be an http(s) URL without credentials or query")
+    if not _valid_api_url(bot_api_url):
+        problems.append("TGAUD_BOT_API_URL must be an http(s) URL with a host, an optional port (1-65535), "
+                        "no credentials and no query")
 
     activation_id = env.get("TGAUD_ACTIVATION_ID", "").strip()
     if any(ch in activation_id for ch in "\r\n"):
@@ -240,34 +241,54 @@ def load(env: Mapping[str, str] | None = None, need: Iterable[str] = ()) -> Conf
 
 
 def _parse_database_url(raw: str, problems: list[str]) -> tuple[dict[str, str], str | None, str] | None:
-    """(conninfo without password, the URL's password, the URL without password) or None after a problem."""
+    """(conninfo without password, the URL's password, a display URL) or None after a problem.
+
+    Neither the display URL nor an error is ever built from the raw text: libpq accepts percent-encoded
+    parameter names (`?%70assword=...`), so only parsed, non-secret fields are shown."""
     if not (raw.startswith("postgresql://") or raw.startswith("postgres://")):
         problems.append("TGAUD_DATABASE_URL must start with postgresql://")
         return None
     try:
         info = psycopg.conninfo.conninfo_to_dict(raw)
-    except psycopg.ProgrammingError:
-        # libpq's message may quote parts of the URL; it is not shown.
-        problems.append(f"TGAUD_DATABASE_URL is not a valid PostgreSQL URL: {_redact_url(raw)}")
+    except psycopg.Error:
+        # libpq's message may quote parts of the URL, the password among them: not shown.
+        problems.append("TGAUD_DATABASE_URL is not a valid PostgreSQL URL")
         return None
     url_password = info.pop("password", None)
     if not info.get("dbname"):
         problems.append("TGAUD_DATABASE_URL must name a database")
+    port = str(info.get("port") or "")
+    if port and not all(p.isdigit() and 0 < int(p) < 65536 for p in port.split(",")):
+        problems.append("TGAUD_DATABASE_URL has an invalid port")
     clean = {k: str(v) for k, v in info.items() if v is not None}
-    return clean, (str(url_password) if url_password else None), _redact_url(raw, keep_user=True)
+    return clean, (str(url_password) if url_password else None), _display_url(clean)
 
 
-def _redact_url(raw: str, keep_user: bool = True) -> str:
-    """The URL with any password removed (user@host stays)."""
-    m = re.match(r"^(?P<scheme>[a-z]+://)(?P<auth>[^@/]*@)?(?P<rest>.*)$", raw)
-    if not m:
-        return "<unparseable>"
-    auth = m.group("auth") or ""
-    if auth:
-        user = auth[:-1].split(":", 1)[0]
-        auth = f"{user}@" if keep_user and user else ""
-    rest = re.sub(r"(?i)([?&]password=)[^&]*", r"\1***", m.group("rest"))
-    return m.group("scheme") + auth + rest
+_DISPLAY_KEYS = ("sslmode", "connect_timeout", "target_session_attrs")
+
+
+def _display_url(info: Mapping[str, str]) -> str:
+    """postgresql://user@host:port/dbname?sslmode=... from parsed fields only (no password, no other options)."""
+    user = info.get("user", "")
+    host = info.get("host", "")
+    port = info.get("port", "")
+    query = "&".join(f"{k}={info[k]}" for k in _DISPLAY_KEYS if k in info)
+    return (f"postgresql://{user + '@' if user else ''}{host}{':' + port if port else ''}/{info.get('dbname', '')}"
+            + (f"?{query}" if query else ""))
+
+
+def _valid_api_url(url: str) -> bool:
+    """Checked with both parsers the client uses, so a URL accepted here is one httpx can request."""
+    try:
+        u = urlsplit(url)
+        port = u.port  # raises on a non-numeric or out-of-range port
+        httpx.URL(url)
+    except (ValueError, httpx.InvalidURL):
+        return False
+    if port == 0:
+        return False
+    return u.scheme in ("http", "https") and bool(u.hostname) and not (u.username or u.password or u.query
+                                                                       or u.fragment)
 
 
 def _listen(name: str, raw: str, problems: list[str]) -> Listen:

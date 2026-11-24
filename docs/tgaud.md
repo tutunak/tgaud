@@ -63,7 +63,7 @@ Three threads, each with its own connection (the contract's budget is 4 with the
 
 | Thread | Runs | Connection |
 |---|---|---|
-| ingest | `tgaud.jobs.ingest.startup(ctx, conn)` once, then `run(ctx, conn)`: the long poll | holds the service lock; never reopened: losing it ends the process (exit 1) |
+| ingest | `tgaud.jobs.ingest.identify(ctx, conn)` and `startup(ctx, conn)` once, then `run(ctx, conn)`: the long poll | holds the service lock; never reopened: losing it ends the process (exit 1) |
 | worker | `Scheduler` over `reconciler`, `prober`, `sampler` | reopened with backoff after a loss |
 | batch | `Scheduler` over `chat_day`, `audience`, `partitions` | same |
 
@@ -77,8 +77,11 @@ other jobs. `JobContext` carries `config`, `api` (a `BotApi`), `health`, `stop` 
 `clock`, `fence(conn)` and `fatal(code, reason)`.
 
 **One serve, fenced by a generation.** `serve` takes `SERVE_LOCK` (a session advisory lock) on its ingest
-connection; a second serve exits 2 at once. Then it increments `tg.bot_state.serve_generation`
-(`SELECT ... FOR UPDATE`) and remembers the value. Every job transaction (ingest's per update, every scheduler
+connection; a second serve exits 2 at once. Then `ingest.identify(ctx, conn)` runs the identity guards (bot id
+from getMe and the link key fingerprint against `tg.bot_state`; on the first start it records both); a
+mismatch raises `StartupError` (exit 2) with nothing written, not even the generation. Only then does serve
+increment `tg.bot_state.serve_generation` (`SELECT ... FOR UPDATE`), remember the value, and call
+`ingest.startup(ctx, conn)` for the other startup writes. Every job transaction (ingest's per update, every scheduler
 step, the metric cache) starts with `ctx.fence(conn)` = `SELECT serve_generation FROM tg.bot_state FOR KEY
 SHARE`; when the value is not the process's own it raises `StaleGeneration` and the process exits 1. A
 takeover's `FOR UPDATE` waits for in-flight job transactions, and after it an old process can commit nothing.
@@ -87,13 +90,14 @@ A step that commits more than once calls `ctx.fence(conn)` again first thing in 
 first") and bumps the generation too.
 
 **Health.** `/health` is 200 only while the last successful getUpdates and the last successful ingest commit
-are both younger than 180 s; ingest marks them with `ctx.health.mark_poll_ok()` and `ctx.health.mark_commit()`
+are both younger than 180 s, measured on a monotonic clock (a wall-clock step changes nothing); ingest marks them with `ctx.health.mark_poll_ok()` and `ctx.health.mark_commit()`
 (an empty poll's commit counts). No other job can make the service healthy. The body always ends with
 `activation=<TGAUD_ACTIVATION_ID>`.
 
 **Shutdown.** The SIGTERM handler only sets a flag; the C-level handler also writes to a wakeup pipe, so the
-supervisor thread (started first in `tgaud serve`, before config, schema check and startup) notices within
-100 ms even when the main thread is blocked. It sets `ctx.stop`, cancels in-flight SQL and closes the Bot API
+supervisor thread (started first in `tgaud serve`, before argument parsing, config, schema check and startup)
+notices within 100 ms even when the main thread is blocked. The supervisor never logs or flushes on its own
+thread, so a stalled log sink (a full stderr pipe) cannot hold it from the deadline. It sets `ctx.stop`, cancels in-flight SQL and closes the Bot API
 client (each in a daemon thread), and calls `os._exit(1)` if the process still runs 9 s after the signal.
 Long polls use `timeout=8`. Correctness never depends on a graceful stop: every unit of work is a transaction.
 
@@ -105,7 +109,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 | Task | Edits |
 |---|---|
 | history | `tgaud/history.py`: `rebuild_pairs` behind the documented signature; migration 003 if it needs one |
-| ingest | `tgaud/jobs/ingest.py` (`startup`, `run`); its fix of `tg.move_chat_history` in 001 (must set `chat_alias.moved_at = now()`, see below); migration 007 |
+| ingest | `tgaud/jobs/ingest.py` (`identify`, `startup`, `run`; the core stub already has the two identity guards in `identify`); its fix of `tg.move_chat_history` in 001 (must set `chat_alias.moved_at = now()`, see below); migration 007 |
 | reconcile | `tgaud/jobs/reconciler.py`; migration 004 |
 | probe-sample | `tgaud/jobs/prober.py`, `tgaud/jobs/sampler.py` (and the metric cache); migration 005 |
 | rollups | `tgaud/jobs/chat_day.py`, `audience.py`, `partitions.py` (R1, R2 in Python, R4); migration 006 |
@@ -117,8 +121,10 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 
 - Files `src/tgaud/sql/migrations/NNN_name.sql`, applied in order by `tgaud migrate` as the tenant, each in one
   transaction together with its row in `public.tgaud_migration(version, name, sha256, applied_at)`, under an
-  advisory lock. The runner owns the transaction: a top-level `BEGIN; ... COMMIT;` around the whole file (as in
-  001) is removed; any other transaction control, psql meta command or psql variable is refused.
+  advisory lock. The runner owns the transaction: an exact top-level `BEGIN;` first and `COMMIT;` last (as in
+  001) are removed; any other transaction control (`PREPARE TRANSACTION`, `COMMIT PREPARED`, `END`,
+  `ROLLBACK`, a `BEGIN` with options, ...), psql meta command or psql variable is refused, and the ledger row
+  is written only while the runner's transaction is still open.
 - A recorded migration whose file changed is refused before anything is applied. Never edit a released
   migration; add a new one. (Nothing is released yet, so tasks of this run still change 001 objects their
   brief names, in place.)
@@ -173,5 +179,7 @@ psql does (`\gset`, `\if`), which the rollups task can compare its Python port a
   (which does not set it) stores NULL until the ingest task's fix of that function sets `moved_at = now()`.
 - **An empty scope** (`scope_ids` NULL because no chat is tracked) becomes `{}` in the loader, so a report
   on a fresh database returns no rows instead of failing.
+- **`--selfcheck` fills dummies only for unset variables**: an explicitly empty value (say `TGAUD_BOT_TOKEN=`)
+  is validated as `serve` would and fails the check.
 - **`tgaud_job_failures_total{job}`** is added to the metrics of design.md 9 (the scheduler counts failing
   steps).

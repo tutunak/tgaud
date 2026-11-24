@@ -50,3 +50,10 @@ def test_selfcheck_fails_on_a_broken_sql_file(tmp_path, file, breakage):
         f.write(breakage)
     with pytest.raises(Exception):
         selfcheck.run(env={}, root=root)
+
+
+@pytest.mark.parametrize("env", [{"TGAUD_BOT_TOKEN": ""}, {"TGAUD_BOT_API_URL": "http://127.0.0.1:abc"},
+                                 {"TGAUD_DATABASE_URL": ""}, {"TGAUD_LINK_HMAC_KEY": " "}])
+def test_selfcheck_checks_explicit_values_even_when_empty(env):
+    with pytest.raises(Exception, match="TGAUD_"):
+        selfcheck.run(env=env)

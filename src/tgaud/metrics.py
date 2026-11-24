@@ -133,26 +133,30 @@ DESIGN_METRICS: tuple[tuple[str, str], ...] = (
 
 
 class Health:
-    """The two ingest timestamps behind /health. Thread-safe enough: float assignments are atomic."""
+    """The two ingest timestamps behind /health. Ages are measured on a monotonic clock, so a wall-clock
+    correction can neither hide a stall nor fake one; the Prometheus gauge keeps Unix time. Float assignments
+    are atomic, so no lock."""
 
-    def __init__(self, window: float = 180.0, activation_id: str = "", clock: Callable[[], float] = time.time):
+    def __init__(self, window: float = 180.0, activation_id: str = "",
+                 clock: Callable[[], float] = time.monotonic, wall: Callable[[], float] = time.time):
         self.window = window
         self.activation_id = activation_id
         self.clock = clock
-        self.poll_ok_at: float | None = None
+        self.wall = wall
+        self.poll_ok_at: float | None = None  # clock() values
         self.ingest_commit_at: float | None = None
 
-    def mark_poll_ok(self, at: float | None = None) -> None:
+    def mark_poll_ok(self) -> None:
         """Ingest: a getUpdates returned without error (empty or not)."""
-        self.poll_ok_at = self.clock() if at is None else at
-        POLL_LAST_SUCCESS.set(self.poll_ok_at)
+        self.poll_ok_at = self.clock()
+        POLL_LAST_SUCCESS.set(self.wall())
 
-    def mark_commit(self, at: float | None = None) -> None:
+    def mark_commit(self) -> None:
         """Ingest: an update's transaction committed, or an empty poll's result was recorded successfully."""
-        self.ingest_commit_at = self.clock() if at is None else at
+        self.ingest_commit_at = self.clock()
 
-    def check(self, now: float | None = None) -> tuple[int, str]:
-        now = self.clock() if now is None else now
+    def check(self) -> tuple[int, str]:
+        now = self.clock()
         problems: list[str] = []
         for what, at in (("getUpdates", self.poll_ok_at), ("ingest commit", self.ingest_commit_at)):
             if at is None:

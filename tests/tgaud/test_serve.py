@@ -202,3 +202,58 @@ def test_the_hard_deadline_ends_a_stuck_process(pg, migrated_dsn, fake, serves, 
     code, took = s.sigterm_and_time()
     assert code == 1 and 8.5 < took < 10, (code, took, s.text())
     assert "exiting now" in s.text()
+
+
+def test_sigterm_with_a_stalled_log_sink_still_exits_within_10s(pg, migrated_dsn, fake, serves, tmp_path):
+    s = start(serves, pg, migrated_dsn, fake, "poll,stalled_log", tmp_path)
+    s.wait_for(lambda: "logging stalls now" in s.text(), what="the stalled log sink")
+    code, took = s.sigterm_and_time()
+    assert took < 10, (code, took, s.text())
+
+
+def bot_row(dsn):
+    with psycopg.connect(dsn, autocommit=True) as c:
+        return c.execute("SELECT bot_id, link_key_fingerprint, serve_generation FROM tg.bot_state").fetchall()
+
+
+def test_identity_guards_record_on_first_start_and_accept_the_same_bot_and_key(pg, migrated_dsn, fake, serves,
+                                                                                tmp_path):
+    from tgaud import config
+
+    first = start(serves, pg, migrated_dsn, fake, "real_ingest", tmp_path)
+    first.wait_for(lambda: "serving as generation 1" in first.text(), what="the first start")
+    assert first.sigterm_and_time()[0] == 0
+    fp = config.load({"TGAUD_LINK_HMAC_KEY": KEY}).link_key_fingerprint()
+    assert bot_row(migrated_dsn) == [(5000, fp, 1)]
+    again = start(serves, pg, migrated_dsn, fake, "real_ingest", tmp_path)
+    again.wait_for(lambda: "serving as generation 2" in again.text(), what="the second start")
+    assert again.sigterm_and_time()[0] == 0
+
+
+@pytest.mark.parametrize("stored", ["other bot", "other key"])
+def test_a_refused_identity_changes_nothing(pg, migrated_dsn, fake, serves, tmp_path, stored):
+    with psycopg.connect(migrated_dsn, autocommit=True) as c:
+        c.execute("INSERT INTO tg.bot_state (bot_id, allowed_updates, link_key_fingerprint, serve_generation) "
+                  "VALUES (%s, '{chat_member}', %s, 7)",
+                  (4999, None) if stored == "other bot" else (5000, "f" * 64))
+    before = bot_row(migrated_dsn)
+    s = start(serves, pg, migrated_dsn, fake, "real_ingest", tmp_path)
+    assert s.proc.wait(30) == 2, s.text()
+    assert "refusing to start" in s.text()
+    assert bot_row(migrated_dsn) == before  # generation still 7, nothing recorded
+
+
+@pytest.mark.parametrize("args,code", [(["--help"], 0), (["--typo"], 2)])
+def test_serve_arguments_are_parsed_before_any_database_work(pg, migrated_dsn, fake, args, code):
+    with psycopg.connect(migrated_dsn, autocommit=True) as c:
+        c.execute("INSERT INTO tg.bot_state (bot_id, allowed_updates, serve_generation) VALUES (5000, '{x}', 3)")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TGAUD_")}
+    env.update(TGAUD_DATABASE_URL=pg.tenant_url(psycopg.conninfo.conninfo_to_dict(migrated_dsn)["dbname"]),
+               TGAUD_DATABASE_PASSWORD=pg.tenant_password, TGAUD_BOT_TOKEN=TOKEN, TGAUD_LINK_HMAC_KEY=KEY,
+               TGAUD_BOT_API_URL=fake.url, TGAUD_METRICS_LISTEN=f"127.0.0.1:{free_port()}")
+    r = subprocess.run([sys.executable, "-c", "import sys; from tgaud.cli import main; sys.exit(main(sys.argv[1:]))",
+                        "serve", *args], env=env, capture_output=True, text=True, timeout=30)
+    assert r.returncode == code, r.stderr
+    assert "usage: tgaud" in r.stdout + r.stderr
+    assert bot_row(migrated_dsn) == [(5000, None, 3)]
+    assert not fake.calls

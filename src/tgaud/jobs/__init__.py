@@ -1,7 +1,8 @@
 """The process model of `tgaud serve` (the brief's "jobs.py"; a package so each job has its own module).
 
-    ingest thread   tgaud.jobs.ingest: startup(ctx, conn) once, then run(ctx, conn), one long-running loop on
-                    the ingest connection (which holds the service lock)
+    ingest thread   tgaud.jobs.ingest: identify(ctx, conn) (identity guards, before the generation is claimed),
+                    startup(ctx, conn) once, then run(ctx, conn), one long-running loop on the ingest
+                    connection (which holds the service lock)
     worker thread   Scheduler over tgaud.jobs.reconciler, .prober, .sampler
     batch thread    Scheduler over tgaud.jobs.chat_day, .audience, .partitions
 
@@ -14,8 +15,9 @@ as the first statement of each further transaction. A failing step is logged, co
 other jobs go on. Steps must be idempotent: a commit whose outcome is unknown after a lost connection is
 retried. Writers of evidence or spells take `tgaud.history.lock_chats` before reading what they rebuild from.
 
-Service ownership (tgaud.db): serve takes SERVE_LOCK on the ingest connection (a second serve exits 2), then
-increments tg.bot_state.serve_generation; a job transaction whose fence sees another value raises
+Service ownership (tgaud.db): serve takes SERVE_LOCK on the ingest connection (a second serve exits 2), runs
+ingest.identify (which writes nothing unless the bot id and link key match), then increments
+tg.bot_state.serve_generation; a job transaction whose fence sees another value raises
 StaleGeneration and the process exits 1, so after a takeover an old process commits nothing.
 
 Shutdown: the SIGTERM/SIGINT handler only sets a flag; the C-level handler also writes to a wakeup pipe, so
@@ -64,8 +66,8 @@ class Job(Protocol):
 
 
 class StartupError(Exception):
-    """Raised by ingest.startup to stop serve before anything starts; `code` is the exit code (2 = identity
-    or configuration mismatch, per the deploy contract)."""
+    """Raised by ingest.identify (or ingest.startup) to stop serve before anything starts; `code` is the exit
+    code (2 = identity or configuration mismatch, per the deploy contract)."""
 
     def __init__(self, message: str, code: int = 2) -> None:
         super().__init__(message)
@@ -271,18 +273,21 @@ class Supervisor:
             if self.stop_started is None and (self.signalled or self.requested is not None):
                 self.stop_started = time.monotonic()
                 why = self.requested[1] if self.requested else "signal"
-                log.info("stopping (%s)", why)
+                # Never log on this thread: a stalled log sink (a full stderr pipe, a held handler lock) must
+                # not keep it from the deadline below.
+                _in_background(lambda why=why: log.info("stopping (%s)", why))
                 with self._actions_lock:
                     actions = list(self._actions)
                 for action in actions:
                     _in_background(action)
             if self.stop_started is not None and time.monotonic() - self.stop_started >= self.deadline:
-                log.error("still running %.0f s after the stop began: exiting now", self.deadline)
-                for h in logging.getLogger().handlers:
-                    try:
-                        h.flush()
-                    except Exception:
-                        pass
+                # Best effort only: the message goes through a daemon thread that may block forever on a
+                # stalled sink; os._exit waits for nothing.
+                note = threading.Thread(target=log.error, name="stop-note", daemon=True,
+                                        args=("still running %.0f s after the stop began: exiting now",
+                                              self.deadline))
+                note.start()
+                note.join(0.05)
                 os._exit(1)
 
 
@@ -364,19 +369,27 @@ def serve(config: Config, supervisor: Supervisor, *, health_window: float | None
             log.error("another tgaud serve runs against this database (or a maintenance command): exiting")
             return 2
         ingest = load_job_module("ingest")
-        generation = db.claim_generation(ingest_conn)
+        if not callable(getattr(ingest, "identify", None)):
+            log.error("tgaud.jobs.ingest must define identify(ctx, conn) (the identity guards)")
+            return 1
         try:
+            # 1. identity guards: nothing is written unless they pass; a refused start changes nothing,
+            #    not even the generation (a running or dying older process keeps its fence)
+            ingest.identify(ctx, ingest_conn)
+            if stop.is_set():
+                return exit_code[0] if exit_code else 0
+            # 2. own the service: from here an older process can commit nothing
+            generation = db.claim_generation(ingest_conn)
+            if generation is None:
+                log.error("ingest.identify left no tg.bot_state row: cannot claim the service")
+                return 1
+            ctx.generation = generation
+            log.info("serving as generation %d", generation)
+            # 3. the other startup writes, fenced like every job transaction
             ingest.startup(ctx, ingest_conn)
         except StartupError as e:
             log.error("%s", e)
             return e.code
-        if generation is None:
-            generation = db.claim_generation(ingest_conn)
-        if generation is None:
-            log.error("ingest startup left no tg.bot_state row: cannot claim the service")
-            return 1
-        ctx.generation = generation
-        log.info("serving as generation %d", generation)
         if stop.is_set():
             return exit_code[0] if exit_code else 0
 

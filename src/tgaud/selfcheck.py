@@ -1,8 +1,9 @@
 """`tgaud --selfcheck`: an offline check of a built image (deploy contract: --network=none, read-only root).
 
-It parses the config from the environment, filling dummy values only for what is absent (the secrets and
-TGAUD_DATABASE_URL), lexes every bundled migration and admin.sql, parses every block of queries.sql, imports
-every module of the package, and prints one line starting `selfcheck ok:`. It never connects anywhere: socket
+It parses the config from the environment, filling dummy values only for unset variables (the secrets and
+TGAUD_DATABASE_URL; an explicitly empty value is validated as serve would), lexes every bundled migration and
+admin.sql, parses every block of queries.sql, imports every module of the package, and prints one line
+starting `selfcheck ok:`. It never connects anywhere: socket
 creation and connects are refused for its duration, so a module that touches the network fails the check.
 """
 
@@ -51,7 +52,8 @@ def run(env: Mapping[str, str] | None = None, root: Traversable | None = None) -
     from tgaud import config, db, sql, sqlscript
 
     env = dict(os.environ if env is None else env)
-    dummies = [k for k, v in DUMMY_ENV.items() if not env.get(k, "").strip()]
+    # Dummies only for unset variables: an explicitly empty value is checked like serve would check it.
+    dummies = [k for k in DUMMY_ENV if k not in env]
     for k in dummies:
         env[k] = DUMMY_ENV[k]
     with _no_network():

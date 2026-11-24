@@ -115,6 +115,12 @@ def test_runner_strips_only_the_outer_transaction():
     "\\set x 1\nCREATE TABLE a (x int);",                     # psql meta command
     "CREATE TABLE a (x int DEFAULT :v);",                     # psql variable
     "CREATE TABLE a (x text DEFAULT 'oops);",                 # unterminated literal
+    "BEGIN;\nCREATE TABLE a (x int);\nPREPARE TRANSACTION 'm';\nCOMMIT;",  # ends the runner's transaction
+    "CREATE TABLE a (x int);\nCOMMIT PREPARED 'm';",
+    "CREATE TABLE a (x int);\nROLLBACK PREPARED 'm';",
+    "BEGIN ISOLATION LEVEL SERIALIZABLE;\nCREATE TABLE a (x int);\nCOMMIT;",  # only an exact BEGIN is removable
+    "BEGIN;\nCREATE TABLE a (x int);\nEND;",                 # only an exact COMMIT closes it
+    "CREATE TABLE a (x int);\nROLLBACK;",
 ])
 def test_runner_refuses_what_it_cannot_own(text):
     with pytest.raises(Exception) as e:
@@ -132,3 +138,27 @@ def test_bundled_001_is_the_design_schema_with_an_origin_line():
     assert rest.startswith("-- schema.sql: PostgreSQL")
     assert "BEGIN;" in rest and rest.rstrip().endswith("COMMIT;")
     assert (design / "design.md").exists()
+
+
+def test_a_statement_that_ends_the_transaction_is_never_recorded(empty_dsn, monkeypatch):
+    """Belt and braces behind the lexer check: if a statement still ended the runner's transaction, the
+    runner refuses to write the ledger row."""
+    from tgaud import sqlscript
+
+    image = db.load_migrations()
+    sneaky = db.Migration(3, "sneaky", "003_sneaky.sql", "s" * 64, "CREATE TABLE public.sneaky (x int);")
+    real = db.Migration.statements
+
+    def statements(self):
+        out = real(self)
+        if self.version == 3:
+            out = out + [sqlscript.Statement("COMMIT", 1, (), ";")]
+        return out
+
+    monkeypatch.setattr(db.Migration, "statements", statements)
+    with psycopg.connect(empty_dsn) as c:
+        with pytest.raises(db.MigrationError, match="ended the runner's transaction"):
+            db.migrate(c, [*image, sneaky])
+        assert [r[0] for r in _ledger(c)] == [1, 2]
+        c.rollback()
+        assert db.schema_status(c, [*image, sneaky]).missing == [3]

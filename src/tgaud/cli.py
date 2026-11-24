@@ -65,12 +65,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    supervisor = None
     if argv[:1] == ["serve"]:
-        # The supervisor first, before any config parsing, schema check or startup (tgaud.jobs).
+        # The supervisor first, before any config parsing, schema check or startup (tgaud.jobs); argparse
+        # still checks the arguments (`serve --help`, a typo) before anything touches the database.
         from tgaud.jobs import Supervisor
 
         supervisor = Supervisor().install()
-        return cmd_serve(supervisor)
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.selfcheck:
@@ -87,7 +88,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "botcheck":
         return cmd_botcheck()
     if args.command == "serve":
-        parser.error("serve takes no arguments")
+        if supervisor is None:  # e.g. `tgaud --some-flag serve`: install it now, still before any I/O
+            from tgaud.jobs import Supervisor
+
+            supervisor = Supervisor().install()
+        return cmd_serve(supervisor)
     config_mod.setup_logging(None)
     try:
         return COMMANDS[args.command].run(args)

@@ -146,3 +146,38 @@ def test_log_redaction(capsys):
         assert secret not in err
     assert err.count("\n") == 2  # one line per record, the traceback folded into its line
     assert logging.getLogger("httpx").level == logging.WARNING
+
+
+def test_percent_encoded_password_key_never_shown():
+    url = f"postgresql://tgaud@h:5432/tgaud?%70assword={PW}&sslmode=disable"
+    env = full_env(TGAUD_DATABASE_URL=url)
+    del env["TGAUD_DATABASE_PASSWORD"]
+    cfg = config.load(env)
+    assert PW not in repr(cfg) and PW not in cfg.database_url
+    assert cfg.database_url == "postgresql://tgaud@h:5432/tgaud?sslmode=disable"
+    assert psycopg.conninfo.conninfo_to_dict(cfg.dsn("x"))["password"] == PW  # still used to connect
+    for bad in (f"postgresql://tgaud@h/tgaud?%70assword={PW}&bogus=1", f"postgresql://u:{PW}@h:x/d",
+                f"postgres://tgaud@h/tgaud?%70assword={PW}&sslmode=nonsense%"):
+        with pytest.raises(config.ConfigError) as e:
+            config.load(full_env(TGAUD_DATABASE_URL=bad))
+        assert PW not in str(e.value) and "TGAUD_DATABASE_URL" in str(e.value)
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:abc", "http://127.0.0.1:0", "http://127.0.0.1:70000",
+                                 "https://h/x#frag", "http://[::1]:x", "https://"])
+def test_bot_api_url_is_fully_validated(url):
+    with pytest.raises(config.ConfigError, match="TGAUD_BOT_API_URL"):
+        config.load(full_env(TGAUD_BOT_API_URL=url))
+
+
+def test_botcheck_with_a_bad_api_url_fails_cleanly(monkeypatch, capsys):
+    from tgaud import cli
+
+    for k in list(config.os.environ):
+        if k.startswith("TGAUD_"):
+            monkeypatch.delenv(k)
+    monkeypatch.setenv("TGAUD_BOT_TOKEN", TOKEN)
+    monkeypatch.setenv("TGAUD_BOT_API_URL", "http://127.0.0.1:abc")
+    assert cli.main(["botcheck"]) == 1
+    err = capsys.readouterr().err
+    assert "TGAUD_BOT_API_URL" in err and "Traceback" not in err and TOKEN not in err

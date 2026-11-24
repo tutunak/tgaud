@@ -84,23 +84,35 @@ class Migration:
     text: str = field(repr=False)
 
     def statements(self) -> list[sqlscript.Statement]:
-        """The file's statements; a top-level BEGIN ... COMMIT around the whole file is removed, because the
-        runner owns the transaction. Any other transaction control, meta command or psql variable is refused."""
+        """The file's statements; an exact top-level `BEGIN;` first and `COMMIT;` last (as in 001) are removed,
+        because the runner owns the transaction. Any other transaction control (PREPARE TRANSACTION, END,
+        ROLLBACK, a BEGIN with options, ...), meta command or psql variable is refused."""
         stmts = [s for s in sqlscript.statements_only(sqlscript.parse(self.text, self.filename), self.filename)]
-        if stmts and _first_word(stmts[0]) in ("BEGIN", "START"):
-            if _first_word(stmts[-1]) not in ("COMMIT", "END") or len(stmts) < 2:
+        if stmts and _is_exact(stmts[0], _WRAPPER_BEGIN):
+            if len(stmts) < 2 or not _is_exact(stmts[-1], _WRAPPER_COMMIT):
                 raise MigrationError(f"{self.filename}:{stmts[0].line}: a top-level BEGIN must be closed by a "
                                      "final COMMIT")
             stmts = stmts[1:-1]
         for s in stmts:
-            if _first_word(s) in _TXN_CONTROL:
+            if _is_txn_control(s):
                 raise MigrationError(f"{self.filename}:{s.line}: transaction control ({s.head}) inside a "
                                      "migration; the runner owns the transaction")
         return stmts
 
 
-def _first_word(s: sqlscript.Statement) -> str:
-    return s.head.split(" ", 1)[0] if s.head else ""
+_WRAPPER_BEGIN = ("BEGIN", "BEGIN WORK", "BEGIN TRANSACTION")
+_WRAPPER_COMMIT = ("COMMIT", "COMMIT WORK", "COMMIT TRANSACTION")
+
+
+def _is_exact(s: sqlscript.Statement, forms: tuple[str, ...]) -> bool:
+    return " ".join(s.code.upper().split()) in forms
+
+
+def _is_txn_control(s: sqlscript.Statement) -> bool:
+    """BEGIN, START, COMMIT (and COMMIT PREPARED), END, ROLLBACK (and ROLLBACK PREPARED / TO), ABORT,
+    PREPARE TRANSACTION."""
+    words = s.head.split(" ")
+    return words[0] in _TXN_CONTROL or words[:2] == ["PREPARE", "TRANSACTION"]
 
 
 def load_migrations(root: Traversable | None = None) -> list[Migration]:
@@ -181,6 +193,11 @@ def migrate(conn: psycopg.Connection, migrations: list[Migration] | None = None,
                         raise MigrationError(f"{m.filename}:{s.line}: {e}".rstrip()) from e
                 if _before_record is not None:
                     _before_record(m)
+                if conn.info.transaction_status != pq.TransactionStatus.INTRANS:
+                    # a statement ended the runner's transaction: the ledger must not record what may be
+                    # half applied, prepared or committed outside it
+                    raise MigrationError(f"{m.filename}: the migration ended the runner's transaction "
+                                         f"(status {conn.info.transaction_status.name}); not recorded")
                 conn.execute("INSERT INTO public.tgaud_migration (version, name, sha256) VALUES (%s, %s, %s)",
                              (m.version, m.name, m.sha256))
                 conn.commit()

@@ -1,4 +1,5 @@
 import re
+import time
 import urllib.error
 import urllib.request
 
@@ -63,7 +64,8 @@ def test_health_200_only_with_both_ingest_timestamps(server):
     server.health.mark_commit()
     status, body = get(server, "/health")
     assert (status, body) == (200, "ok activation=act-42\n")
-    assert metrics.REGISTRY.get_sample_value("tgaud_poll_last_success_timestamp_seconds") == server.health.poll_ok_at
+    gauge = metrics.REGISTRY.get_sample_value("tgaud_poll_last_success_timestamp_seconds")
+    assert abs(gauge - time.time()) < 5  # Unix time for Prometheus; the health ages use a monotonic clock
 
 
 def test_health_turns_503_after_the_window():
@@ -77,3 +79,18 @@ def test_health_turns_503_after_the_window():
     now[0] += 2
     status, body = h.check()
     assert status == 503 and "181 s ago" in body and body.endswith("activation=\n")
+
+
+def test_health_ages_ignore_wall_clock_corrections(monkeypatch):
+    h = metrics.Health(window=0.02, activation_id="a")
+    h.mark_poll_ok()
+    h.mark_commit()
+    assert h.check()[0] == 200
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() - 3600)  # the wall clock steps back an hour
+    time.sleep(0.04)
+    assert h.check()[0] == 503
+    h.mark_poll_ok()
+    h.mark_commit()
+    monkeypatch.setattr(time, "time", lambda: real() + 3600)  # and forward again
+    assert h.check()[0] == 200
