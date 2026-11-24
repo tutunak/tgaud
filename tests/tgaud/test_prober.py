@@ -678,8 +678,8 @@ def test_a_failure_is_cached_until_its_backoff_ends_and_own_answers_rank_nothing
     e.fake.respond("getChatMember", compute)
     p = prober.make(e.ctx)
     ranked = []
-    real = p._rank_outage
-    monkeypatch.setattr(p, "_rank_outage", lambda *a: (ranked.append(a[2]), real(*a)))
+    real = p._read_chat
+    monkeypatch.setattr(p, "_read_chat", lambda *a: (ranked.append(a[2]), real(*a)))
     e.run(p, 10.0)
     assert ranked == [] and [u for _, u in asked(e)][:2] == [200, 199]  # 200 failed: attempt 1, backoff 60 s
     with psycopg.connect(e.dsn) as c:  # someone else's change while the backlog drains
@@ -706,7 +706,7 @@ def test_a_probe_queued_while_the_chat_is_ranked_again_is_caught_by_the_next_hea
     answer(e)
     p = prober.make(e.ctx)
     ranked = []
-    real = p._rank_outage
+    real = p._read_chat
 
     def between(conn, now, chat, expect):
         ranked.append(chat)
@@ -714,7 +714,7 @@ def test_a_probe_queued_while_the_chat_is_ranked_again_is_caught_by_the_next_hea
             with psycopg.connect(e.dsn) as c:
                 c.execute("SELECT tg.queue_probes(%s::bigint[], %s::bigint[], 'outage')", ([CHAT], [400]))
         return real(conn, now, chat, expect)
-    monkeypatch.setattr(p, "_rank_outage", between)
+    monkeypatch.setattr(p, "_read_chat", between)
     e.run(p, 2.0)
     n = len(asked(e))
     with psycopg.connect(e.dsn) as c:
@@ -723,6 +723,185 @@ def test_a_probe_queued_while_the_chat_is_ranked_again_is_caught_by_the_next_hea
     later = [u for _, u in asked(e)[n:]]
     assert later[:2] == [400, 301] and len(set(asked(e))) == len(asked(e))
     assert ranked[:2] == [CHAT, CHAT]  # the second ranking picked up what the first one's expected set did not hold
+
+
+def test_an_outage_set_swapped_with_the_same_count_and_id_sum_is_ranked_again(env):
+    """crossfix review 2: four consecutive probes a < b < c < d, so a + d = b + c. b and c (outage, old spells) are
+    raised to manual, a and d (sample probes of the two newest spells) raised to outage, in one transaction: the
+    outage set keeps its count and id sum. The manual ones go first, then the two promoted newest spells."""
+    e = env
+    for u in range(1, 201):
+        e.w.join(u, at(100 + u))
+    for u, minute in ((401, 1000), (402, 5), (403, 6), (404, 999)):
+        e.w.join(u, at(minute))
+    e.w.rebuild()
+    for u in range(1, 201):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+    ids = [queue(e, 401, "sample"), queue(e, 402, "outage"), queue(e, 403, "outage"), queue(e, 404, "sample")]
+    assert ids[0] + ids[3] == ids[1] + ids[2]
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:
+        c.execute("UPDATE tg.probe SET reason = 'manual' WHERE probe_id = ANY(%s)", ([ids[1], ids[2]],))
+        c.execute("UPDATE tg.probe SET reason = 'outage' WHERE probe_id = ANY(%s)", ([ids[0], ids[3]],))
+    e.run(p, 3.0)
+    assert [u for _, u in asked(e)[n:n + 4]] == [402, 403, 401, 404]
+
+
+def test_a_rebuild_that_makes_a_cached_pairs_spell_the_newest_moves_its_probe_up(env):
+    """crossfix review 2: user 1 has the oldest spell of the 200 cached outage probes; late events (a leave and a rejoin
+    after every other spell started) are ingested and rebuilt, so its newest spell is now the newest of all, with the
+    same probe id. It is the next call."""
+    e = env
+    _outage_backlog(e)
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:  # ingest: the events and the pair's rebuild under the chat's lock
+        history.lock_chats(c, [CHAT])
+        for update_id, (old, new, minute) in enumerate((("member", "left", 950), ("left", "member", 951)), 920001):
+            c.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                      "VALUES (%s, 1, %s, %s, %s, %s)", (CHAT, at(minute), update_id, old, new))
+        history.rebuild_pairs(c, [(CHAT, 1)])
+    e.run(p, 1.0)
+    assert asked(e)[n] == (CHAT, 1)
+
+
+def test_an_outage_retry_left_out_of_the_cache_is_asked_when_it_becomes_eligible(env):
+    """crossfix review 2: 600 newer spells are in a ten-minute backoff (the cache's share of probes in backoff); the
+    next spell, user 601, is in a one-minute backoff that ends 2 s after the full read, so it is left out. Once
+    eligible it is the newest eligible spell: the chat is read again and it is the next call."""
+    e = env
+    w = e.w
+    for u in range(1, 101):
+        w.join(u, at(100 + u))  # ready, older
+    for u in range(1001, 1601):
+        w.join(u, at(u))  # newer, in backoff
+    w.join(601, at(1000))
+    w.rebuild()
+    for u in range(1, 101):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+    waiting = [queue(e, u, "outage", queued=START - timedelta(hours=2)) for u in range(1001, 1601)]
+    w.c.execute("UPDATE tg.probe SET attempts = 2, last_attempt_at = %s WHERE probe_id = ANY(%s)",
+                (START - timedelta(minutes=1), waiting))
+    pid = queue(e, 601, "outage", queued=START - timedelta(hours=2))
+    w.c.execute("UPDATE tg.probe SET attempts = 1, last_attempt_at = %s WHERE probe_id = %s",
+                (START - timedelta(seconds=58), pid))
+    w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 1.5)
+    assert 601 not in [u for _, u in asked(e)]
+    n = len(asked(e))
+    e.clock.set(START + timedelta(seconds=2))  # the end of its backoff
+    e.run(p, 1.0)
+    assert asked(e)[n] == (CHAT, 601)
+
+
+def test_cancelling_a_chats_cached_probes_keeps_its_share(env):
+    """crossfix review 2: chat CHAT has 900 outage probes, so the full read cuts it at 600; another chat waits too.
+    Every pending row of CHAT's cached 600 is cancelled: the chat is read again with a cut of its own, and its 300
+    survivors keep getting their half of the calls."""
+    e = env
+    w = e.w
+    w.add_chat(OTHER)
+    for u in range(1, 901):
+        w.join(u, at(u))
+    w.rebuild()
+    for u in range(1, 901):
+        queue(e, u, "outage", queued=START - timedelta(hours=2))
+    for u in range(2001, 2301):
+        queue(e, u, "conflict", chat=OTHER, queued=START - timedelta(hours=2))
+    w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    n = len(asked(e))
+    with psycopg.connect(e.dsn) as c:  # the reconciler or the CLI cancels the rest of the top 600 (users 301-900)
+        c.execute("UPDATE tg.probe SET outcome = 'cancelled' WHERE chat_id = %s AND user_id > 300 "
+                  "AND outcome = 'pending'", (CHAT,))
+    e.run(p, 15.0)
+    later = asked(e)[n:]
+    mine = [u for c, u in later if c == CHAT]
+    assert len(later) > 60 and 0.3 * len(later) <= len(mine) <= 0.55 * len(later), (len(mine), len(later))
+    assert mine == sorted(mine, reverse=True) and max(mine) <= 300  # the survivors, newest spell first
+
+
+def test_a_straddled_outage_answer_is_asked_again_from_the_next_second(env):
+    """crossfix review 2: a role change of user 200 (the newest spell of the cached 200) commits during its call, dated
+    the second the call returns in; the answer straddles the event and is not stored. The probe goes back into the
+    cache, eligible from the next second (a new call in the event's second would straddle it again), and is asked
+    then, ahead of the older spells (the event's rebuild re-keys it without making it eligible earlier); its second
+    answer is stored."""
+    e = env
+    _outage_backlog(e)
+    pid = e.w.c.execute("SELECT probe_id FROM tg.probe WHERE user_id = 200").fetchone()[0]
+    e.w.c.commit()
+    sent, go = _held(e, "member")
+    p = prober.make(e.ctx)
+    t = _step_in_thread(e, p)
+    assert sent.wait(10)
+    event_second = (START + timedelta(seconds=2)).replace(microsecond=0)  # the call returns at START + 2 s
+    with psycopg.connect(e.dsn) as c:  # ingest: the role change and the pair's rebuild
+        history.lock_chats(c, [CHAT])
+        c.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                  "VALUES (%s, 200, %s, 930001, 'member', 'administrator')", (CHAT, event_second))
+        history.rebuild_pairs(c, [(CHAT, 200)])
+    e.clock.advance(2)
+    go.set()
+    t.join(10)
+    assert not t.errors and probe_row(e, pid)["outcome"] == "pending"
+    answer(e)
+    n = len(asked(e))
+    e.run(p, 3.0)
+    later = [u for _, u in asked(e)[n:]]
+    assert 200 in later[:4] and later.count(200) == 1  # only the calls of the event's second go before it
+    assert probe_row(e, pid)["outcome"] == "in"
+
+
+def test_a_rebuild_committed_across_head_reads_still_moves_its_probe_up(env):
+    """The order of the spell mark: ingest's rebuild of user 1 (late leave and rejoin: its spell becomes the newest of
+    all) takes its spell row ids and holds the chat's lock; another chat's rebuild takes later ids and commits; while
+    the prober asks that chat's manual probes, its head reads mark past both; only then does the first commit. The
+    head reads scan from a mark SPELL_MARGIN old, so they still see it: user 1 is the chat's next call."""
+    e = env
+    e.w.add_chat(OTHER)
+    e.w.join(9999, at(1), chat=OTHER)
+    _outage_backlog(e)
+    e.w.c.commit()
+    answer(e)
+    p = prober.make(e.ctx)
+    e.run(p, 2.0)
+    first = psycopg.connect(e.dsn)
+    try:
+        history.lock_chats(first, [CHAT])
+        first.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                      "VALUES (%s, 1, %s, 940001, 'member', 'left'), (%s, 1, %s, 940002, 'left', 'member')",
+                      (CHAT, at(950), CHAT, at(951)))
+        history.rebuild_pairs(first, [(CHAT, 1)])  # ids taken, not committed
+        with psycopg.connect(e.dsn) as later:  # another chat's rebuild: later ids, committed first
+            history.lock_chats(later, [OTHER])
+            later.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) "
+                          "VALUES (%s, 9999, %s, 940003, 'member', 'left')", (OTHER, at(5)))
+            history.rebuild_pairs(later, [(OTHER, 9999)])
+            for u in range(3001, 3016):  # work of the other chat for the prober meanwhile (manual: first, no share)
+                later.execute("INSERT INTO tg.tg_user (user_id, first_seen_at, last_seen_at) VALUES (%s, now(), now()) "
+                              "ON CONFLICT DO NOTHING", (u,))
+                later.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, %s, 'manual')", (OTHER, u))
+        n = len(asked(e))
+        e.run(p, 1.5)  # several steps, each with a head read that marks past the later ids
+        assert all(c == OTHER for c, _ in asked(e)[n:]) and len(asked(e)) - n >= 3
+        first.commit()
+    finally:
+        first.close()
+    n = len(asked(e))
+    e.run(p, 4.0)
+    assert [u for c, u in asked(e)[n:] if c == CHAT][0] == 1
 
 
 def test_a_conflict_of_another_chat_queued_during_a_backlog_is_asked_next(env):

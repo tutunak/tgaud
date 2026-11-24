@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 import psycopg
 import pytest
 
-from tgaud import config, metrics
+from tgaud import config, history, metrics
 from tgaud.jobs import JobContext, prober, sampler
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
@@ -153,3 +153,39 @@ def test_prober_head_read_ranks_a_g1_batch_by_spell_with_100k_pending(scale_dsn,
     record_property("prober_head_read_after_batch_seconds", steady)
     assert outage[0] == 86399 and len(outage) == prober.PER_CHAT
     assert ranked < 3.0 and steady < 0.2
+
+
+def test_prober_sees_a_swapped_outage_set_and_a_rebuilt_spell_with_100k_pending(scale_dsn, record_property):
+    """crossfix review 2 at scale: (a) four new probes a < b < c < d of the big chat (a + d = b + c); after the full
+    read b and c are raised to manual and a and d (the two newest spells) to outage: count and id sum stay, the head
+    read still ranks the chat again; (b) late events rebuild user 1's spell (the oldest) into the newest of all: the
+    next head read moves its probe to the front."""
+    p = prober.Prober(_ctx(), rate=5)
+    with psycopg.connect(scale_dsn) as c:
+        ids = [c.execute("INSERT INTO tg.probe (chat_id, user_id, reason) VALUES (%s, %s, %s) RETURNING probe_id",
+                         (BIG, u, r)).fetchone()[0]
+               for u, r in ((86399, "sample"), (2, "outage"), (3, "outage"), (172799, "sample"))]
+        assert ids[0] + ids[3] == ids[1] + ids[2]
+        p._read(c, NOW.timestamp())  # noqa: SLF001
+        c.execute("UPDATE tg.probe SET reason = 'manual' WHERE probe_id = ANY(%s)", ([ids[1], ids[2]],))
+        c.execute("UPDATE tg.probe SET reason = 'outage' WHERE probe_id = ANY(%s)", ([ids[0], ids[3]],))
+        t = time.perf_counter()
+        p._read_heads(c, NOW.timestamp() + 1)  # noqa: SLF001
+        swapped = time.perf_counter() - t
+        first = [(x.user_id, x.reason) for x in p.queue if x.chat_id == BIG][:4]
+        c.execute("SELECT tg.ensure_partitions('member_event', 'month', '2026-08-01', '2026-09-01')")
+        c.execute("INSERT INTO tg.member_event (chat_id, user_id, event_at, update_id, old_status, new_status) VALUES "
+                  "(%s, 1, '2026-08-02 00:00+00', 950001, 'member', 'left'), "
+                  "(%s, 1, '2026-08-02 00:00:01+00', 950002, 'left', 'member')", (BIG, BIG))
+        history.rebuild_pairs(c, [(BIG, 1)])
+        t = time.perf_counter()
+        p._read_heads(c, NOW.timestamp() + 2)  # noqa: SLF001
+        respelled = time.perf_counter() - t
+        outage = [x.user_id for x in p.queue if x.chat_id == BIG and x.reason == "outage"]
+        c.rollback()
+    print(f"prober head read, a swapped outage set beside 100 000 pending: {swapped * 1000:.0f} ms (the chat read "
+          f"again); a rebuilt spell: {respelled * 1000:.0f} ms")
+    record_property("prober_head_read_swapped_seconds", swapped)
+    record_property("prober_head_read_respelled_seconds", respelled)
+    assert first == [(2, "manual"), (3, "manual"), (86399, "outage"), (172799, "outage")]
+    assert outage[0] == 1 and swapped < 3.0 and respelled < 0.2

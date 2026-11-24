@@ -292,7 +292,8 @@ _TLS_ENV = {"sslmode": "PGSSLMODE", "sslnegotiation": "PGSSLNEGOTIATION", "sslro
 def _tls_problems(info: Mapping[str, str], env: Mapping[str, str]) -> list[str]:
     """The combinations libpq refuses before it connects, on the effective values: the URL's option, else the
     environment variable (libpq reads it even when empty), else libpq's default (sslnegotiation postgres; sslmode
-    verify-full with sslrootcert=system, else prefer). Names and these fixed values only: never a path."""
+    require when the legacy PGREQUIRESSL starts with 1, else verify-full with sslrootcert=system, else prefer).
+    Names and these fixed values only: never a path."""
     found: dict[str, tuple[str, str]] = {}  # option -> (value, where it came from)
     problems = []
     valid = True
@@ -307,6 +308,8 @@ def _tls_problems(info: Mapping[str, str], env: Mapping[str, str]) -> list[str]:
     if not valid:
         return problems  # an invalid value is reported once (the URL's by the caller), never compared or shown
     rootcert = found.get("sslrootcert", ("", ""))[0]
+    if "sslmode" not in found and env.get("PGREQUIRESSL", "").startswith("1"):
+        found["sslmode"] = ("require", "PGREQUIRESSL")  # libpq's fallback before its defaults
     mode, mode_from = found.get("sslmode", ("verify-full" if rootcert == "system" else "prefer", "the default sslmode"))
     negotiation, negotiation_from = found.get("sslnegotiation", ("postgres", ""))
     if rootcert == "system" and mode != "verify-full":

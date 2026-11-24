@@ -225,7 +225,7 @@ def test_option_verdicts_agree_with_libpq(query, ok):
     assert libpq_refused_option is (not ok), str(e.value)
 
 
-TLS_ENV = ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT")
+TLS_ENV = ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT", "PGREQUIRESSL")
 
 
 @pytest.mark.parametrize("query,env,ok", [
@@ -240,6 +240,12 @@ TLS_ENV = ("PGSSLMODE", "PGSSLNEGOTIATION", "PGSSLROOTCERT")
     ("sslrootcert=system", {"PGSSLMODE": "require"}, False),
     ("sslmode=disable", {"PGSSLMODE": "bogus"}, True),
     ("connect_timeout=5", {"PGSSLMODE": "bogus"}, False),
+    ("sslrootcert=system", {"PGREQUIRESSL": "1"}, False),                 # review round 2: the legacy fallback
+    ("sslnegotiation=direct", {"PGREQUIRESSL": "1"}, True),
+    ("sslnegotiation=direct", {"PGREQUIRESSL": "0"}, False),
+    ("sslnegotiation=direct", {"PGREQUIRESSL": "yes"}, False),            # only a leading 1 counts
+    ("sslrootcert=system", {"PGREQUIRESSL": "1", "PGSSLMODE": "verify-full"}, True),
+    ("sslnegotiation=direct&sslmode=prefer", {"PGREQUIRESSL": "1"}, False),
 ])
 def test_tls_verdicts_on_the_effective_values_agree_with_libpq(query, env, ok, monkeypatch):
     """The TLS options libpq checks against each other: URL option, else environment variable, else libpq's default,
@@ -273,8 +279,11 @@ def test_selfcheck_refuses_the_tls_options_libpq_refuses(monkeypatch):
         selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=disable", "PGSSLNEGOTIATION": "direct"})
     with pytest.raises(config.ConfigError, match="sslrootcert=system .* needs sslmode verify-full, not require"):
         selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=require&sslrootcert=system"})
+    with pytest.raises(config.ConfigError, match=r"needs sslmode verify-full, not require \(PGREQUIRESSL\)"):
+        selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslrootcert=system", "PGREQUIRESSL": "1"})
     selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslmode=verify-full&sslnegotiation=direct"})
     selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslnegotiation=direct&sslrootcert=system"})
+    selfcheck.run(env={"TGAUD_DATABASE_URL": "postgresql://u@h/d?sslnegotiation=direct", "PGREQUIRESSL": "1"})
 
 
 @pytest.mark.parametrize("url", ["http://127.0.0.1:8081?", "http://127.0.0.1:8081#", "http://h/x?", "http://h/#"])
