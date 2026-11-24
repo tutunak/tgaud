@@ -160,7 +160,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   rollback after `migrate` must keep working. `serve` exits 3 when the database lacks one of the image's
   migrations and accepts a newer database with a warning.
 - Numbers: core 002 (every addition more than one task uses), history 003, reconcile 004, probe-sample 005,
-  rollups 006, ingest 007, cli 008, web 009.
+  rollups 006, ingest 007, cli 008, web 009, prober-simplify 010 (`tg.probe.next_attempt_at`, `.spell_from`).
 
 002 (`002_shared.sql`) adds: `tg.bot_state.caught_up_at`, `.link_key_fingerprint`, `.serve_generation`;
 `tg.member_event.actor_is_other` with its BEFORE INSERT trigger (the rebuild and the join route read it, never
