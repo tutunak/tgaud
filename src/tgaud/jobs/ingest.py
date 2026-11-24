@@ -10,9 +10,10 @@ serve calls, in this order, with the service lock held:
                         serve generation, which serve claims only after this returns.
     startup(ctx, conn)  once, after the claim: partitions; allowed_updates (an updates_not_allowed gap when
                         the stored list lacked chat_member, closed by the first poll); the rights check of
-                        every tracked chat except the old group of a migration (getChatMember(chat, bot) ->
-                        bot_status, coverage, not_admin / rights_lost gaps, the chat gauges); queues a getChat
-                        metadata fetch for each. Every transaction starts with ctx.fence(conn).
+                        every tracked chat except the old group of a migration, and of the destination of
+                        every migration still in M2 (getChatMember(chat, bot) -> bot_status, coverage,
+                        not_admin / rights_lost gaps, the chat gauges, M1 when the bot is admin there); queues a
+                        getChat metadata fetch for each. Every transaction starts with ctx.fence(conn).
     run(ctx, conn)      the long-polling loop until ctx.stop is set.
 
 The loop. Before every getUpdates: when tg.bot_state.last_update_at is older than 6 days (or unset), the offset
@@ -36,7 +37,10 @@ the offset), counted as tgaud_ingest_failures_total{stage="parse"}; the loop nev
 database error rolls back and retries the same update with backoff (stage "db") and never advances the
 offset; a lost connection ends ingest (serve exits 1). Any other exception (a program error in a body or a
 rebuild) rolls back and ends ingest, so the restarted service retries the valid update rather than
-acknowledging it without its data.
+acknowledging it without its data. An entry whose update_id can't be read ends its response there: the
+updates before it commit, neither the offset nor caught_up_at passes it, it is counted (stage "parse") and
+the same offset is polled again after a backoff. Values are made storable before anything is written (NUL and
+unpaired surrogates become U+FFFD, NaN and Infinity null).
 
 Bot rights: my_chat_member events and rights checks set the bot's status as of their time. A queued event
 older than the last check (processed after the startup check) is replayed at its own time for coverage and
@@ -67,6 +71,8 @@ from __future__ import annotations
 import copy
 import datetime as dt
 import logging
+import math
+import re
 import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
@@ -114,6 +120,8 @@ SERVICE_KEYS = frozenset((
 ))
 DIGEST_MARK = "hmac-sha256:"
 USER_KEYS = ("from", "user", "creator")  # keys whose object is a person in membership payloads
+MEMBER_KEYS = ("new_chat_member", "old_chat_member")  # a ChatMember: holds the person at `user`
+NAME_KEYS = ("first_name", "last_name", "username")
 
 
 class Malformed(ValueError):
@@ -125,10 +133,18 @@ class Malformed(ValueError):
 # ------------------------------------------------------------------------------------------------------------
 
 
+UNSTORABLE = re.compile("[\x00\ud800-\udfff]")  # NUL and surrogates: PostgreSQL text and jsonb refuse them
+
+
 def _clean(v: Any) -> Any:
-    """The JSON value without NUL characters (PostgreSQL text and jsonb refuse them)."""
+    """The JSON value made storable: in every string (keys included) NUL and unpaired surrogates (a JSON escape
+    like \\ud800 survives decoding) replaced with U+FFFD, and NaN or Infinity (Python's JSON decoder accepts
+    them, jsonb does not) as null. Applied to each update before parsing, so the raw payload is clean before its
+    jsonb write and the text columns too."""
     if isinstance(v, str):
-        return v.replace("\x00", "")
+        return UNSTORABLE.sub("\ufffd", v)
+    if isinstance(v, float) and not math.isfinite(v):
+        return None
     if isinstance(v, dict):
         return {_clean(k): _clean(x) for k, x in v.items()}
     if isinstance(v, list):
@@ -316,6 +332,11 @@ def parse_link(v: Any, bot_id: int) -> Link | None:
                 subscription_price=_opt_int(d.get("subscription_price")))
 
 
+def _identified(raw: Any) -> bool:
+    """An entry of a getUpdates response whose update_id can be read (and stored with its successor)."""
+    return isinstance(raw, dict) and _opt_int(raw.get("update_id"), UPDATE_IDS) is not None
+
+
 def update_type_of(raw: dict) -> str | None:
     keys = [k for k in raw if k != "update_id"]
     return keys[0] if len(keys) == 1 and isinstance(keys[0], str) else None
@@ -381,6 +402,22 @@ def post_kind(msg: dict) -> str:
 
 def _is_user_dict(d: dict) -> bool:
     return isinstance(d.get("id"), int) and "is_bot" in d
+
+
+def _expected_shape(holder: str | None, key: Any, value: Any) -> bool:
+    """Whether a value has the shape redaction reads at its position in a membership payload. A person, a member
+    and invite_link are objects (invite_link may also be the link's text); inside one of them (`holder`) only a
+    member's `user` and a link's `creator` are objects, the rest scalars; a name is a string. Other positions
+    hold anything."""
+    if holder is not None and isinstance(value, (dict, list)):
+        return (holder, key) in (("member", "user"), ("link", "creator")) and isinstance(value, dict)
+    if key in USER_KEYS or key in MEMBER_KEYS:
+        return isinstance(value, dict)
+    if key == "invite_link":
+        return isinstance(value, (dict, str))
+    if key in NAME_KEYS:
+        return isinstance(value, str)
+    return True
 
 
 # ------------------------------------------------------------------------------------------------------------
@@ -554,10 +591,14 @@ class Ingest:
                         dict(last=last_poll, now=now, note=f"allowed_updates was {allowed}: chat_member missing"))
             conn.execute("UPDATE tg.bot_state SET allowed_updates = %s, updated_at = now() WHERE bot_id = %s",
                          (list(ALLOWED_UPDATES), bot_id))
-            # every tracked chat except the old group of a migration: a rights check now, then getChat
+            # every tracked chat except the old group of a migration: a rights check now, then getChat; and the
+            # destination of every migration still in M2, even one an earlier check found the bot not admin in
+            # (its promotion update may have expired during an outage): admin there now means M1
             conn.execute("""UPDATE tg.chat c SET rights_due_at = %(now)s, metadata_due_at = %(now)s
-                            WHERE c.tracked AND NOT EXISTS (SELECT 1 FROM tg.chat_alias a
-                                                            WHERE a.old_chat_id = c.chat_id)""", dict(now=now))
+                            WHERE (c.tracked OR EXISTS (SELECT 1 FROM tg.chat_alias a
+                                                        WHERE a.chat_id = c.chat_id AND a.moved_at IS NULL))
+                              AND NOT EXISTS (SELECT 1 FROM tg.chat_alias a WHERE a.old_chat_id = c.chat_id)""",
+                         dict(now=now))
             self._updates_gap_open = conn.execute(
                 """SELECT EXISTS (SELECT 1 FROM tg.gap WHERE chat_id IS NULL AND reason = 'updates_not_allowed'
                                   AND upper_inf(period))""").fetchone()[0]
@@ -689,7 +730,12 @@ class Ingest:
             if self.ctx.stop.is_set():  # the client was closed by the shutdown
                 return None
             raise
-        self._poll_backoff = self.backoff_base
+        # Telegram sends a response in update_id order: an entry whose update_id can't be read ends it there, so
+        # neither the offset nor caught_up_at passes it, and the next poll (after the backoff) asks again from
+        # the same offset. While Telegram keeps sending it ingest stalls, visibly: evidence may be missing.
+        usable = next((i for i, raw in enumerate(updates) if not _identified(raw)), len(updates))
+        if usable == len(updates):
+            self._poll_backoff = self.backoff_base
         received = self.now()
         self.ctx.health.mark_poll_ok()
         if not updates:
@@ -704,25 +750,32 @@ class Ingest:
                 self.ctx.stop.wait(self.min_empty_poll - elapsed)
             return 0
         done = 0
-        short = len(updates) < LIMIT
-        for i, raw in enumerate(updates):
+        short = len(updates) < LIMIT and usable == len(updates)
+        for i, raw in enumerate(updates[:usable]):
             if self.ctx.stop.is_set():
-                break
+                return done
             last = i == len(updates) - 1
             if self.handle(raw, received, sent if (last and short) else None):
                 done += 1
                 self.ctx.health.mark_commit()
             elif self.ctx.stop.is_set():
-                break
+                return done
+        if usable < len(updates):
+            metrics.INGEST_FAILURES.labels("parse").inc()
+            wait = self._poll_backoff
+            log.error("ingest: entry %d of a getUpdates response has no valid update_id; nothing from it on is "
+                      "acknowledged (offset and caught_up_at stay); polled again in %.0f s", usable, wait)
+            self._poll_backoff = min(self._poll_backoff * 2, MAX_BACKOFF)
+            self.ctx.stop.wait(wait)
         return done
 
     # -- one update --------------------------------------------------------------------------------------
 
     def handle(self, raw: Any, received: dt.datetime, caught_up: dt.datetime | None) -> bool:
         """Process one update in one transaction; True when it committed."""
-        if not isinstance(raw, dict) or _opt_int(raw.get("update_id"), UPDATE_IDS) is None:
+        if not _identified(raw):  # poll_once never passes one: it ends the response there
             metrics.INGEST_FAILURES.labels("parse").inc()
-            log.error("ingest: an update without a valid update_id was skipped")
+            log.error("ingest: an update without a valid update_id was not processed")
             return False
         raw = _clean(raw)
         try:
@@ -895,6 +948,13 @@ class Ingest:
             self._message(fx, p, chat_id, erased, received)
         elif p.type == "channel_post":
             self._channel_post(fx, p, chat_id)
+        if p.type in ("chat_member", "my_chat_member"):
+            # news from the destination of a migration still in M2 (after the body: M1 may have just run): the
+            # bot may be admin there by now with its promotion update lost; a rights check decides M1
+            conn.execute("""UPDATE tg.chat c SET rights_due_at = coalesce(c.rights_due_at, %s)
+                            WHERE c.chat_id = %s AND EXISTS (SELECT 1 FROM tg.chat_alias a
+                                                             WHERE a.chat_id = c.chat_id AND a.moved_at IS NULL)""",
+                         (received, chat_id))
 
     def _pending_aliases(self, chat_id: int) -> list[tuple[int, dt.datetime]]:
         """Migrations into this chat whose history waits for M1 (old chat id, migrated_at)."""
@@ -1300,7 +1360,8 @@ class Ingest:
     def redact(self, inner: dict, erased: set[int] = frozenset()) -> dict:  # type: ignore[assignment]
         """The payload as stored in tg.raw_update: no bio or user_chat_id anywhere, a full invite link (one
         this bot made, or any link Telegram did not mask) replaced by its digest marker, erased people replaced,
-        names and usernames of people dropped when store_names is off."""
+        names and usernames of people dropped when store_names is off, and a value of another shape at a
+        sensitive position (a person, a member, invite_link, a name) dropped."""
         bot_id = self._bot_id()
         digest = self.ctx.config.link_digest
 
@@ -1314,11 +1375,17 @@ class Ingest:
             uid = v.get("id")
             if person and isinstance(uid, int) and uid in erased:
                 return {"erased": True}
+            holder = "person" if person else "member" if key in MEMBER_KEYS else "link" if key == "invite_link" \
+                else None
             out: dict[str, Any] = {}
             for k, x in v.items():
                 if k in ("bio", "user_chat_id"):
                     continue
-                if not self.store_names and person and k in ("first_name", "last_name", "username"):
+                if not self.store_names and person and k in NAME_KEYS:
+                    continue
+                if not _expected_shape(holder, k, x):
+                    # a sensitive position holding something else (an array, a scalar): dropped, not walked,
+                    # so redaction never depends on the container shape
                     continue
                 if k == "invite_link" and isinstance(x, str):
                     # a link's text, in a ChatInviteLink or (malformed) directly in the update: only a link

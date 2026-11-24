@@ -1230,3 +1230,153 @@ def test_move_chat_history_marks_utc_days_whatever_the_session_time_zone(migrate
         assert conn.execute("SELECT from_day FROM tg.rollup_dirty WHERE chat_id = %s", (new,)).fetchone()[0] == (
             dt.date(2026, 11, 10))
         conn.rollback()
+
+
+# ------------------------------------------------------------------------------------------------------------
+# review round 3 regressions
+# ------------------------------------------------------------------------------------------------------------
+
+
+def test_an_unreadable_update_id_ends_the_response_there_and_is_polled_again(h):
+    tracked_channel(h)
+    caught_up = h.one("SELECT caught_up_at FROM tg.bot_state")
+    failures = sample("tgaud_ingest_failures_total", stage="parse")
+    unreadable = chat_member(11, 43, T0)
+    unreadable["update_id"] = "eleven"
+    h.clock.advance(minutes=1)
+    # one short response: a join, the unreadable entry, a valid join after it
+    assert h.poll(chat_member(10, 42, T0), unreadable, chat_member(12, 44, T0)) == 1
+    assert h.q("SELECT update_id FROM tg.member_event") == [(10,)]
+    assert h.one("SELECT next_offset, caught_up_at FROM tg.bot_state") == (11, caught_up)
+    assert h.q("SELECT count(*) FROM tg.update_receipt WHERE update_id > 10") == [(0,)]
+    assert sample("tgaud_ingest_failures_total", stage="parse") == failures + 1
+    # Telegram sends it again from the same offset: still nothing past it
+    h.clock.advance(minutes=1)
+    assert h.poll(unreadable, chat_member(12, 44, T0)) == 0
+    assert h.fake.calls_of("getUpdates")[-1].params["offset"] == 11
+    assert h.one("SELECT next_offset, caught_up_at FROM tg.bot_state") == (11, caught_up)
+    assert sample("tgaud_ingest_failures_total", stage="parse") == failures + 2
+    # once the response reads, it commits and the watermark moves
+    h.clock.advance(minutes=1)
+    sent = h.clock.now
+    assert h.poll(chat_member(12, 44, T0)) == 1
+    assert h.one("SELECT next_offset, caught_up_at FROM tg.bot_state") == (13, sent)
+    assert h.q("SELECT update_id FROM tg.member_event ORDER BY 1") == [(10,), (12,)]
+
+
+def without_is_bot(uid: int) -> dict:
+    u = user(uid)
+    del u["is_bot"]
+    return u
+
+
+def test_unexpected_shapes_at_sensitive_positions_are_dropped_from_malformed_payloads(make):
+    h = make(store_names=False).start()
+    tracked_channel(h)
+    link_in_array = chat_member(10, 42, T0, link=[bot_link()])
+    from_in_array = chat_member(11, 43, T0, actor=ADMIN)
+    from_in_array["chat_member"]["from"] = [without_is_bot(ADMIN)]
+    from_scalar = join_request(12, 44, T0)
+    from_scalar["chat_join_request"]["from"] = "Name44 Surname44"
+    user_in_array = chat_member(13, 45, T0)
+    user_in_array["chat_member"]["new_chat_member"]["user"] = [without_is_bot(45)]
+    text_in_array = chat_member(14, 46, T0, link=dict(bot_link(), invite_link=[BOT_LINK]))
+    # containers nested inside a link or a member, which hold only scalars besides `creator` and `user`
+    text_in_object = chat_member(15, 47, T0, link=dict(bot_link(), invite_link={"url": BOT_LINK}))
+    person_in_member = chat_member(16, 48, T0, "left", "banned", new_kw={"extra": [without_is_bot(49)]})
+    h.poll(link_in_array, from_in_array, from_scalar, user_in_array, text_in_array, text_in_object,
+           person_in_member, chat_member(17, 50, T0))
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        *((u, "malformed") for u in range(10, 17)), (17, "chat_member")]
+    raw = dict(h.q("SELECT update_id, payload FROM tg.raw_update WHERE update_id BETWEEN 10 AND 16"))
+    assert set(raw) == set(range(10, 17))
+    assert "invite_link" not in raw[10] and "from" not in raw[11] and "from" not in raw[12]
+    assert "user" not in raw[13]["new_chat_member"] and "invite_link" not in raw[14]["invite_link"]
+    assert "invite_link" not in raw[15]["invite_link"] and "extra" not in raw[16]["new_chat_member"]
+    tables = h.q("""SELECT n.nspname || '.' || c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname IN ('tg', 'stats') AND c.relkind IN ('r', 'p', 'm') AND NOT c.relispartition
+                      AND (c.relkind <> 'm' OR c.relispopulated)""")
+    secrets = [BOT_LINK, "BOTLINKfulltoken", "Name9001", "Surname9001", "handle9001", "Name44", "Name45",
+               "Surname45", "handle45", "Name49", "handle49"]
+    found = []
+    for (table,) in tables:
+        for (row,) in h.q(f"SELECT t::text FROM {table} t"):
+            found += [(table, s) for s in secrets if s in row]
+    assert found == []
+    assert h.q("SELECT update_id FROM tg.member_event") == [(17,)]
+
+
+def surrogate_and_nul(bad: dict) -> None:
+    bad["chat_member"]["new_chat_member"]["status"] = "banned"
+    bad["chat_member"]["new_chat_member"]["custom_title"] = "x\ud800y\x00z"  # sent as the escapes \ud800, \u0000
+    bad["chat_member"]["\udc00"] = True
+
+
+def nan_and_infinity(bad: dict) -> None:
+    bad["chat_member"]["date"] = float("inf")  # json.dumps sends Infinity and NaN, as json.loads reads them
+    bad["chat_member"]["new_chat_member"]["until_date"] = float("nan")
+
+
+@pytest.mark.parametrize("spoil", [surrogate_and_nul, nan_and_infinity])
+def test_values_postgresql_cannot_store_in_a_malformed_update_commit_once(h, spoil):
+    tracked_channel(h)
+    bad = chat_member(10, 42, T0)
+    spoil(bad)
+    db_failures = sample("tgaud_ingest_failures_total", stage="db")
+    attempts = []
+
+    def fail_once(update_id):  # a genuine database failure in the malformed path still rolls back and retries
+        if update_id == 10 and not attempts:
+            attempts.append(1)
+            h.conn.execute("SELECT 1/0")
+
+    h.ing.before_commit = fail_once
+    guard = threading.Timer(15, h.ctx.stop.set)  # a wedge ends the poll (and fails the test) instead of hanging
+    guard.start()
+    try:
+        assert h.poll(bad, chat_member(11, 43, T0)) == 2
+    finally:
+        guard.cancel()
+    assert sample("tgaud_ingest_failures_total", stage="db") == db_failures + 1
+    assert h.q("SELECT update_id, update_type FROM tg.update_receipt WHERE update_id >= 10 ORDER BY 1") == [
+        (10, "malformed"), (11, "chat_member")]
+    payload = h.one("SELECT payload FROM tg.raw_update WHERE update_id = 10")
+    if spoil is surrogate_and_nul:
+        assert payload["new_chat_member"]["custom_title"] == "x\ufffdy\ufffdz" and payload["\ufffd"] is True
+    else:
+        assert payload["date"] is None and payload["new_chat_member"]["until_date"] is None
+    assert h.q("SELECT update_id FROM tg.member_event") == [(11,)]
+    assert h.one("SELECT next_offset FROM tg.bot_state") == 12
+
+
+@pytest.mark.parametrize("trigger", ["restart", "chat_member", "my_chat_member"])
+def test_an_m2_destination_once_checked_as_not_admin_is_checked_again(make, trigger):
+    h = make().start()
+    tracked_channel(h, upd=1, chat=BASIC, at=T0 - dt.timedelta(hours=5))
+    h.poll(chat_member(2, 42, T0 - dt.timedelta(hours=4), chat=BASIC))
+    h.poll(migrate_to(3, T0 - dt.timedelta(hours=2)))
+    h.fake.ok("getChatMember", member(BOT_ID, "member"))
+    assert h.ing.refresh_rights() == 1  # the destination's check: the bot is not admin there yet
+    checked = h.clock.now
+    assert h.one("SELECT tracked, bot_status, rights_due_at FROM tg.chat WHERE chat_id = %s", NEW_SG["id"]) == (
+        False, "member", None)
+    # the bot is promoted there and that update is lost; a check now finds it admin
+    h.fake.respond("getChatMember", lambda params: member(BOT_ID, "administrator", **admin_rights()))
+    if trigger == "restart":
+        h.clock.advance(hours=26)  # the outage the promotion update expired in
+        h.restart()
+        assert BASIC["id"] not in [c.params["chat_id"] for c in h.fake.calls_of("getChatMember")]
+    else:
+        h.clock.advance(minutes=10)
+        news = (chat_member(4, 43, h.clock.now - dt.timedelta(minutes=1), chat=NEW_SG) if trigger == "chat_member"
+                # queued from before the first check, so it says nothing about now
+                else my_chat_member(4, checked - dt.timedelta(minutes=1), "member", "left", chat=NEW_SG))
+        h.poll(news)
+        assert h.one("SELECT moved_at FROM tg.chat_alias") is None
+        assert h.ing.refresh_rights() == 1
+    assert h.one("SELECT moved_at IS NOT NULL FROM tg.chat_alias") is True
+    assert h.one("SELECT tracked FROM tg.chat WHERE chat_id = %s", NEW_SG["id"]) is True
+    assert h.one("SELECT chat_id, source_chat_id FROM tg.member_event WHERE update_id = 2") == (
+        NEW_SG["id"], BASIC["id"])
+    assert h.q("SELECT count(*) FROM tg.member_event WHERE chat_id = %s", BASIC["id"]) == [(0,)]
+    assert h.ing.refresh_rights() == 0  # nothing left due: M1 ran once
