@@ -81,25 +81,23 @@ class _Server(ThreadingMixIn, WSGIServer):
         log.debug("web http: a connection failed", exc_info=True)
 
 
-class _DeadlineReader:
-    """The request's reads, each with the time left until one deadline for the whole request."""
+class _DeadlineSocket(io.RawIOBase):
+    """The connection's reads, each socket read armed with the time left until one deadline for the whole request,
+    under the buffered reader: a line or a body trickled in many chunks still ends at the deadline."""
 
-    def __init__(self, raw: Any, sock: Any, deadline: float) -> None:
-        self.raw, self.sock, self.deadline = raw, sock, deadline
+    def __init__(self, sock: Any, deadline: float) -> None:
+        super().__init__()
+        self.sock, self.deadline = sock, deadline
 
-    def _arm(self) -> None:
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, buffer: Any) -> int:
         left = self.deadline - time.monotonic()
         if left <= 0:
             raise TimeoutError("the request was not sent in time")
         self.sock.settimeout(left)
-
-    def readline(self, size: int = -1) -> bytes:
-        self._arm()
-        return self.raw.readline(size)
-
-    def read(self, size: int = -1) -> bytes:
-        self._arm()
-        return self.raw.read(size)
+        return self.sock.recv_into(buffer)
 
 
 class _Handler(WSGIRequestHandler):
@@ -111,7 +109,8 @@ class _Handler(WSGIRequestHandler):
     read_deadline = READ_DEADLINE
 
     def handle(self) -> None:
-        self.rfile = _DeadlineReader(self.rfile, self.connection, time.monotonic() + self.read_deadline)
+        self.rfile.close()  # setup()'s reader, unused: nothing was read through it yet
+        self.rfile = io.BufferedReader(_DeadlineSocket(self.connection, time.monotonic() + self.read_deadline))
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if not self.raw_requestline:

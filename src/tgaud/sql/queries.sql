@@ -439,7 +439,7 @@ CROSS JOIN LATERAL (SELECT
     tg.state_at(m.known_from, m.left_after, m.left_before, m.end_source, m.suspect_since, m.joined_at + interval '30 days') AS s30) x
 WHERE m.joined_at >= :'since_ts' AND m.joined_at < :'as_of_ts' AND m.chat_id = ANY (:'scope_ids'::bigint[])
 GROUP BY m.chat_id, m.join_route, m.invite_link_id, l.name, l.masked_link, l.made_by_bot, g.campaign_id, g.name
-ORDER BY m.chat_id, joins DESC, m.join_route, m.invite_link_id;
+ORDER BY m.chat_id, joins DESC, m.join_route, m.invite_link_id, g.campaign_id;
 \endif
 
 ------------------------------------------------------------------------------------------------------------
@@ -730,7 +730,7 @@ SELECT p.chat_id, p.message_id, p.posted_at, p.kind,
                                                   :'as_of_ts'::timestamptz))) AS flags
 FROM tg.post p JOIN tg.chat c ON c.chat_id = p.chat_id AND c.tracked AND c.chat_type = 'channel'
 WHERE p.posted_at >= :'since_ts' AND p.posted_at < :'as_of_ts' AND p.chat_id = ANY (:'scope_ids'::bigint[])
-ORDER BY p.chat_id, p.posted_at;
+ORDER BY p.chat_id, p.posted_at, p.message_id;
 \endif
 
 ------------------------------------------------------------------------------------------------------------
@@ -776,7 +776,7 @@ JOIN tg.tg_user u ON u.user_id = m.user_id AND NOT u.is_bot AND u.is_deleted IS 
 WHERE m.chat_id = :chat
   AND (m.stay @> :'day_ts'::timestamptz
        OR (m.start_source = 'snapshot' AND m.known_from > :'day_ts'::timestamptz AND m.joined_hint <= :'day_ts'::timestamptz))
-ORDER BY state, m.user_id;
+ORDER BY state, m.user_id, m.known_from, m.membership_id;
 \endif
 
 SELECT :'only' IN ('all', '16', '16c') AS run \gset

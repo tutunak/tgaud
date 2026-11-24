@@ -864,3 +864,140 @@ def test_connections_are_bounded_and_an_idle_one_is_dropped_at_the_deadline(list
     finally:
         web_pkg._Server.max_handlers = web_pkg.MAX_HANDLERS
         web_pkg._Handler.read_deadline = web_pkg.READ_DEADLINE
+
+
+# ------------------------------------------------------------------------------------------------------
+# Review round 2
+# ------------------------------------------------------------------------------------------------------
+
+
+def test_pager_links_keep_only_the_reports_inputs(web, monkeypatch):
+    monkeypatch.setattr(pages, "REPORT_PAGE", 3)
+    page = ok(web.get("/reports/asof", chat=str(B), date="2026-11-07", mode="list", as_of=NOW_ARG, q="1001",
+                      user="@user1001", among=str(A)))
+    links = [u for u in urls(page) if "offset=" in u]
+    assert links
+    for u in links:
+        query = dict(parse_qsl(u.partition("?")[2]))
+        assert set(query) <= {"chat", "date", "mode", "among", "as_of", "offset"}, u
+        assert "1001" not in u.replace(str(B), "").replace(str(A), "")
+    page = ok(web.get("/reports/sources", chat=str(A), since="2026-08-01", as_of=NOW_ARG, q="1001"))
+    links = [u for u in urls(page) if "offset=" in u]
+    assert links and all(set(dict(parse_qsl(u.partition("?")[2]))) <= {"chat", "since", "as_of", "offset"} for u in links)
+
+
+PAGED = [(s.block, {"scope": AD, "since": "2026-08-01", "burst_users": 2} | ({"raid_min_joins": 5} if s.block == "13" else {}))
+         for s in pages.reports.PLAIN if s.block not in ("13",)] + [
+    ("13", {"raid_min_joins": 5}), ("16a", {"chat": A, "day": "2026-11-07"}), ("16b", {"chat": B, "day": "2026-11-07"}),
+    ("16b", {"chat": A, "day": "2026-11-07"}), ("16c", {"scope": AD, "day": "2026-11-07"}),
+    ("16d", {"scope": AD, "day": "2026-11-07"})]
+
+
+@pytest.mark.parametrize("block,params", PAGED, ids=[f"{b}-{i}" for i, (b, _) in enumerate(PAGED)])
+def test_pages_of_every_paged_block_are_its_unpaged_rows(web, block, params):
+    params = {k: v for k, v in params.items() if k in sql.load().defaults}
+    with web.app.db.read() as conn:
+        whole = sql.run(conn, block, as_of=NOW_ARG, **params).rows
+        pieces, offset = [], 0
+        while True:
+            page = sql.run_page(conn, block, offset=offset, limit=2, as_of=NOW_ARG, **params).rows
+            pieces += page
+            if len(page) < 2:
+                break
+            offset += 2
+    assert pieces == whole
+
+
+def test_posts_in_the_same_second_page_without_loss(fresh_web, monkeypatch):
+    web = fresh_web
+    monkeypatch.setattr(pages, "REPORT_PAGE", 2)
+    with psycopg.connect(web.dsn) as c:  # 9 posts of channel D, 3 in each second: ties at the page boundaries
+        for n in range(9):
+            c.execute("INSERT INTO tg.post (chat_id, message_id, posted_at, kind) VALUES (%s, %s, %s, 'text')",
+                      (D, 9000 - n, ts(f"2026-11-1{n // 3}T10:00:00")))
+        c.commit()
+    with web.db.read() as conn:
+        whole = sql.run(conn, "15", as_of=NOW_ARG, scope=[D], since="2026-08-01")
+    ids = [str(r[whole.columns.index("message_id")]) for r in whole.rows]
+    assert len(ids) == len(set(ids)) >= 9
+    page = ok(web.get("/reports/post-leaves", chat=str(D), since="2026-08-01", as_of=NOW_ARG))
+    got = []
+    while True:
+        got += [r["message_id"] for r in page.table_with("message_id")]
+        nxt = [u for u in urls(page) if f"offset={len(got)}" in u]
+        if not nxt:
+            break
+        page = ok(follow(web, nxt[0]))
+    assert got == ids
+
+
+def test_the_latest_publication_is_the_highest_run_even_when_the_clock_stepped_back(fresh_web):
+    web = fresh_web
+    link = pair_link(ok(web.get("/overlap", chat=[str(A), str(B)])), A, B)
+    with psycopg.connect(web.dsn) as c:
+        c.execute("UPDATE stats.rollup_run SET finished_at = now() + interval '1 day' WHERE rollup_run_id = %s",
+                  (int(link["gen"]),))  # the old run "finished" later than the next one will
+        b = Builder(c)
+        b.stay(A, 8803, ts("2026-11-20T10:00:00"), update_id=880500)
+        b.stay(B, 8803, ts("2026-11-20T10:05:00"), update_id=880600)
+        c.commit()
+        audience.refresh(c, NOW)
+    stale = web.get("/overlap/pair", **link)
+    assert stale.status == 409 and "8803" not in stale.text
+    fresh = pair_link(ok(web.get("/overlap", chat=[str(A), str(B)])), A, B)
+    assert int(fresh["gen"]) > int(link["gen"])
+    assert "in both <b>5</b>" in ok(web.get("/overlap/pair", **fresh)).text
+
+
+def trickle(port: int, head: bytes, chunks: list[bytes], every: float, limit: float) -> tuple[float | None, bytes]:
+    """Send `head`, then a chunk every `every` seconds; returns when the server closed the connection (seconds
+    after the start, None if it stayed open for `limit` s) and what it sent back."""
+    import socket
+    import time
+
+    s = socket.create_connection(("127.0.0.1", port))
+    started = time.monotonic()
+    got = b""
+    try:
+        s.sendall(head)
+        pending = list(chunks)
+        while time.monotonic() - started < limit:
+            s.settimeout(every)
+            try:
+                data = s.recv(4096)
+                if not data:
+                    return time.monotonic() - started, got
+                got += data
+            except TimeoutError:
+                pass
+            except OSError:
+                return time.monotonic() - started, got
+            if pending:
+                try:
+                    s.sendall(pending.pop(0))
+                except OSError:
+                    return time.monotonic() - started, got
+        return None, got
+    finally:
+        s.close()
+
+
+def test_a_request_trickled_in_chunks_ends_at_its_deadline(listener):
+    from tgaud import web as web_pkg
+
+    server = listener({(web_pkg._Handler, "read_deadline"): 1.0})
+    port = server.port
+    try:
+        # a body that is still incomplete at the deadline, sent in many small chunks: never reaches the app
+        head = (f"POST /user HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\nX-Tgaud-Proxy-Token: {PROXY_TOKEN}\r\n"
+                f"Origin: http://127.0.0.1:{port}\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+                "Content-Length: 200\r\n\r\n").encode()
+        closed, got = trickle(port, head, [b"q=1001&x=" + b"a" * 5] * 20, 0.15, 4.0)
+        assert closed is not None and closed < 1.6 and got == b"", (closed, got)
+        # one request line trickled without its end
+        closed, got = trickle(port, b"GET /hea", [b"l", b"t", b"h", b"z", b" ", b"H"] * 4, 0.15, 4.0)
+        assert closed is not None and closed < 1.6 and got == b"", (closed, got)
+        # the slots are free again and a whole request is answered
+        assert raw(port, "GET", "/healthz")[0] == 200
+    finally:
+        web_pkg._Handler.read_deadline = web_pkg.READ_DEADLINE

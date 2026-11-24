@@ -43,6 +43,7 @@ REPORT_PAGE = 500  # rows per page of a report table; every page is its own boun
 SIDES = {"shared": "in both", "only_a": "only in A", "only_b": "only in B"}
 USER_COLUMNS = frozenset({"user_id"})
 ASOF_MODES = {"counts": "16a", "list": "16b", "eod": "16d", "matrix": "16c"}
+ASOF_INPUTS = ("chat", "date", "mode", "among")  # what an asof page link keeps (with its frozen as_of)
 PAGES = (("/", "Overview"), ("/overlap", "Overlap"), ("/user", "User"), ("/campaigns", "Campaigns"),
          ("/reports", "Reports"))
 
@@ -144,16 +145,18 @@ def transposed(result: sql.Result, titles: dict[int, str], key: str) -> Table:
     return Table(["", *heads], rows, numeric)
 
 
-def paged_table(req: Request, report: reports.Report, titles: dict[int, str], offset: int) -> Table:
+def paged_table(req: Request, report: reports.Report, titles: dict[int, str], offset: int,
+                inputs: Sequence[str]) -> Table:
     """One page of a report read with page=(offset, REPORT_PAGE + 1): its rows, and links to the pages before and
-    after that keep every input of the request (scope, options) and freeze its as-of time."""
+    after. A link keeps only the report's own `inputs` (scope, options) from the request, never another field
+    (a lookup's user id must not travel into a URL), and freezes the as-of time."""
     rows = report.result.rows
     more = len(rows) > REPORT_PAGE
     t = table(sql.Result(report.result.columns, rows[:REPORT_PAGE]), titles)
     t.start = offset
 
     def href(at: int) -> str:
-        query = {k: v for k, v in req.query.items() if k not in ("offset", "as_of")}
+        query = {k: v for k, v in req.query.items() if k in inputs and k not in ("offset", "as_of")}
         query["as_of"] = [report.as_of.isoformat()]
         if at:
             query["offset"] = [str(at)]
@@ -647,7 +650,7 @@ class WebApp:
             except (CliError, ValueError) as e:
                 raise HttpError(400, str(e)) from None
         return self.render("report.html", nav="/reports", title=spec.name, spec=spec, header=header_of(report),
-                           table=paged_table(req, report, common.titles_of(chats), offset),
+                           table=paged_table(req, report, common.titles_of(chats), offset, ("chat", *spec.params)),
                            chats=[c for c in chats if c.tracked], chosen=set(scope or []),
                            form={n: req.arg(n, "") for n in ("as_of", *spec.params)},
                            options={n: reports.OPTIONS[n][1]["help"] for n in spec.params}, action=f"/reports/{spec.name}")
@@ -690,7 +693,7 @@ class WebApp:
             report = reports.build_report(conn, block, as_of=as_of, scope=scope, params=params, window=window,
                                           as_of_notes=as_of_notes, page=(offset, REPORT_PAGE + 1))
         return self.render("asof.html", header=header_of(report),
-                           table=paged_table(req, report, common.titles_of(chats), offset), **page)
+                           table=paged_table(req, report, common.titles_of(chats), offset, ASOF_INPUTS), **page)
 
     def coverage(self, req: Request, _m: dict[str, str]) -> Response:
         gaps = req.arg("gaps") is not None
@@ -725,9 +728,12 @@ class WebApp:
 
 def publication(conn: psycopg.Connection) -> tuple[int, dt.datetime] | None:
     """The published audience rollup: its stats.rollup_run row (id, as_of), written by R2 in the transaction that
-    publishes the matrix and tg.user_chats. The id names one publication; two runs with the same as_of differ."""
+    publishes the matrix and tg.user_chats. The id names one publication; two runs with the same as_of differ.
+    The latest is the highest id, not the latest finished_at (a wall clock can step back): R2 takes its id with
+    its last statement, and two R2 runs are ordered by the lock of the tg.user_chats refresh, their first write,
+    so the run that commits later inserts later and has the higher id."""
     row = conn.execute("SELECT rollup_run_id, as_of FROM stats.rollup_run WHERE rollup = 'audience' "
-                       "ORDER BY finished_at DESC, rollup_run_id DESC LIMIT 1").fetchone()
+                       "ORDER BY rollup_run_id DESC LIMIT 1").fetchone()
     return (int(row[0]), row[1]) if row else None
 
 
