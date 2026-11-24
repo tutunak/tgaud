@@ -71,7 +71,7 @@ def probes(draw):
 
 @st.composite
 def snapshots(draw):
-    """(started_at, good, applied to the user, listed page time or None, hint), in started_at order."""
+    """(started_at, good, applied to the user, listed page time or None, hint, rejected later), in started_at order."""
     starts = sorted(draw(st.lists(st.integers(0, 240), max_size=5, unique=True)))
     out = []
     for k, s in enumerate(starts):
@@ -79,7 +79,8 @@ def snapshots(draw):
         page = t_of(s, 0) + timedelta(minutes=draw(st.integers(0, 15)), milliseconds=draw(st.sampled_from([0, 800])))
         # only the latest snapshot can be mid-apply in practice; earlier ones are mostly applied
         applied = draw(st.booleans() if k == len(starts) - 1 else st.sampled_from([True] * 5 + [False]))
-        out.append((t_of(s, 0), draw(st.booleans()), applied, page if listed else None, draw(st.sampled_from(HINTS))))
+        out.append((t_of(s, 0), draw(st.booleans()), applied, page if listed else None, draw(st.sampled_from(HINTS)),
+                    draw(st.sampled_from([False] * 5 + [True]))))
     return out
 
 
@@ -90,11 +91,12 @@ world_evidence = st.fixed_dictionaries({
 
 
 def brute_force(d: dict) -> Evidence:
-    """The evidence by its definition: every applied listing a point, every applied good non-listing an absence."""
+    """The evidence by its definition: every applied listing a point, every applied good non-listing an absence;
+    a snapshot the owner rejected is no evidence at all."""
     ev = Evidence(CHAT, USER, events=list(d["events"]), probes=[p for p in d["probes"] if p.outcome != "error"],
                   gaps=[g for g, _ in d["gaps"]], echo_from=list(d["echo"]), migrations=list(d["m2"]))
-    for k, (started, good, applied, page, hint) in enumerate(d["snapshots"]):
-        if not applied:
+    for k, (started, good, applied, page, hint, rejected) in enumerate(d["snapshots"]):
+        if not applied or rejected:
             continue
         if page is not None:
             ev.sightings.append(SightingPoint(page, hint, k, 0))
@@ -171,12 +173,14 @@ def write(w: World, d: dict, rnd: random.Random) -> None:
 
     def listings():
         last = len(d["snapshots"]) - 1
-        for k, (started, good, applied, page, hint) in enumerate(d["snapshots"]):
+        for k, (started, good, applied, page, hint, rejected) in enumerate(d["snapshots"]):
             listed = {USER: (page, hint)} if page is not None else {}
             # the latest snapshot may be mid-apply with this user's run already folded ahead of the cursor
-            w.snapshot(started, listed, finished=started + timedelta(minutes=30), good=good,
-                       through="all" if applied else USER - 1, snapshot_id=900 + k,
-                       fold_through="all" if k == last else "same")
+            sid = w.snapshot(started, listed, finished=started + timedelta(minutes=30), good=good,
+                             through="all" if applied else USER - 1, snapshot_id=900 + k,
+                             fold_through="all" if k == last else "same")
+            if rejected:  # the owner grades it rejected after it was folded; later listings extend through it
+                w.reject(sid)
     actions.append(listings)
     rnd.shuffle(actions)
     for a in actions:

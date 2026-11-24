@@ -7,8 +7,8 @@ differences. Every row of the state table is one branch below, named in a commen
 Evidence and its time order (design.md 4 and the plan reviews):
   rank 0  events            tg.member_event at event_at, ties by update_id
   rank 1  sighting points   every point of every tg.sighting run at its exact page time (first_seen_at,
-                            interior_seen_at, last_seen_at), with the run's joined_date as the hint; an end point
-                            counts only once its snapshot is graded and applied to the user
+                            interior_seen_at, last_seen_at), with the run's joined_date as the hint; point i was
+                            listed by the run's i-th finished snapshot and counts only if that snapshot counts
   rank 2  probe answers     tg.probe in/out at answered_at; ignored when an event of the pair has
                             sent_at <= event_at <= answered_at (the answer may describe either side)
   rank 3  absences          good, applied snapshots of the chat that no run of the user covers, at started_at
@@ -18,8 +18,8 @@ Ranks 3-5 are this module's choice where design.md is silent: an absence or a ga
 the same instant ends in the same state either way, and an event dated the second of a migration happened
 before the service message. Aliases with this chat as chat_id (M1, history moved in) open the E3 echo windows.
 Snapshot evidence comes only from tg.sighting and tg.snapshot, never tg.snapshot_member, so pruning (R3) can
-never change a replay. A snapshot is evidence for a user once it is graded and applied to that user
-(reconciled_at set, or user_id <= applied_through_user_id).
+never change a replay. A snapshot is evidence for a user once it is graded good or partial (never rejected) and
+applied to that user (reconciled_at set, or user_id <= applied_through_user_id), for every point of every run.
 
 Every time is compared as a UTC instant. Python orders, subtracts and compares datetimes that share a tzinfo by
 wall time, so a zone with daylight saving (the session's, which psycopg loads timestamptz into) would misorder the
@@ -451,12 +451,8 @@ SELECT e.chat_id, e.user_id, e.event_id, e.event_at, e.update_id, e.old_status, 
        e.new_is_member, e.actor_is_other, e.invite_link_id, e.via_join_request, e.via_folder_link
 FROM {_PAIRS} JOIN tg.member_event e ON e.chat_id = p.chat_id AND e.user_id = p.user_id"""
 
-# a run's end snapshot counts once graded and applied to the user; only a chat's latest snapshot is ever mid-apply
-_APPLIED = ("coalesce({s}.quality IN ('good', 'partial') AND "
-            "({s}.reconciled_at IS NOT NULL OR p.user_id <= {s}.applied_through_user_id), false)")
 _Q_SIGHTINGS = f"""
-SELECT s.chat_id, s.user_id, s.first_snapshot_id, fs.started_at, {_APPLIED.format(s="fs")},
-       s.last_snapshot_id, ls.started_at, {_APPLIED.format(s="ls")},
+SELECT s.chat_id, s.user_id, s.first_snapshot_id, fs.started_at, s.last_snapshot_id, ls.started_at,
        s.first_seen_at, s.interior_seen_at, s.last_seen_at, s.times_seen, s.joined_date
 FROM {_PAIRS} JOIN tg.sighting s ON s.chat_id = p.chat_id AND s.user_id = p.user_id
 JOIN tg.snapshot fs ON fs.snapshot_id = s.first_snapshot_id
@@ -471,10 +467,11 @@ _Q_SPELLS = f"""
 SELECT m.membership_id, {", ".join("m." + c for c in SPELL_COLUMNS)}
 FROM {_PAIRS} JOIN tg.membership m ON m.chat_id = p.chat_id AND m.user_id = p.user_id"""
 
-# good snapshots of the chats; whether one counts for a user is decided per user (the reconciler's cursor)
+# finished snapshots of the chats (the sources of run points; the good ones also give absences); whether one counts
+# for a user is decided per user (the reconciler's cursor)
 _Q_SNAPSHOTS = """
-SELECT s.chat_id, s.started_at, s.snapshot_id, s.applied_through_user_id, s.reconciled_at IS NOT NULL
-FROM tg.snapshot s WHERE s.chat_id = ANY(%(cs)s) AND s.quality = 'good'"""
+SELECT s.chat_id, s.started_at, s.snapshot_id, s.quality, s.applied_through_user_id, s.reconciled_at IS NOT NULL
+FROM tg.snapshot s WHERE s.chat_id = ANY(%(cs)s) AND s.finished_at IS NOT NULL"""
 
 _Q_GAPS = """
 SELECT g.chat_id, lower(g.period) FROM tg.gap g
@@ -491,6 +488,8 @@ _COPY = f"COPY tg.membership ({', '.join(SPELL_COLUMNS)}) FROM STDIN"
 
 @dataclass
 class _ChatContext:
+    fin_index: dict[int, int] = field(default_factory=dict)  # snapshot_id -> position among finished, by key
+    fin_meta: list[tuple[str | None, int | None, bool]] = field(default_factory=list)  # (quality, through, reconciled)
     snap_keys: list[tuple[datetime, int]] = field(default_factory=list)  # good snapshots, sorted
     snap_starts: list[datetime] = field(default_factory=list)  # their started_at, for bisect
     snap_meta: list[tuple[int | None, bool]] = field(default_factory=list)  # (applied_through, reconciled)
@@ -518,18 +517,29 @@ def _window(times: list[datetime], lo: datetime, hi: datetime, keep: Callable[[i
         i += 1
 
 
+def _counts_for(meta: tuple[str | None, int | None, bool], user_id: int) -> bool:
+    """A snapshot is evidence for a user once graded good or partial (never rejected) and applied to that user."""
+    quality, through, reconciled = meta
+    return quality in ("good", "partial") and (reconciled or (through is not None and user_id <= through))
+
+
 def _evidence(chat_id: int, user_id: int, ctx: _ChatContext, events: list[Event], runs: list[tuple],
               probes: list[ProbeAnswer]) -> Evidence:
     points: list[SightingPoint] = []
     covered: list[tuple[tuple[datetime, int], tuple[datetime, int]]] = []
-    for (first_id, first_started, first_applied, last_id, last_started, last_applied, first_seen, interior,
-         last_seen, times_seen, joined_date) in runs:
+    for (first_id, first_started, last_id, last_started, first_seen, interior, last_seen, times_seen,
+         joined_date) in runs:
         times = [first_seen] if times_seen == 1 else [first_seen, *interior, last_seen]
-        if not last_applied:
-            times.pop()  # plan review 2: the newest point's snapshot is not applied to this user yet
-        if times and not first_applied:
-            times.pop(0)  # (a run must not begin in a snapshot that is still being applied before its end)
-        points.extend(SightingPoint(t, joined_date, first_id, i) for i, t in enumerate(times))
+        lo, hi = ctx.fin_index.get(first_id), ctx.fin_index.get(last_id)
+        if lo is not None and hi is not None and hi - lo + 1 == len(times):
+            sources: Sequence[int | None] = range(lo, hi + 1)  # the 003 contract: every snapshot of the range
+        else:
+            # the run does not match the chat's finished snapshots (a writer broke the 003 contract): only its ends
+            # can be attributed, so its interior points are not evidence
+            times = times[:1] if times_seen == 1 else [first_seen, last_seen]
+            sources = [lo] if times_seen == 1 else [lo, hi]
+        kept = [t for t, k in zip(times, sources) if k is not None and _counts_for(ctx.fin_meta[k], user_id)]
+        points.extend(SightingPoint(t, joined_date, first_id, i) for i, t in enumerate(kept))
         covered.append(((first_started, first_id), (last_started, last_id)))
     ev = Evidence(chat_id, user_id, events, points, probes, migrations=ctx.migrations, echo_from=ctx.echo_from)
     opening = [e.event_at for e in events] + [p.seen_at for p in points] + [p.answered_at for p in probes]
@@ -577,11 +587,15 @@ def _load_chunk(conn: psycopg.Connection, pairs: list[tuple[int, int]]
 
     ctxs: dict[int, _ChatContext] = defaultdict(_ChatContext)
     global_gaps: list[datetime] = []
-    for chat_id, started_at, snapshot_id, through, reconciled in sorted(snap_rows, key=lambda r: (r[0], r[1], r[2])):
+    for chat_id, started_at, snapshot_id, quality, through, reconciled in sorted(
+            snap_rows, key=lambda r: (r[0], r[1], r[2])):
         ctx = ctxs[chat_id]
-        ctx.snap_keys.append((started_at, snapshot_id))
-        ctx.snap_starts.append(started_at)
-        ctx.snap_meta.append((through, reconciled))
+        ctx.fin_index[snapshot_id] = len(ctx.fin_meta)
+        ctx.fin_meta.append((quality, through, reconciled))
+        if quality == "good":
+            ctx.snap_keys.append((started_at, snapshot_id))
+            ctx.snap_starts.append(started_at)
+            ctx.snap_meta.append((through, reconciled))
     per_chat_gaps: dict[int, list[datetime]] = defaultdict(list)
     for chat_id, start in gap_rows:
         (global_gaps if chat_id is None else per_chat_gaps[chat_id]).append(start)

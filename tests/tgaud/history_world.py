@@ -133,6 +133,10 @@ class World:
                 ON CONFLICT (chat_id, user_id, first_snapshot_id) DO NOTHING""",
                            (self.chat_id, user, seen, sid, seen, sid, hint))
 
+    def reject(self, sid: int) -> None:
+        """The owner's action: grade a snapshot rejected (none of its sightings or absences count)."""
+        self.c.execute("UPDATE tg.snapshot SET quality = 'rejected' WHERE snapshot_id = %s", (sid,))
+
     def prune(self) -> int:
         """R3: drop the member rows of every snapshot (the sightings stay)."""
         n = self.c.execute("DELETE FROM tg.snapshot_member m USING tg.snapshot s WHERE s.snapshot_id = m.snapshot_id "

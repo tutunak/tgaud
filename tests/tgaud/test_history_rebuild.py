@@ -572,3 +572,77 @@ def test_extension_above_the_cursor_keeps_the_applied_points(world):
     w.finish_reconcile(sid)
     w.rebuild([9])
     assert w.spells(9)[0].last_confirmed_at == at(7 * DAY + 5)
+
+
+# --- review 2: a snapshot graded rejected is no evidence at any position of a run (conductor) --------------------
+
+REJ_DAY = datetime(2026, 9, 5, tzinfo=timezone.utc)
+
+
+def hm(h: int, m: int = 0) -> datetime:
+    return REJ_DAY + timedelta(hours=h, minutes=m)
+
+
+def test_rejected_interior_listing_is_no_evidence_after_pruning(world):
+    w = world
+    w.join(40, hm(9))
+    sids = [w.snapshot(hm(k), {40: (hm(k, 1), H1)}, finished=hm(k, 20)) for k in (10, 11, 12)]
+    w.leave(40, hm(10, 30))  # the exact exit falls between the first and the middle listing
+    w.rebuild([40])
+    assert [(s.known_from, s.end_source) for s in w.spells(40)] == [(hm(9), "event"), (hm(11, 1), None)]
+    assert w.c.execute("SELECT times_seen FROM tg.sighting WHERE user_id = 40").fetchone()[0] == 3
+    w.prune()
+    w.c.execute("UPDATE tg.rollup_dirty SET from_day = '2026-12-01' WHERE chat_id = %s", (CHAT,))
+    version = w.c.execute("SELECT version FROM tg.rollup_dirty WHERE chat_id = %s", (CHAT,)).fetchone()[0]
+    with w.c.transaction(force_rollback=True):  # the owner's rejection, interrupted: nothing changes
+        w.reject(sids[1])
+        w.rebuild([40])
+        assert w.spells(40)[1].known_from == hm(12, 1)
+    assert w.rebuild([40]) == history.RebuildResult()
+    assert w.spells(40)[1].known_from == hm(11, 1)
+    w.reject(sids[1])
+    assert w.rebuild([40]) == history.RebuildResult(opened=1, changed=1)  # the rejoin moves to the next listing
+    assert [(s.known_from, s.end_source) for s in w.spells(40)] == [(hm(9), "event"), (hm(12, 1), None)]
+    from_day, new_version = w.c.execute("SELECT from_day, version FROM tg.rollup_dirty WHERE chat_id = %s",
+                                        (CHAT,)).fetchone()
+    assert from_day == REJ_DAY.date() and new_version > version
+    assert w.rebuild([40]) == history.RebuildResult()
+
+
+def test_rejected_end_point_stays_out_when_the_run_is_extended(world):
+    w = world
+    w.join(41, hm(9))
+    w.snapshot(hm(10), {41: (hm(10, 1), H1)}, finished=hm(10, 20))
+    w.leave(41, hm(10, 30))
+    s2 = w.snapshot(hm(11), {41: (hm(11, 1), H1)}, finished=hm(11, 20))
+    w.reject(s2)
+    w.rebuild([41])
+    assert [(s.known_from, s.end_source) for s in w.spells(41)] == [(hm(9), "event")]
+    w.snapshot(hm(12), {41: (hm(12, 1), H1)}, finished=hm(12, 20))  # extends the run: s2's point is now interior
+    assert w.c.execute("SELECT times_seen FROM tg.sighting WHERE user_id = 41").fetchone()[0] == 3
+    w.rebuild([41])
+    assert [(s.known_from, s.end_source) for s in w.spells(41)] == [(hm(9), "event"), (hm(12, 1), None)]
+
+
+def test_rejected_good_snapshot_gives_no_absence(world):
+    w = world
+    w.snapshot(hm(10), {42: (hm(10, 1), H1), 43: (hm(10, 2), H1)})
+    s2 = w.snapshot(hm(11), {43: (hm(11, 2), H1)})  # 42 is missing from a good snapshot
+    w.rebuild([42])
+    assert w.spells(42)[0].suspect_since == hm(11)
+    w.reject(s2)
+    assert w.rebuild([42]) == history.RebuildResult(changed=1)
+    assert w.spells(42)[0].suspect_since is None
+
+
+def test_run_that_does_not_match_the_chat_snapshots_keeps_only_its_ends(world):
+    w = world
+    sids = [w.snapshot(hm(k), {} if k == 11 else {44: (hm(k, 1), H1)}) for k in (10, 11, 12, 13)]
+    # a writer that broke the 003 contract: one run across a snapshot that did not list the user
+    w.c.execute("DELETE FROM tg.sighting WHERE user_id = 44")
+    w.c.execute("""INSERT INTO tg.sighting (chat_id, user_id, first_seen_at, first_snapshot_id, last_seen_at,
+                                            last_snapshot_id, times_seen, joined_date, interior_seen_at)
+                   VALUES (%s, 44, %s, %s, %s, %s, 3, %s, %s)""",
+                (CHAT, hm(10, 1), sids[0], hm(13, 1), sids[3], H1, [hm(12, 1)]))
+    ev = history.load_evidence(w.c, [(CHAT, 44)])[(CHAT, 44)]
+    assert [p.seen_at for p in ev.sightings] == [hm(10, 1), hm(13, 1)]  # the interior point is not attributed

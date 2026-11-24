@@ -30,10 +30,13 @@ COMMENT ON TABLE tg.sighting IS
   'of a user in a chat, identified by its first snapshot. A run is consecutive applied snapshots of the chat '
   '(in started_at, snapshot_id order) that each listed the user with the same joined_date; the reconciler starts '
   'a new run when a snapshot did not list the user, when the joined_date changes, or when the page time is '
-  'earlier than the run''s last_seen_at; it may also break a run at exit evidence. Every good snapshot whose key '
-  'lies between a run''s first and last snapshot counts as listing the user (no absence). A point is written in '
-  'the transaction that applies its snapshot to the user (with tg.snapshot.applied_through_user_id). Survives '
-  'the pruning of snapshot_member. Written by the reconciler.';
+  'earlier than the run''s last_seen_at; it may also break a run at exit evidence. So point i of a run was '
+  'listed by the i-th finished snapshot of the chat from first_snapshot_id, and every good snapshot whose key '
+  'lies between a run''s first and last snapshot counts as listing the user (no absence). The rebuild counts a '
+  'point only while its snapshot is graded good or partial (a snapshot the owner grades rejected is no evidence '
+  'at all) and applied to the user (reconciled_at, or user_id <= applied_through_user_id); a point is written in '
+  'the transaction that applies its snapshot to the user. Survives the pruning of snapshot_member. Written by '
+  'the reconciler.';
 
 ------------------------------------------------------------------------------------------------------------
 -- Probe answers that straddle a transition
