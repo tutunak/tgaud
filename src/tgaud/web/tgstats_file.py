@@ -76,6 +76,7 @@ class Snapshot:
     method: str | None = None
     reported_start: int | None = None
     reported_end: int | None = None
+    reported: int | None = None  # tgstats' own column: the larger of the two counts
 
 
 @dataclass(frozen=True)
@@ -176,9 +177,9 @@ class Reader:
             return sqlite3.SQLITE_OK
         if action == sqlite3.SQLITE_READ and arg1 in ("sqlite_master", *self.tables):
             return sqlite3.SQLITE_OK
-        if action == sqlite3.SQLITE_PRAGMA and arg1 == "table_info":
+        if action == sqlite3.SQLITE_PRAGMA and arg1 == "table_xinfo":
             return sqlite3.SQLITE_OK
-        if action == sqlite3.SQLITE_FUNCTION and arg2 in ("count", "pragma_table_info"):
+        if action == sqlite3.SQLITE_FUNCTION and arg2 == "count":
             return sqlite3.SQLITE_OK
         return sqlite3.SQLITE_DENY
 
@@ -251,7 +252,11 @@ def _check_schema(r: Reader) -> bool:
     if extra:
         raise FileError(f"the file has table(s) a tgstats.db does not have: {', '.join(extra)}")
     r.tables = set(tables)
-    info = {t: r.query(f"PRAGMA table_info({t})").fetchall() for t in BASE}
+    # table_xinfo, not table_info: the latter leaves out generated columns (hidden 2, 3; 1 = a virtual table's)
+    info = {t: r.query(f"PRAGMA table_xinfo({t})").fetchall() for t in BASE}
+    hidden = [f"{t}.{row[1]}" for t, rows in info.items() for row in rows if row[6]]
+    if hidden:
+        raise FileError(f"the file has generated or hidden column(s) ({', '.join(hidden)}): a tgstats.db has none")
     names = {t: {row[1] for row in rows} for t, rows in info.items()}
     current = set(SNAPSHOT_COLUMNS) <= names["snapshots"]
     want = {t: set(cols) for t, cols in BASE.items()}
@@ -325,7 +330,10 @@ def parse_time(value: str | None, what: str) -> dt.datetime | None:
         raise BadValue(f"{what} is not a time ({value[:40]!r})") from None
     if t.tzinfo is None:
         raise BadValue(f"{what} has no time zone")
-    return t.astimezone(UTC)
+    try:
+        return t.astimezone(UTC)
+    except OverflowError:  # year 1 with a positive offset, year 9999 with a negative one
+        raise BadValue(f"{what} is out of range ({value[:40]!r})") from None
 
 
 def _snapshot(row: tuple, current: bool) -> Snapshot:
@@ -335,17 +343,17 @@ def _snapshot(row: tuple, current: bool) -> Snapshot:
     if taken_at is None:
         raise FileError("snapshots.taken_at is empty")
     fetched = _typed(row[3], INT, "snapshots.fetched")
-    _typed(row[4], OPT_INT, "snapshots.reported")
+    reported = _typed(row[4], OPT_INT, "snapshots.reported")
     complete = _flag(row[5], "snapshots.complete")
     if not current:
-        return Snapshot(file_id, chat_id, True, taken_at, fetched, bool(complete))
+        return Snapshot(file_id, chat_id, True, taken_at, fetched, bool(complete), reported=reported)
     u, started, finished, method = (_text(row[i], f"snapshots.{n}", 64) for i, n in
                                     zip(range(6, 10), SNAPSHOT_COLUMNS[:4]))
     rep_start = _typed(row[10], OPT_INT, "snapshots.reported_start")
     rep_end = _typed(row[11], OPT_INT, "snapshots.reported_end")
     legacy = u is None and started is None and finished is None and method is None
     return Snapshot(file_id, chat_id, legacy, taken_at, fetched, bool(complete), u, started, finished, method,
-                    rep_start, rep_end)
+                    rep_start, rep_end, reported)
 
 
 def _order_key(s: Snapshot) -> tuple:
@@ -383,26 +391,32 @@ def _check_snapshot(chat: Chat, now: dt.datetime) -> None:
     if finished > now + FUTURE_SLACK:
         raise BadValue(f"finished_at {finished:%Y-%m-%d %H:%M:%S}Z is in the future (the server's time is "
                        f"{now:%Y-%m-%d %H:%M:%S}Z)")
-    for n, what in ((s.reported_start, "the count before the listing"), (s.reported_end, "the count after it")):
+    for n, what in ((s.reported_start, "the count before the listing"), (s.reported_end, "the count after it"),
+                    (s.reported, "the reported count"), (s.fetched, "the fetched count")):
         if n is not None and not 0 <= n <= 2**31 - 1:
             raise BadValue(f"{what} is negative or too large")
+    if s.fetched != chat.listed:  # tgstats writes one member row per user it counts
+        raise BadValue(f"the snapshot says it fetched {s.fetched} members, but the file has {chat.listed} member "
+                       "rows for it")
     chat.started_at, chat.finished_at = started, finished
 
 
-def member(row: tuple, started: dt.datetime, finished: dt.datetime) -> Member:
-    """One member row, typed (FileError) and checked against its snapshot's interval (BadValue)."""
-    user_id = _typed(row[0], INT, "memberships.user_id")
+def _shape(row: tuple) -> tuple:
+    """A member row with every storage class and shape checked (FileError: the whole file is refused): what this
+    tgstats writes, is_bot and is_deleted never NULL (NULL would read as false and could undo a deleted account)."""
+    return (_typed(row[0], INT, "memberships.user_id"), _text(row[1], "memberships.seen_at", 64),
+            _text(row[2], "memberships.joined_date", 64), _typed(row[3], OPT_INT, "memberships.inviter_id"),
+            _flag(row[4], "memberships.via_request", optional=True),
+            _text(row[5], "memberships.subscription_until", 64), _flag(row[6], "memberships.is_bot"),
+            _flag(row[7], "memberships.is_deleted"), _flag(row[8], "memberships.is_premium", optional=True),
+            *(_text(row[i], f"memberships.{n}") for i, n in ((9, "username"), (10, "first_name"), (11, "last_name"))))
+
+
+def _member(v: tuple, started: dt.datetime, finished: dt.datetime) -> Member:
+    """A shaped member row checked against its snapshot's interval (BadValue: that chat is refused)."""
+    user_id, seen_raw, joined_raw, inviter, via, until_raw, is_bot, is_deleted, is_premium, *names = v
     if not 0 < user_id <= 2**63 - 1:
         raise BadValue("a user id is not a positive number")
-    seen_raw = _text(row[1], "memberships.seen_at", 64)
-    joined_raw = _text(row[2], "memberships.joined_date", 64)
-    inviter = _typed(row[3], OPT_INT, "memberships.inviter_id")
-    via = _flag(row[4], "memberships.via_request", optional=True)
-    until_raw = _text(row[5], "memberships.subscription_until", 64)
-    is_bot = _flag(row[6], "memberships.is_bot", optional=True)
-    is_deleted = _flag(row[7], "memberships.is_deleted", optional=True)
-    is_premium = _flag(row[8], "memberships.is_premium", optional=True)
-    names = [_text(row[i], f"memberships.{n}") for i, n in ((9, "username"), (10, "first_name"), (11, "last_name"))]
     seen = parse_time(seen_raw, "a member's seen_at")
     if seen is None:
         raise BadValue("a member row has no seen_at")
@@ -412,8 +426,28 @@ def member(row: tuple, started: dt.datetime, finished: dt.datetime) -> Member:
     if inviter is not None and not 0 < inviter <= 2**63 - 1:
         inviter = None  # no inviter (Telegram's 0)
     return Member(user_id, seen, parse_time(joined_raw, "a joined_date"), inviter, via,
-                  parse_time(until_raw, "a subscription_until"), bool(is_bot), bool(is_deleted), is_premium,
+                  parse_time(until_raw, "a subscription_until"), is_bot, is_deleted, is_premium,
                   *(clean_name(n) for n in names))
+
+
+def member(row: tuple, started: dt.datetime, finished: dt.datetime) -> Member:
+    """One member row, shaped (FileError) and checked against its snapshot's interval (BadValue)."""
+    return _member(_shape(row), started, finished)
+
+
+def _scan(reader: Reader, chat: Chat) -> BadValue | None:
+    """Shape every member row of the chat's snapshot, whatever the chat's own refusal (a structural error refuses
+    the whole file), and check their values while the chat is still admissible; returns the first value error."""
+    values = chat.refusal is None and chat.started_at is not None and chat.finished_at is not None
+    bad: BadValue | None = None
+    for row in reader.rows(reader.query(MEMBER_SQL, (chat.snapshot.file_id,))):
+        shaped = _shape(row)
+        if values and bad is None:
+            try:
+                _member(shaped, chat.started_at, chat.finished_at)  # type: ignore[arg-type]
+            except BadValue as e:
+                bad = e
+    return bad
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -433,15 +467,19 @@ def check(reader: Reader, *, now: dt.datetime, ceiling: int) -> TgstatsFile:
     by_chat: dict[int, list[Snapshot]] = {}
     for row in reader.rows(reader.query(f"SELECT {cols} FROM snapshots ORDER BY id")):
         s = _snapshot(row, current)
+        if s.chat_id not in by_chat and len(by_chat) >= MAX_CHATS:
+            raise FileError(f"the file has snapshots of more than {MAX_CHATS} chats, the most the import reads")
         by_chat.setdefault(s.chat_id, []).append(s)
-    if len(by_chat) > MAX_CHATS:
-        raise FileError(f"the file has {len(by_chat)} chats, more than the {MAX_CHATS} the import reads")
     uuids = [s.uuid.lower() for ss in by_chat.values() for s in ss if s.uuid is not None]
     if len(uuids) != len(set(uuids)):
         raise FileError("two snapshots of the file have the same collection id")
     titles: dict[int, str | None] = {}
-    for row in reader.rows(reader.query("SELECT id, title FROM chats")):
-        titles[_typed(row[0], INT, "chats.id")] = clean_name(_text(row[1], "chats.title"))
+    for n, row in enumerate(reader.rows(reader.query("SELECT id, title FROM chats")), 1):
+        if n > MAX_CHATS:
+            raise FileError(f"the file has more than {MAX_CHATS} chats, the most the import reads")
+        chat_id, title = _typed(row[0], INT, "chats.id"), clean_name(_text(row[1], "chats.title"))
+        if chat_id in by_chat:  # only the titles of chats it will report
+            titles[chat_id] = title
     out = TgstatsFile(reader.path, current)
     for chat_id in sorted(by_chat):
         snaps = by_chat[chat_id]
@@ -453,26 +491,23 @@ def check(reader: Reader, *, now: dt.datetime, ceiling: int) -> TgstatsFile:
         out.chats.append(chat)
         chat.listed = reader.query("SELECT count(*) FROM memberships WHERE snapshot_id = ?",
                                    (latest.file_id,)).fetchone()[0]
+        if latest.legacy:  # an old-format snapshot's member rows are never read by the import
+            chat.refusal = "old format" if unreadable is None else \
+                f"bad times or values: {unreadable}, so the latest snapshot of this chat cannot be told"
+            continue
         if unreadable is not None:
             chat.refusal = f"bad times or values: {unreadable}, so the latest snapshot of this chat cannot be told"
-            continue
-        if latest.legacy:
-            chat.refusal = "old format"
-            continue
-        try:
-            _check_snapshot(chat, now)
-        except BadValue as e:
-            chat.refusal = f"bad times or values: {e}"
-            continue
-        if chat.listed > ceiling:
+        else:
+            try:
+                _check_snapshot(chat, now)
+            except BadValue as e:
+                chat.refusal = f"bad times or values: {e}"
+        if chat.refusal is None and chat.listed > ceiling:
             chat.refusal = (f"too large: {chat.listed} members in one snapshot, more than the {ceiling} one import "
                             "transaction takes")
-            continue
-        try:
-            for _ in members(reader, chat):
-                pass
-        except BadValue as e:
-            chat.refusal = f"bad times or values: {e}"
+        bad = _scan(reader, chat)
+        if bad is not None and chat.refusal is None:
+            chat.refusal = f"bad times or values: {bad}"
     return out
 
 

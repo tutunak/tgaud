@@ -22,9 +22,9 @@ UI. No database access from the owner's machine, no change to the Ansible role.
   read fresh, basic groups included) and the method (`basic_group`, `listing`, `deep`); per member, with the
   membership row, the observation of the page that listed them: `seen_at`, `joined_date` (NULL for creators),
   `inviter_id`, `via_request`, `subscription_until`, bot, deleted, premium, username and names. **The first
-  observation wins** (as `ON CONFLICT DO NOTHING`). A failed page or query that the run went on after, or a failed
-  final count, makes the snapshot incomplete whatever the counts say. Old files get the columns on open and read back
-  as before.
+  observation wins** (as `ON CONFLICT DO NOTHING`). A failed page or query that the run went on after, or a final
+  count that failed or came back without the count, makes the snapshot incomplete whatever the counts say. Old
+  files get the columns on open and read back as before.
 - **Old-format snapshots are refused**, never imported: they carry only `taken_at`, roughly the end of the
   collection, so their sightings can contradict leaves and erasures recorded during it. The page tells the owner to
   collect again.
@@ -36,10 +36,11 @@ UI. No database access from the owner's machine, no change to the Ansible role.
   acknowledgement is settled by the next upload even after a migration re-keyed the chat. A retired source (an
   `old_chat_id` of `tg.chat_alias`) is refused. All of these checks run inside the chat's transaction, after the
   generation fence and `history.lock_chats`.
-- **Whole-file versus per-snapshot errors.** Not SQLite, missing or extra tables or columns, a view, trigger or
-  virtual table, a wrong type or shape in a row the import reads: the whole file is refused, nothing written. Bad
-  times (`started_at <= seen_at <= finished_at <= now + 5 min`), negative counts or a malformed uuid refuse that
-  snapshot only.
+- **Whole-file versus per-snapshot errors.** Not SQLite, missing or extra tables or columns (generated ones
+  included), a view, trigger or virtual table, a wrong type or shape in a member row of any chat's latest snapshot
+  (even a refused chat's), a NULL bot or deleted flag: the whole file is refused, nothing written. Bad times
+  (`started_at <= seen_at <= finished_at <= now + 5 min`, or out of range), negative counts, a `fetched` that is not
+  the number of member rows, or a malformed uuid refuse that snapshot only.
 - **Erasure.** Nobody erased by `tg.forget_user` is imported, whatever their `seen_at` says (the collector's clock
   proves nothing); erased inviters are cleared; `fetched` counts the rows that survived.
 - **Names follow `TGAUD_STORE_NAMES`**: off, no name or username is written anywhere.

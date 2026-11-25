@@ -443,8 +443,8 @@ async def collect_chat(
 
     The snapshot records what tgaud's snapshot contract needs: a random id, started_at before the first count
     read, Telegram's count before and after the listing, the path taken, finished_at, and each member as the first
-    page that listed them saw them. A failed final count keeps the listing, with reported_end NULL and
-    complete false. An interrupt (Ctrl-C cancels the task) keeps the members found so far, then propagates.
+    page that listed them saw them. A final count that failed or came back without the count keeps the listing,
+    with reported_end NULL and complete false. An interrupt (Ctrl-C cancels the task) keeps the members found so far, then propagates.
     """
     result = CollectResult(chat)
     listing = Listing(clock)
@@ -458,6 +458,9 @@ async def collect_chat(
             reported_end = None
             out(f"  the member count after the listing failed: {type(exc).__name__}: {exc}")
             listing.failed(f"the final member count failed: {type(exc).__name__}: {exc}")
+        if reported_end is None and listing.error is None:  # an answer without the (optional) count field
+            out("  Telegram gave no member count after the listing")
+            listing.failed("Telegram gave no member count after the listing")
         reported = _larger(listing.reported_start, reported_end)
         snapshot = db.add_snapshot(conn, chat.row, listing.members.values(), reported,
                                    complete=False if listing.error else None,

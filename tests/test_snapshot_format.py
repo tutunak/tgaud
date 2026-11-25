@@ -160,6 +160,16 @@ def test_a_failed_final_count_keeps_the_listing_incomplete_without_an_end_count(
     assert "the member count after the listing failed" in rec.text and "a request failed" in rec.text
 
 
+@pytest.mark.parametrize("start", [1, None], ids=["start-count", "no-start-count"])
+def test_an_answer_without_the_final_count_keeps_the_listing_incomplete(conn, start):
+    """review 1: a successful GetFullChannel whose optional participants_count is absent is no count either."""
+    client = FakeClient([channel(1, "C", megagroup=True)], {1: [tg_user(1)]}, {1: {"reported": [start, None]}})
+    results, rec = collect(client, conn)
+    snap = db.latest_snapshots(conn)[CHAT1]
+    assert (snap.fetched, snap.reported_start, snap.reported_end, snap.complete) == (1, start, None, False)
+    assert not results[0].complete and "no member count after the listing" in rec.text
+
+
 def test_one_user_listed_on_two_pages_keeps_the_first_pages_observation(conn):
     first = tg_user(5, first="Before")
     later = tg_user(5, first="After", premium=True)
