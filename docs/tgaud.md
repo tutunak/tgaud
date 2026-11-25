@@ -64,16 +64,26 @@ the day and the few things shortened for the test (job intervals; count samples 
   to the database on the host's 127.0.0.1, which the containers reach through pasta's `--map-host-loopback`; the
   relay forwards over TCP to the server wherever `TGAUD_TEST_ADMIN_URL` points, never to a Unix socket), `/health` 200 within 60 s through
   the published port, and SIGTERM ends it with exit 0 within 10 s.
-- **CI** (`.forgejo/workflows/ci.yml`, the pattern of `~/projects/helpers/sui`): no `uses:` actions. Job `test` runs
-  `uv run pytest -rs` on Python 3.13 with `TGAUD_TEST_NO_DATABASE=1`: the database tests skip with that reason, because
-  the runner's job network is the host's and a PostgreSQL service is not reachable by name there. The local
-  `mise run ci` runs them all against PostgreSQL 18.6. Job `image` builds with buildah (vfs storage, chroot isolation)
-  tagged `:$GITHUB_SHA` and `:latest`, then gates the image: it is pushed to the job as a docker archive, loaded through
-  the runner's container socket, and run with the same flags as the container check; the one `selfcheck ok:` line must
-  print before anything is pushed. It pushes to `git.firr.co/company/tgaud` on a push to `main` only (secret
-  `REGISTRY_TOKEN`, variable `REGISTRY_USER`).
-- **Release**: a push to `main` publishes `:$GITHUB_SHA` and `:latest`; the deploy repo pins the digest it resolves
-  (deploy order in the contract). The schema is never rolled back, so an image rollback needs no database step.
+- **CI** (`.github/workflows/ci.yml`, GitHub Actions on `ubuntu-latest`, pull requests to `main` only; the pattern of
+  echopan): jobs `lint` (actionlint 1.7.12 on the workflows), `tests` (`uv sync --locked`, `uv run pytest -rs` on
+  Python 3.13, the interpreter the image runs, against a real PostgreSQL 18.6: `scripts/ci-postgres.sh` starts it with
+  Docker with the image, `--memory 512m` and `SERVER_SETTINGS` of `tests/tgaud/conftest.py`, checks that the cap and every
+  setting are in effect, and the fixture uses it through `TGAUD_TEST_ADMIN_URL`; no database test is skipped),
+  `container` (`scripts/image-test.sh` and `scripts/container-e2e.sh` with the runner's podman, rootless, with passt
+  for pasta) and `release-scripts` (`scripts/release/test-release.sh`). Then `publishing`, which needs all four, logs in
+  to ghcr.io with `GITHUB_TOKEN` and runs `scripts/release/publish-images.sh ghcr.io/tutunak/tgaud`: it builds the
+  image with buildx from the `Containerfile` (context `.`, `.dockerignore` is a link to `.containerignore`), loads it,
+  runs the gate on that build (`scripts/release/gate-image.sh`: `--selfcheck` with `--network=none --read-only --tmpfs /tmp
+  --cap-drop=all --security-opt=no-new-privileges`, exactly one `selfcheck ok: ` line) and only then pushes it tagged with the
+  full 40-hex git tree hash of the checkout (on a pull request GitHub's merge ref: the tree `main` gets if the PR is merged
+  as it is). A tag the registry already has is not built again; when the registry can't say, the job stops.
+- **Release** (`.github/workflows/release.yml`, every push to `main`; no tests, no build; `concurrency: {group: release,
+  queue: max}`): `scripts/release/release.sh` computes the tree hash of the commit, stops naming the image when it lacks
+  that tag, picks the version (the `X.Y.Z` tag already on the commit, else the highest `X.Y.Z` on the remote plus one patch,
+  `1.0.0` first), adds it to the image with `docker buildx imagetools create --prefer-index=false` (no pull, same digest)
+  and only then pushes the git tag. The deploy repo pins the digest it resolves (deploy order in the contract). The schema
+  is never rolled back, so an image rollback needs no database step. What the owner sets up, and recovery: README, "CI and
+  releases".
 
 ## Layout
 
@@ -151,7 +161,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 | rollups | `tgaud/jobs/chat_day.py`, `audience.py`, `partitions.py` (R1, R2 in Python, R4); migration 006 |
 | cli | modules in `tgaud/commands/` that call `tgaud.cli.register(name, help, add_arguments, run)`; migration 008 |
 | web | the web listener, started in `tgaud.jobs.serve` where the comment says, after `config.web_proxy_token_or_fail()`; migration 009 |
-| image | Containerfile, Forgejo CI; adds the container check to the `ci` task of `mise.toml` |
+| image | Containerfile, GitHub Actions CI and release; adds the container check, `lint-ci` and `release-scripts` to the `ci` task of `mise.toml` |
 
 ## Migrations
 

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Build the image and run it as the deploy role will: --selfcheck offline, migrate fails cleanly without a database.
+# `mise run image-test` and CI's container job run it. Needs podman.
+set -eu -o pipefail
+cd "$(dirname "$0")/.."
+
+# The image is named by the ID this build printed, so a concurrent build elsewhere cannot change what this run checks.
+image=$(podman build -q .)
+
+run() {
+    podman run --rm --network=none --read-only --tmpfs /tmp --cap-drop=all --security-opt=no-new-privileges "$@"
+}
+
+out=$(run "$image" --selfcheck)
+echo "$out"
+[[ $out == "selfcheck ok: "* && $out != *$'\n'* ]] || { echo "image-test: --selfcheck did not print one 'selfcheck ok:' line" >&2; exit 1; }
+
+# No database: migrate exits 1 with one connection-failure line, not a traceback or an empty message.
+rc=0
+err=$(run -e TGAUD_DATABASE_URL="postgresql://tgaud@127.0.0.1:5432/tgaud?sslmode=disable" "$image" migrate 2>&1) || rc=$?
+echo "$err"
+[[ $rc -eq 1 ]] || { echo "image-test: migrate exited $rc, want 1" >&2; exit 1; }
+[[ $err == "ERROR tgaud: migrate failed: connection failed: "* && $err != *$'\n'* ]] \
+    || { echo "image-test: migrate did not print one connection-failure line" >&2; exit 1; }
+
+# No session, env or database file reaches the image. The scan keeps the full capabilities of the image's root user
+# (dropped ones cannot read root-only directories and would fail the scan); find's own errors stay visible and fail
+# the check. Dependencies' test directories are not the repo's and are not matched.
+leaks=$(podman run --rm --network=none --entrypoint sh "$image" -c 'find / -xdev -not -path "/proc/*" \( -name ".env" -o -name ".env.*" -o -name "*.env" -o -name "*.session" -o -name "*.session-journal" -o -name "*.db" \)')
+[ -z "$leaks" ] || { echo "image-test: state or secret files in the image:" >&2; echo "$leaks" >&2; exit 1; }
+echo "image-test: ok"

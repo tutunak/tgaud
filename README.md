@@ -199,9 +199,49 @@ Read, in this order:
 Tests (PostgreSQL 18.6 and podman; never the real Telegram, always the fake Bot API in `tests/tgaud/`):
 
 ```sh
-mise run ci                                    # everything: pytest, the image check, the container end-to-end run
+mise run ci                                    # everything CI runs: pytest, the image check, the container end-to-end run,
+                                               # actionlint, the release scripts' tests
 TGAUD_TEST_ADMIN_URL=postgresql://postgres:PASSWORD@127.0.0.1:5432/postgres mise run ci   # use a running server
 uv run pytest tests/tgaud/test_end_to_end.py   # one scripted day through `tgaud serve`
 ```
 
 Without `TGAUD_TEST_ADMIN_URL` the tests start a throwaway PostgreSQL container with podman.
+
+### CI and releases
+
+GitHub Actions, as in echopan. Pull requests to `main` run `.github/workflows/ci.yml`: the tests, then the image. A push
+to `main` runs only `.github/workflows/release.yml`: no tests, no build. `mise run ci` is the same suite locally.
+
+- `lint` is actionlint, `tests` is `uv run pytest -rs` with a real PostgreSQL 18.6 (limits as in the local fixture,
+  checked before pytest runs), `container` is the image check and the container end-to-end run with podman, and
+  `release-scripts` tests the scripts below against a throwaway registry.
+- `publishing` (needs every job above; logs in to ghcr.io with `GITHUB_TOKEN`) builds the image, runs
+  `--selfcheck` on that build the way the deploy role runs it, and only then pushes `ghcr.io/tutunak/tgaud:<40-hex git
+  tree hash>`. On a pull request the checkout is GitHub's merge ref, the tree `main` gets if the PR is merged as it is.
+  A tag the registry already has isn't built again; when the registry can't say, the job stops.
+- `release` computes the tree hash of the commit, stops (naming the image) when the registry lacks that tag, picks the
+  version, adds it to the image at the manifest level (`docker buildx imagetools create`: no pull, same digest) and only
+  then pushes the git tag. The version is the `X.Y.Z` tag already on the commit (a re-run bumps nothing), else the highest
+  `X.Y.Z` on the remote plus one patch, `1.0.0` when there is none; plain `X.Y.Z`, no `v`. Releases run one at a time
+  (`concurrency: {group: release, queue: max}`); never set `cancel-in-progress`.
+- Images: `ghcr.io/tutunak/tgaud:<tree hash>` for every pull request that passed, `ghcr.io/tutunak/tgaud:X.Y.Z` for every
+  release. There is no `latest`. A git tag `X.Y.Z` means the image carries that version; an image `X.Y.Z` without a git
+  tag is a stopped run's leftover, and the next release reuses the number.
+
+What it relies on from the owner:
+
+- **Branch rules** (GitHub settings): pull requests must be up to date with `main` before merging, the required checks are
+  every test job (`lint`, `tests`, `container`, `release-scripts`) **and `publishing`**, and merges use rebase. Otherwise the
+  merged tree has no image and the release stops, saying so. A direct push to `main` stops the same way.
+- **Pull requests from forks** get a read-only token, so their `publishing` fails: push the reviewed branch to this repo
+  and merge it through a same-repository pull request instead.
+- **Tags**: the release workflow is the only writer of `X.Y.Z` git tags. Never tag by hand, and never move a pushed tag.
+- **The package**: `ghcr.io/tutunak/tgaud` is created by the first `publishing` run and linked to this repository. Its
+  visibility must be set to public in the package settings for anonymous pulls. Unverified: whether GitHub makes a package
+  public by itself for a public repository; check after the first run. If the package already exists without having been created by a workflow run of this repo, add the repo
+  under Package settings, Manage Actions access, with role Write.
+- **Recovery**: a release that was cancelled (the queue full, by hand) or failed on a registry or network error is fixed by
+  re-running it, which is safe: a commit that already has a version keeps it, and one without gets the next patch, even
+  after newer commits were released (version order is then release order, not commit order). A release stopped for a
+  missing image isn't fixed by a re-run, since no run built that tree: the next pull request merged up to date with `main`
+  releases a tree that contains the commit.
