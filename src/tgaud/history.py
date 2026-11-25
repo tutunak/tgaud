@@ -15,7 +15,10 @@ Evidence and its time order (design.md 4 and the plan reviews):
                             covers, at started_at; never a retired one (taken under an old chat id at or after its
                             migration)
   rank 4  gap starts        tg.gap of the chat or of every chat, at lower(period)
-  rank 5  migration (M2)    an alias of this chat as old_chat_id with moved_at NULL, at migrated_at
+  rank 5  migration (M2)    an alias of this chat as old_chat_id with moved_at NULL, at migrated_at; a sighting
+                            point of the old id after it is no evidence for the old id (the M2 cutoff: a listing
+                            stamped later, imported or written before the migration was known, must not reopen a
+                            chat that no longer exists; after a later M1 the same points count in the new chat)
 Ranks 3-5 are this module's choice where design.md is silent: an absence or a gap start after positive evidence of
 the same instant ends in the same state either way, and an event dated the second of a migration happened
 before the service message. Aliases with this chat as chat_id (M1, history moved in) open the E3 echo windows.
@@ -284,6 +287,7 @@ def replay(ev: Evidence, trace: Trace | None = None, cases: Cases | None = None)
     ev = _in_utc(ev)
     note = trace.append if trace is not None else None
     event_times = sorted(e.event_at for e in ev.events)
+    cutoff = min(ev.migrations) if ev.migrations else None  # M2: the old id ends at its migration
     items: list[tuple] = []
     for e in ev.events:
         items.append(((e.event_at, 0, e.update_id), e))
@@ -370,6 +374,10 @@ def replay(ev: Evidence, trace: Trace | None = None, cases: Cases | None = None)
 
         elif rank == 1:
             s: SightingPoint = item
+            if cutoff is not None and t > cutoff:
+                if note:
+                    note(("M2-cut", t))  # M2 cutoff: listed under the old id after its migration: not evidence
+                continue
             if last is None:
                 stays.append(_Stay("snapshot", t, t, joined_hint=s.joined_date))  # S1: seeded by a snapshot
                 if note:

@@ -1,5 +1,6 @@
 """The pages of the web UI (design.md 10): overview, overlap matrix and pair drill-down, user lookup, campaigns
-(create, bot links, item 4 per chat and per person, entrant CSV) and the CLI's other reports as tables.
+(create, bot links, item 4 per chat and per person, entrant CSV), the CLI's other reports as tables, and the
+Import page (a tgstats.db upload written as snapshots, tgaud.web.importer).
 
 Every page reads in one REPEATABLE READ transaction through the blocks of queries.sql (tgaud.sql) or the CLI's
 own helpers (tgaud.commands), so a page and `tgaud <report>` give the same numbers for the same as-of time.
@@ -11,11 +12,15 @@ population.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import datetime as dt
 import io
 import logging
+import os
 import re
+import tempfile
+import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -31,6 +36,7 @@ from tgaud.commands import campaigns as campaigns_cmd
 from tgaud.commands import common, reports
 from tgaud.commands.common import CliError, Window
 from tgaud.config import Config
+from tgaud.web import importer, upload
 from tgaud.web.app import HttpError, Request, Response, WebDb, db_error_line, finish, redirect, same_origin, \
     text, token_ok
 
@@ -45,7 +51,8 @@ USER_COLUMNS = frozenset({"user_id"})
 ASOF_MODES = {"counts": "16a", "list": "16b", "eod": "16d", "matrix": "16c"}
 ASOF_INPUTS = ("chat", "date", "mode", "among")  # what an asof page link keeps (with its frozen as_of)
 PAGES = (("/", "Overview"), ("/overlap", "Overlap"), ("/user", "User"), ("/campaigns", "Campaigns"),
-         ("/reports", "Reports"))
+         ("/reports", "Reports"), ("/import", "Import"))
+SPOOL_PREFIX = "tgaud-import-"  # the one spool file of an upload, in the temporary directory (/tmp in the container)
 
 
 def environment() -> jinja2.Environment:
@@ -262,12 +269,15 @@ class WebApp:
 
     def __init__(self, cfg: Config, database: WebDb, token: bytes, *,
                  api_factory: Callable[[Config], Any] | None = None,
-                 fatal: Callable[[int, str], None] = lambda code, reason: None) -> None:
+                 fatal: Callable[[int, str], None] = lambda code, reason: None,
+                 spool_dir: str | None = None) -> None:
         self.cfg = cfg
         self.db = database
         self.token = token
         self.api_factory = api_factory or campaigns_cmd.make_api
         self.fatal = fatal
+        self.spool_dir = spool_dir  # None: the temporary directory
+        self.importing = threading.Lock()  # one import at a time: the spool budget is one file
         self.env = environment()
         self.routes: list[tuple[str, re.Pattern[str], Handler]] = [
             ("GET", re.compile(r"/healthz"), self.healthz),
@@ -286,6 +296,8 @@ class WebApp:
             ("GET", re.compile(r"/reports/asof"), self.asof),
             ("GET", re.compile(r"/reports/coverage"), self.coverage),
             ("GET", re.compile(r"/reports/(?P<name>[a-z-]+)"), self.report),
+            ("GET", re.compile(r"/import"), self.import_form),
+            ("POST", re.compile(r"/import"), self.import_post),
         ]
 
     def __call__(self, environ: dict[str, Any], start_response: Callable) -> list[bytes]:
@@ -631,6 +643,71 @@ class WebApp:
             return self.render("link_made.html", 500, nav="/campaigns", title="Invite link", made=shown)
         log.info("web: bot invite link %d made for chat %d, campaign %d", shown["id"], chat.id, campaign_id)
         return self.render("link_made.html", nav="/campaigns", title="Invite link", made=shown)
+
+    # --------------------------------------------------------------------------------------------------
+    # Import
+    # --------------------------------------------------------------------------------------------------
+
+    def import_form(self, req: Request, _m: dict[str, str], *, problem: str | None = None,
+                    status: int = 200) -> Response:
+        return self.render("import.html", status, nav="/import", title="Import", problem=problem,
+                           max_mib=upload.MAX_FILE // (1024 * 1024), ceiling=importer.MAX_MEMBERS,
+                           seconds=importer.CHAT_SECONDS, names=self.cfg.store_names)
+
+    def import_post(self, req: Request, m: dict[str, str]) -> Response:
+        """A tgstats.db upload (multipart, the one file part): refused with 409 while another import runs, before
+        its body is read; streamed into one spool file under the upload deadline; checked whole, then imported one
+        chat per transaction (tgaud.web.importer). The spool file is deleted whatever happens."""
+        if not self.importing.acquire(blocking=False):
+            return self.import_form(req, m, problem="another import is running: wait for its result page, then "
+                                                    "upload again", status=409)
+        try:
+            return self._import(req, m)
+        except HttpError as e:
+            return self.import_form(req, m, problem=e.message, status=e.status)
+        finally:
+            self.importing.release()
+
+    def _import(self, req: Request, m: dict[str, str]) -> Response:
+        environ = req.environ
+        try:
+            boundary = upload.boundary_of(environ.get("CONTENT_TYPE"))
+            raw_length = environ.get("CONTENT_LENGTH")
+            if not raw_length:
+                raise HttpError(411, "the upload has no Content-Length")
+            if not re.fullmatch(r"[0-9]{1,12}", raw_length):
+                raise HttpError(400, "bad Content-Length")
+            length = int(raw_length)
+            if length > upload.MAX_BODY:
+                raise HttpError(413, f"the upload is larger than {upload.MAX_FILE // (1024 * 1024)} MiB; collect "
+                                     "into a fresh file with tgstats collect --db and upload that")
+        except upload.UploadError as e:
+            raise HttpError(e.status, e.message) from None
+        fd, spool = tempfile.mkstemp(prefix=SPOOL_PREFIX, suffix=".db", dir=self.spool_dir)
+        try:
+            with os.fdopen(fd, "wb") as out:
+                try:
+                    size = upload.receive(environ["wsgi.input"], length, boundary, out)
+                except upload.UploadError as e:
+                    raise HttpError(e.status, e.message) from None
+                except TimeoutError:
+                    raise HttpError(408, "the upload took longer than the server waits; nothing was imported. "
+                                         "Upload again on a faster connection") from None
+                except OSError:
+                    raise HttpError(400, "the connection was lost during the upload; nothing was imported") from None
+            if size == 0:
+                raise HttpError(400, "the file is empty: upload the tgstats.db that tgstats collect wrote")
+            try:
+                report = importer.run(self.db, spool, store_names=self.cfg.store_names)
+            except importer.FileError as e:
+                raise HttpError(400, f"the file was not imported: {e}") from None
+        finally:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(spool)
+        log.info("web: import of %d chats: %d imported, %d skipped, %d refused, %d failed, %d unknown",
+                 len(report.outcomes), report.count(importer.IMPORTED), report.count(importer.SKIPPED),
+                 report.count(importer.REFUSED), report.count(importer.FAILED), report.count(importer.UNKNOWN))
+        return self.render("import_result.html", nav="/import", title="Import result", report=report)
 
     # --------------------------------------------------------------------------------------------------
     # Reports

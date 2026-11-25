@@ -13,9 +13,10 @@ from telethon.tl.functions.messages import GetFullChatRequest
 NOW = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
 
-def tg_user(uid, bot=False, deleted=False, first=None):
+def tg_user(uid, bot=False, deleted=False, first=None, premium=None, last=None):
     return types.User(
-        id=uid, first_name=first or f"Name{uid}", username=f"user{uid}", bot=bot, deleted=deleted
+        id=uid, first_name=first or f"Name{uid}", last_name=last, username=f"user{uid}", bot=bot, deleted=deleted,
+        premium=premium,
     )
 
 
@@ -39,7 +40,10 @@ class FakeClient:
 
     opts[id]: page (max participants per response), cap (max returned by the
     empty-query listing), search_cap (max returned by a non-empty query), reported
-    (what GetFullChannel says), error (exception to raise on GetFullChannel/GetParticipants).
+    (what GetFullChannel, or GetFullChat's chat, says; a list gives one value per count
+    read, and an exception in it is raised by that read), error (exception to raise on
+    GetFullChannel/GetParticipants), participant (user -> the participant object a
+    listing returns for that user; default ChannelParticipant joined at NOW).
 
     Interrupts (Ctrl-C) happen instead of answering a request: on GetFullChannel
     (interrupt_on_full), on given 1-based GetParticipants call numbers
@@ -51,6 +55,7 @@ class FakeClient:
     def __init__(
         self, dialogs, members, opts=None, flood_on=(), dialog_floods=0,
         interrupt_on_full=False, interrupt_on_calls=(), interrupt_on_queries=(), sigint=False, fail_on_queries=None,
+        fail_on_pages=None,
     ):
         self.dialogs = dialogs
         self.members = members
@@ -62,6 +67,7 @@ class FakeClient:
         self.interrupt_on_queries = set(interrupt_on_queries)
         self.sigint = sigint
         self.fail_on_queries = fail_on_queries or {}  # search query -> exception to raise
+        self.fail_on_pages = fail_on_pages or {}  # (search query, offset) -> exception to raise
         self.participant_calls = 0
         self.requests = []
 
@@ -82,13 +88,26 @@ class FakeClient:
 
         return gen()
 
+    def _reported(self, opt, default):
+        value = opt.get("reported", default)
+        if isinstance(value, list):
+            value = value.pop(0) if len(value) > 1 else value[0]
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
     async def __call__(self, request):
         self.requests.append(request)
         if isinstance(request, GetFullChatRequest):
             users = self.members[request.chat_id]
-            parts = [types.ChatParticipant(user_id=u.id, inviter_id=0, date=NOW) for u in users]
+            opt = self.opts.get(request.chat_id, {})
+            make = opt.get("participant", lambda u: types.ChatParticipant(user_id=u.id, inviter_id=0, date=NOW))
+            parts = [make(u) for u in users]
+            chat = types.Chat(id=request.chat_id, title="g", photo=types.ChatPhotoEmpty(),
+                              participants_count=self._reported(opt, len(users)), date=NOW, version=1)
             return SimpleNamespace(
-                full_chat=SimpleNamespace(participants=SimpleNamespace(participants=parts)), users=users
+                full_chat=SimpleNamespace(participants=SimpleNamespace(participants=parts)), users=users,
+                chats=[chat],
             )
         cid = request.channel.id
         opt = self.opts.get(cid, {})
@@ -99,7 +118,7 @@ class FakeClient:
             if self.interrupt_on_full:
                 await self._interrupt()
             return SimpleNamespace(
-                full_chat=SimpleNamespace(participants_count=opt.get("reported", len(users)))
+                full_chat=SimpleNamespace(participants_count=self._reported(opt, len(users)))
             )
         assert isinstance(request, GetParticipantsRequest)
         self.participant_calls += 1
@@ -108,6 +127,8 @@ class FakeClient:
         query = request.filter.q.lower()
         if query in self.fail_on_queries:
             raise self.fail_on_queries[query]
+        if (query, request.offset) in self.fail_on_pages:
+            raise self.fail_on_pages[(query, request.offset)]
         if self.participant_calls in self.interrupt_on_calls or query in self.interrupt_on_queries:
             await self._interrupt()
         if query:
@@ -116,8 +137,9 @@ class FakeClient:
         else:
             hits = users[: opt.get("cap", len(users))]
         page = hits[request.offset : request.offset + min(request.limit, opt.get("page", 200))]
+        make = opt.get("participant", lambda u: types.ChannelParticipant(user_id=u.id, date=NOW))
         return SimpleNamespace(
-            participants=[types.ChannelParticipant(user_id=u.id, date=NOW) for u in page],
+            participants=[make(u) for u in page],
             users=page,
             count=len(hits),
         )

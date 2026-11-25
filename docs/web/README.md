@@ -18,7 +18,11 @@ shared Caddy with `basic_auth` on a tailnet-only domain) and has no login of its
   `/user?q=...` is 400); a link to a person is a small POST form; the pair list pages by position; the entrant CSV
   is a POST. The access log (DEBUG) has method, path without the query, and status only.
 - **Bounded.** At most 16 requests are handled at once. A connection beyond them gets `503 busy` on the accepting
-  thread, without a handler thread. A request must arrive whole within 10 s, or its connection is closed.
+  thread, without a handler thread. A request must arrive whole within 10 s, or its connection is closed, and a POST
+  body is at most 64 KiB. The one exception is `POST /import`: its body is left to the page, which checks the token,
+  the method and the origin first, allows one import at a time (409 for a second, before its body is read), and
+  streams at most 32 MiB within 2 minutes into one spool file in `/tmp`, deleted when the request ends. After an
+  early answer the listener reads and drops the rest of the body for up to 2 s, so the client can read the page.
 - **Escaping.** Jinja2 autoescaping everywhere; titles, names and usernames come from Telegram.
 - **Headers.** Every response is `Cache-Control: no-store` (user-level data) with a Content-Security-Policy that
   allows only the app's own stylesheet: the UI has no JavaScript and loads nothing from a CDN.
@@ -34,8 +38,9 @@ dependency to pin or patch), a plain WSGI app (`tgaud.web.app`, `tgaud.web.pages
 
 One database connection, `tgaud-web`, opened on the first request (none while the web UI is off), so serve holds
 at most 4. Requests take turns on it; each statement has a 60 s `statement_timeout`. Pages read in one REPEATABLE
-READ read-only transaction, like the CLI's reports. Writes open with serve's generation fence. SIGTERM cancels the
-statement in flight.
+READ read-only transaction, like the CLI's reports. Writes open with serve's generation fence. An import writes one
+transaction per chat, bounded in total by 30 s (its waits included), so a page waits at most that long for the
+connection during an import. SIGTERM cancels the statement in flight.
 
 ## Pages
 
@@ -51,6 +56,7 @@ statement in flight.
 | `/reports`, `/reports/NAME` | every other CLI report as a table, with as-of, scope, coverage and gap flags | the report's block |
 | `/reports/asof` | who was in a chat at a moment: counts, the list, the end-of-day count, the pair matrix of the `among` chats at that moment | 16a, 16b, 16d, 16c |
 | `/reports/coverage` | `tgaud coverage` and `--gaps` | the CLI's queries |
+| `/import` (GET; POST a `tgstats.db`, multipart) | the form, what is imported and the limits; the result: every chat of the file with its outcome (imported, skipped, refused, failed, unknown) and the reason, then links to the overview and the coverage report | writes `tg.snapshot` and `tg.snapshot_member` (docs/tgaud.md, "The Import page") |
 
 A report table shows 500 rows per page, each page its own bounded query (`tgaud.sql.run_page`: the block's last
 statement with LIMIT/OFFSET); the page links keep the scope and options and freeze the first page's as-of time.

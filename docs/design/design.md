@@ -132,7 +132,7 @@ L = `last_confirmed_at`, G = 10 min. Rows with a chat in brackets were exercised
 | P4 | any | probe failed (429, timeout, error) | - | unknown: nothing changes; stays open and suspect; retried with backoff (H11) |
 | G1 | open | gap (outage, rights lost) | gap starts after L | suspect since the gap start; probes queued (reason `outage`) within the budget; a later sighting, probe or event clears it (H14, A-D confirmed by the Aug 12 snapshots) |
 | M1 | any | migration, new chat tracked | - | `tg.move_chat_history`: all rows re-keyed, then rebuild (E3 absorbs the echoes) (H13) |
-| M2 | open | migration, new chat not tracked | - | close `migration`/`migrated`, bounds L .. `migrated_at`: censoring, never an exit; reopened by M1 if the new chat is tracked later |
+| M2 | open | migration, new chat not tracked | - | close `migration`/`migrated`, bounds L .. `migrated_at`: censoring, never an exit; reopened by M1 if the new chat is tracked later. A sighting of the old id dated after `migrated_at` is not evidence for it (the M2 cutoff: a listing written or imported before the migration was known must not reopen a chat that no longer exists) |
 
 A member who was there before the bot comes from the collect script (S1) with Telegram's join date as a hint; a
 missed leave is found later by a probe (P3, bounded exit) or by the next observed join (E4, unknown end before it).
@@ -155,6 +155,11 @@ exactly this. Ids: chat id from `utils.get_peer_id` (Bot API marked form), user 
    fetched = <distinct users written>, complete = <false if interrupted or the script saw an error> WHERE
    snapshot_id = $1`. **This marks it finished.** An interrupted run may still finish with `complete = false`:
    its sightings count, its absences do not. A snapshot left unfinished for 2 days is deleted by the reconciler.
+
+**Implemented writer.** The web UI's Import page is this contract's writer (docs/tgaud.md, "The Import page"): the
+owner runs `tgstats collect`, which records these fields in its `tgstats.db`, and uploads the file; for each tracked
+chat the latest snapshot is written by steps 2-4 in one transaction (with `collect_uuid`, migration 011, against
+duplicates), refused when older than one tgaud has or taken by a tgstats without these fields.
 
 The reconciler takes finished, unreconciled snapshots per chat in `started_at` order once ingest has caught up past
 `finished_at` (a `getUpdates` that returned fewer than 100 updates after `finished_at`; never "a later event in that

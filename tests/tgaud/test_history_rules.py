@@ -302,6 +302,18 @@ def test_M2_migration_to_an_untracked_chat_closes_by_migration():
     assert rules == ["E1", "E5", "M2-none"]
 
 
+def test_M2_cutoff_a_listing_of_the_old_id_after_its_migration_is_no_evidence():
+    """snapshot-import plan review, rule 2: a snapshot committed before the migration was known but dated after it
+    (an import, or the collect script) must not reopen the old id: no S4, no S1, no S3 conflict."""
+    m = at(60 * 24)
+    for later in (timedelta(minutes=5), timedelta(hours=2)):  # within G of the close (S3) and past it (S4)
+        (s,), rules = run(events=[join(at(0))], sightings=[seen(at(60)), seen(m + later)], migrations=[m])
+        assert rules == ["E1", "S2", "M2", "M2-cut"] and (s.end_source, s.left_before) == ("migration", m)
+    assert run(sightings=[seen(m + timedelta(hours=2))], migrations=[m]) == ([], ["M2-none", "M2-cut"])
+    (s,), rules = run(sightings=[seen(m)], migrations=[m])  # the migration's own instant is still before it
+    assert rules == ["S1", "M2"]
+
+
 # --- order ---------------------------------------------------------------------------------------------------
 
 def test_same_instant_order_is_events_by_update_id_then_sightings_then_probes():

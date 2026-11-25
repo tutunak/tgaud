@@ -40,6 +40,10 @@ The fake Bot API (`tests/tgaud/botapi_fake.py`, never the real Telegram): `FakeB
 and the metrics listener real) through a scripted day against the fake Bot API server: the module docstring lists
 the day and the few things shortened for the test (job intervals; count samples taken when the test asks).
 
+The Import page's tests (`tests/tgaud/test_import*.py`) write synthetic `tgstats.db` files with the tgstats code
+itself and drive the page through the WSGI app, the real listener and the reconciler's scheduler loop
+(`tests/tgaud/import_lab.py`); `TGAUD_IMPORT_SCALE_MIB=32` repeats the size measurement with a 32 MiB file.
+
 `tests/tgaud/serve_runner.py` runs `tgaud serve` through the real CLI with job modules from
 `tests/tgaud/serve_fakes.py` put into `sys.modules` under the real names; that is how a test replaces a job.
 
@@ -101,6 +105,9 @@ src/tgaud/
   cli.py         argparse entry: serve, migrate, botcheck, --selfcheck, register()
   selfcheck.py   the offline check
   sql/           migrations/NNN_name.sql, queries.sql, admin.sql
+  web/           the web UI (docs/web/README.md); the Import page: upload.py (the multipart body into one spool
+                 file), tgstats_file.py (the uploaded tgstats.db, read defensively and checked), importer.py (the
+                 snapshots written, one transaction per chat)
 ```
 
 ## Process model (`tgaud serve`)
@@ -162,6 +169,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 | rollups | `tgaud/jobs/chat_day.py`, `audience.py`, `partitions.py` (R1, R2 in Python, R4); migration 006 |
 | cli | modules in `tgaud/commands/` that call `tgaud.cli.register(name, help, add_arguments, run)`; migration 008 |
 | web | `tgaud/web/` (docs/web/README.md), started in `tgaud.jobs.serve` after the metrics listener; the token is checked first (exit 2); blocks 1b, 2c, 2d of queries.sql; no migration |
+| snapshot-import | the Import page (`tgaud/web/upload.py`, `tgstats_file.py`, `importer.py`), the listener's upload path in `tgaud/web/__init__.py`, the M2 cutoff in `tgaud/history.py`; `tgstats` collect's new file format; migration 011 |
 | image | Containerfile, GitHub Actions CI and release; adds the container check, `lint-ci` and `release-scripts` to the `ci` task of `mise.toml` |
 
 ## Migrations
@@ -181,7 +189,8 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   rollback after `migrate` must keep working. `serve` exits 3 when the database lacks one of the image's
   migrations and accepts a newer database with a warning.
 - Numbers: core 002 (every addition more than one task uses), history 003, reconcile 004, probe-sample 005,
-  rollups 006, ingest 007, cli 008, prober-simplify 010 (009 stays unused: the web UI needs no migration) (`tg.probe.next_attempt_at`, `.spell_from`).
+  rollups 006, ingest 007, cli 008, prober-simplify 010 (009 stays unused: the web UI needs no migration) (`tg.probe.next_attempt_at`, `.spell_from`),
+  snapshot-import 011 (`tg.snapshot.collect_uuid` with a unique index).
 
 002 (`002_shared.sql`) adds: `tg.bot_state.caught_up_at`, `.link_key_fingerprint`, `.serve_generation`;
 `tg.member_event.actor_is_other` with its BEFORE INSERT trigger (the rebuild and the join route read it, never
@@ -199,6 +208,69 @@ ordered either way).
   order. Every writer of evidence or spells takes it before reading what it rebuilds from, and keeps that
   transaction short. The single-bigint key space of `pg_advisory_xact_lock` is reserved for chat ids.
 - tgaud's own locks use the two-int4 form with class `0x74676175`: `MIGRATE_LOCK` (…, 1), `SERVE_LOCK` (…, 2).
+
+## The Import page (snapshot import)
+
+The writer of design.md 5 that is built: the owner runs `tgstats collect` on their machine and uploads the
+`tgstats.db` on the web UI's Import page; tgaud writes the latest snapshot of each tracked chat exactly as the
+contract describes, and the reconciler applies it like any other. The plan and its decisions:
+`docs/plans/snapshot-import.md`.
+
+**The file.** `tgstats collect` records the contract's fields (src/tgstats/db.py): per snapshot a random `uuid`,
+`started_at` (before the first count read), `finished_at`, `reported_start` and `reported_end` (both read fresh),
+`method`; per membership row the observation of the first page that listed the user (`seen_at`, `joined_date`,
+`inviter_id`, `via_request`, `subscription_until`, `is_bot`, `is_deleted`, `is_premium`, names). Old files get these
+columns on open (NULL for their snapshots); tgaud refuses those snapshots ("old format": they have only `taken_at`,
+roughly the end of the collection, so their sightings could contradict leaves recorded during it).
+
+**Transport** (`tgaud/web/__init__.py`, `upload.py`). Every request is read whole within 10 s and a POST body is at
+most 64 KiB, read before the app runs; `POST /import` is the one exception. The listener hands the app the
+connection unread; the app checks the proxy token, the method and the origin (the usual order), takes the one
+import slot (a second upload gets 409 before its body is read) and the Content-Length (none: 411; over 32 MiB plus
+16 KiB of multipart overhead: 413), then streams the body, read as it arrives under a 2-minute deadline
+(`UPLOAD_DEADLINE`, 408 after it), straight into one spool file (`tempfile.mkstemp` in `/tmp`, `tgaud-import-*.db`):
+exactly one part, the `file` field, at most 32 MiB. A body that ends early is 400. The spool file is deleted when the
+request ends, whatever happened. An answer sent before the body was read whole (403, 409, 413, 408) is followed by a
+half-close and up to 2 s of reading and dropping the rest (`LINGER`), so the client reads the page instead of meeting
+a reset.
+
+**The check** (`tgstats_file.py`), before any write and outside the web connection. The file is opened
+`mode=ro&immutable=1` with `SQLITE_DBCONFIG_DEFENSIVE`, untrusted schema, triggers and views disabled, `query_only`,
+`temp_store=MEMORY`, value length 64 KiB, an authorizer that allows only reads of the known tables and a progress
+deadline of 30 s. `sqlite_master` must hold exactly the four tgstats tables (and `sqlite_sequence`), with exactly
+the old or the new columns and the tgstats keys, no view, trigger or virtual table. Structural problems (that, or a
+value of the wrong type or shape in a row the import reads) refuse the whole file. Per chat, the latest snapshot by
+`started_at` (an old one by `taken_at`; ties: the new format, then the uuid; never the row id) is checked: uuid
+well-formed, `started_at <= every seen_at <= finished_at <= now + 5 min`, counts non-negative, method known, at most
+`MAX_MEMBERS` members. A value error refuses that chat only. Names lose their control characters. Nothing of the
+member rows is kept in memory; they are read again for the write.
+
+**The write** (`importer.py`). One transaction per chat on the web connection (`WebDb.write_within`), bounded by
+`CHAT_SECONDS` (30 s) in total: `lock_timeout` and `statement_timeout` are set from the time left before the fence
+and before every later statement, so the fence's and the chat lock's waits count too. In order: the generation fence;
+`history.lock_chats([chat])` (ingest, the reconciler, migrations and forget-user take it); the uuid anywhere in
+`tg.snapshot` (skipped: already imported); the chat an `old_chat_id` of `tg.chat_alias` (refused: migrated; before
+tracking, as M1 deletes the old chat's row); not tracked (skipped); a snapshot of the chat with `started_at` at or
+after this one's (skipped: not newer). Then `INSERT tg.snapshot` unfinished with `collect_uuid`, `COPY
+tg.snapshot_member` (names only with `TGAUD_STORE_NAMES`), delete the rows of anyone in `tg.erasure` whatever their
+`seen_at` (migration 008's trigger keeps a row dated after the erasure; a collector's clock proves nothing) and
+clear erased inviters, and finish the snapshot with `fetched` = the rows left. Failures are per chat: a database
+error fails that chat ("upload the same file again"), the next chat still runs on a new connection; a commit whose
+answer was lost is "unknown", and the re-upload settles it by the uuid.
+
+**Size.** One chat's transaction holds the web connection, so other pages wait for it. `MAX_MEMBERS` = 200 000 per
+snapshot; measured on the development machine against the test server's production limits
+(`tests/tgaud/test_import_scale.py`): a chat at the ceiling (18 MiB file) took 7.3 s with a report waiting 7.2 s
+for the connection; the largest chat a 32 MiB file holds (352 960 members, no names) took 12.6 s. The cost is the
+COPY, where migration 008's per-row erasure trigger dominates (about 4 s per 100 000 members); the ceiling keeps a
+slower server well inside the 30 s deadline and the 75 s lock wait.
+
+**After the import** the reconciler grades the snapshot once ingest has caught up past its `finished_at`, and applies
+it by the state table. One rule was added for it (design.md 4, M2): a sighting of an old chat id dated after its
+migration is not evidence for the old id (`tgaud.history.replay`, "M2-cut"). Without it, a snapshot committed before
+ingest recorded the migration, with pages stamped after `migrated_at`, reopened spells (S4) on a chat that no longer
+exists (`tests/tgaud/test_import.py`, the import-first migration test). After a later M1 the same points count in
+the new chat.
 
 ## The query loader
 

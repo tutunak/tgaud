@@ -12,14 +12,22 @@ autoescaping (tgaud/web/templates). No JavaScript and no CDN: the one stylesheet
 
 One database connection (the contract's budget: serve holds at most 4), opened on the first request, never when
 the web UI is off. Requests take turns on it. Reads are REPEATABLE READ read-only transactions through the blocks
-of queries.sql, as the CLI's; writes (a campaign, a bot invite link) open with the serve generation fence. POST
-forms must come from the request's own host (Origin, or Referer without one).
+of queries.sql, as the CLI's; writes (a campaign, a bot invite link, an import) open with the serve generation
+fence. POST forms must come from the request's own host (Origin, or Referer without one).
+
+Bodies: every request must arrive whole within READ_DEADLINE, and a POST body is read before the app runs, at most
+MAX_BODY (64 KiB). The one exception is /import (tgaud.web.upload): its body is left unread for the app, which
+checks the proxy token, the method and the origin first; a POST is then streamed into a spool file within
+UPLOAD_DEADLINE.
+After an answer sent before the body was all read, the listener half-closes and reads what the client still sends
+for a little while (LINGER), so the client can read the error page instead of meeting a reset connection.
 """
 
 from __future__ import annotations
 
 import io
 import logging
+import socket
 import threading
 import time
 from collections.abc import Callable
@@ -31,7 +39,7 @@ from wsgiref.simple_server import ServerHandler, WSGIRequestHandler, WSGIServer,
 import psycopg
 
 from tgaud.config import Config, Secret
-from tgaud.web.app import MAX_BODY, WebDb
+from tgaud.web.app import MAX_BODY, UPLOAD_PATH, WebDb
 from tgaud.web.pages import WebApp
 
 log = logging.getLogger(__name__)
@@ -40,7 +48,9 @@ __all__ = ["WebServer", "WebApp", "WebDb"]
 
 MAX_HANDLERS = 16  # requests handled at once; a connection beyond them gets 503 without a thread
 READ_DEADLINE = 10.0  # seconds a client has to send its whole request (line, headers, body)
+UPLOAD_DEADLINE = 120.0  # seconds a client has to send the body of POST /import, from the end of its headers
 WRITE_TIMEOUT = 30.0  # seconds a send of the response may block
+LINGER = 2.0  # seconds the rest of an upload is read and dropped after an early answer
 _BUSY = (b"HTTP/1.0 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n"
          b"Content-Length: 5\r\nConnection: close\r\n\r\nbusy\n")
 
@@ -100,17 +110,48 @@ class _DeadlineSocket(io.RawIOBase):
         return self.sock.recv_into(buffer)
 
 
+class _UploadInput(io.RawIOBase):
+    """wsgi.input of POST /import: at most `length` bytes of the body, read as they arrive under the upload's
+    deadline (the socket reader's), each read put back to WRITE_TIMEOUT for the answer that follows."""
+
+    def __init__(self, reader: io.BufferedReader, sock: Any, length: int) -> None:
+        super().__init__()
+        self.reader, self.sock, self.left = reader, sock, length
+        self.ended = False  # the client closed its side before `length` bytes
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, n: int = -1) -> bytes:
+        if self.left <= 0:
+            return b""
+        n = self.left if n is None or n < 0 else min(n, self.left)
+        try:
+            chunk = self.reader.read1(n)
+        finally:
+            self.sock.settimeout(WRITE_TIMEOUT)
+        if not chunk:
+            self.ended = True
+        self.left -= len(chunk)
+        return chunk
+
+
 class _Handler(WSGIRequestHandler):
     """Reads the whole request within READ_DEADLINE before the app runs (a slow or idle client cannot hold a
-    handler), and logs method, path without the query, and status only: queries carry user ids and @names."""
+    handler), and logs method, path without the query, and status only: queries carry user ids and @names.
+    /import is the exception: its body is the app's to read, after its guards, within upload_deadline."""
 
     server_version = "tgaud"
     sys_version = ""
     read_deadline = READ_DEADLINE
+    upload_deadline = UPLOAD_DEADLINE
+    linger = LINGER
 
     def handle(self) -> None:
         self.rfile.close()  # setup()'s reader, unused: nothing was read through it yet
-        self.rfile = io.BufferedReader(_DeadlineSocket(self.connection, time.monotonic() + self.read_deadline))
+        raw = _DeadlineSocket(self.connection, time.monotonic() + self.read_deadline)
+        self.rfile = io.BufferedReader(raw)
+        upload: _UploadInput | None = None
         try:
             self.raw_requestline = self.rfile.readline(65537)
             if not self.raw_requestline:
@@ -126,20 +167,49 @@ class _Handler(WSGIRequestHandler):
             except ValueError:
                 self.send_error(400, "bad Content-Length")
                 return
-            if length < 0 or length > MAX_BODY:
-                self.send_error(413)
+            if length < 0:
+                self.send_error(400, "bad Content-Length")
                 return
-            body = self.rfile.read(length) if length else b""
-            if len(body) < length:
-                return  # the client went away
+            if urlsplit(self.path).path == UPLOAD_PATH:  # any method: the app's guards come before any body read
+                raw.deadline = time.monotonic() + self.upload_deadline
+                upload = _UploadInput(self.rfile, self.connection, length)
+                body_input: Any = upload
+            else:
+                if length > MAX_BODY:
+                    self.send_error(413)
+                    return
+                body = self.rfile.read(length) if length else b""
+                if len(body) < length:
+                    return  # the client went away
+                body_input = io.BytesIO(body)
         except (TimeoutError, OSError):
             self.close_connection = True
             return
         self.connection.settimeout(WRITE_TIMEOUT)
-        handler = ServerHandler(io.BytesIO(body), self.wfile, self.get_stderr(), self.get_environ(),
-                                multithread=True)
+        handler = ServerHandler(body_input, self.wfile, self.get_stderr(), self.get_environ(), multithread=True)
         handler.request_handler = self
         handler.run(self.server.get_app())
+        if upload is not None and upload.left > 0 and not upload.ended:
+            self._drain(upload.left)
+
+    def _drain(self, left: int) -> None:
+        """The answer went out before the body was all read: half-close, then read and drop what the client still
+        sends (at most its declared rest, for `linger` seconds), so closing does not reset the connection before
+        the client has read the answer."""
+        try:
+            self.connection.shutdown(socket.SHUT_WR)
+            end = time.monotonic() + self.linger
+            while left > 0:
+                wait = end - time.monotonic()
+                if wait <= 0:
+                    return
+                self.connection.settimeout(wait)
+                chunk = self.connection.recv(min(65536, left))
+                if not chunk:
+                    return
+                left -= len(chunk)
+        except OSError:
+            return
 
     def log_request(self, code: Any = "-", size: Any = "-") -> None:
         path = urlsplit(getattr(self, "path", "") or "").path

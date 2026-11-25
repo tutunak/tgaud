@@ -6,8 +6,10 @@ import asyncio
 import random
 import sqlite3
 import string
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Iterable
+from uuid import uuid4
 
 from telethon import TelegramClient, errors, utils
 from telethon.tl import types
@@ -16,7 +18,7 @@ from telethon.tl.functions.messages import GetFullChatRequest
 
 from . import db
 from .analysis import resolve_chat
-from .db import ChatRow, UserRow
+from .db import ChatRow, Member, UserRow
 
 PAGE_SIZE = 200
 MAX_FLOOD_RETRIES = 20
@@ -34,6 +36,11 @@ DEFAULT_EXPAND_AT = 100
 
 Sleep = Callable[[float], Awaitable[None]]
 Out = Callable[[str], None]
+Clock = Callable[[], datetime]
+
+
+def wall_clock() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 @dataclass(frozen=True)
@@ -58,6 +65,47 @@ class CollectResult:
     reported: int | None = None
     complete: bool = True
     error: str | None = None
+
+
+@dataclass
+class Listing:
+    """One collection of one chat as it goes (tgaud's snapshot contract, docs/design/design.md 5): its random id,
+    when it started, the count read before it, the first observation of every member, the path it took, and the
+    first error it went on after (a kept listing that saw an error is incomplete whatever the counts say).
+
+    Times come from `clock` but never go back: a wall-clock step between two pages must not date a page before
+    the start or before an earlier page."""
+
+    clock: Clock = wall_clock
+    uuid: str = field(default_factory=lambda: str(uuid4()))
+    members: dict[int, Member] = field(default_factory=dict)
+    method: str = "listing"
+    error: str | None = None
+    reported_start: int | None = None
+    started_at: str = ""
+    _last: datetime | None = None
+
+    def now(self) -> str:
+        t = self.clock().astimezone(timezone.utc)
+        if self._last is not None and t < self._last:
+            t = self._last
+        self._last = t
+        return t.isoformat(timespec="microseconds")
+
+    def start(self) -> None:
+        self.started_at = self.now()
+
+    def add(self, rows: dict[int, Member]) -> None:
+        """Merge one page: a member already listed keeps the first page's observation."""
+        for uid, row in rows.items():
+            self.members.setdefault(uid, row)
+
+    def failed(self, what: str) -> None:
+        if self.error is None:
+            self.error = what
+
+    def finish(self, reported_end: int | None) -> db.Collection:
+        return db.Collection(self.uuid, self.started_at, self.now(), self.method, self.reported_start, reported_end)
 
 
 class Pacer:
@@ -165,6 +213,8 @@ def _user_row(user: Any) -> UserRow:
 def _participant_user_id(participant: Any) -> int | None:
     if isinstance(participant, types.ChannelParticipantLeft):
         return None
+    if isinstance(participant, types.ChannelParticipantBanned) and participant.left:
+        return None  # restricted or banned and no longer in the chat: not a member
     user_id = getattr(participant, "user_id", None)
     if user_id is None:
         peer = getattr(participant, "peer", None)
@@ -172,36 +222,65 @@ def _participant_user_id(participant: Any) -> int | None:
     return user_id
 
 
-def _rows_from(participants: Iterable[Any], users: Iterable[Any]) -> dict[int, UserRow]:
+def _when(value: Any) -> str | None:
+    if not isinstance(value, datetime):
+        return None
+    return (value if value.tzinfo else value.replace(tzinfo=timezone.utc)).astimezone(timezone.utc).isoformat()
+
+
+def _member(participant: Any, user: Any, seen_at: str) -> Member:
+    """The observation of one participant on one page. Telethon 1.45: `date` (the join date) on ChannelParticipant,
+    -Self, -Admin, -Banned and Chat-/ChatParticipantAdmin, none on the creators (joined_date NULL, design.md 5);
+    `inviter_id` on -Self, -Admin and the Chat ones (0 = none); `via_request` on -Self only;
+    `subscription_until_date` on ChannelParticipant and -Self."""
+    inviter = getattr(participant, "inviter_id", None)
+    via = getattr(participant, "via_request", None)
+    return Member(
+        user=_user_row(user),
+        seen_at=seen_at,
+        joined_date=_when(getattr(participant, "date", None)),
+        inviter_id=inviter if isinstance(inviter, int) and inviter > 0 else None,
+        via_request=bool(via) if isinstance(participant, types.ChannelParticipantSelf) else None,
+        subscription_until=_when(getattr(participant, "subscription_until_date", None)),
+        is_premium=bool(getattr(user, "premium", False)),
+    )
+
+
+def _rows_from(participants: Iterable[Any], users: Iterable[Any], seen_at: str) -> dict[int, Member]:
+    """The members one page lists, observed at `seen_at` (a user listed twice on the page: the first entry)."""
     by_id = {u.id: u for u in users if hasattr(u, "id")}
-    rows: dict[int, UserRow] = {}
+    rows: dict[int, Member] = {}
     for p in participants:
         uid = _participant_user_id(p)
-        if uid is not None and uid in by_id:
-            rows[uid] = _user_row(by_id[uid])
+        if uid is not None and uid in by_id and uid not in rows:
+            rows[uid] = _member(p, by_id[uid], seen_at)
     return rows
 
 
 async def reported_count(
     client: Any, chat: AdminChat, sleep: Sleep = asyncio.sleep, out: Out = print
 ) -> int | None:
-    """The member count Telegram reports for the chat."""
+    """The member count Telegram reports for the chat now: asked for every time, never the dialog list's copy."""
     entity = chat.entity
     if isinstance(entity, types.Channel):
         full = await call(client, GetFullChannelRequest(entity), sleep, out)
         return getattr(full.full_chat, "participants_count", None)
-    return getattr(entity, "participants_count", None)
+    full = await call(client, GetFullChatRequest(entity.id), sleep, out)
+    for c in getattr(full, "chats", None) or []:
+        if getattr(c, "id", None) == entity.id:
+            return getattr(c, "participants_count", None)
+    return None
 
 
 async def _search_members(
-    client: Any, entity: Any, query: str, sleep: Sleep, out: Out, into: dict[int, UserRow]
-) -> dict[int, UserRow]:
+    client: Any, entity: Any, query: str, sleep: Sleep, out: Out, listing: Listing
+) -> int:
     """Page through one channel participant listing until Telegram returns no more.
 
-    Every page is merged into `into` as it arrives, so an interrupt keeps what was found; the
-    return value is what this one query alone returned.
+    Every page is merged into the listing as it arrives (dated when it arrived), so an interrupt keeps what was
+    found; returns how many distinct members this one query alone returned.
     """
-    members: dict[int, UserRow] = {}
+    found: set[int] = set()
     offset = 0
     while True:
         result = await call(
@@ -212,24 +291,27 @@ async def _search_members(
             sleep,
             out,
         )
+        seen_at = listing.now()
         participants = getattr(result, "participants", None)
         if not participants:
             break
-        rows = _rows_from(participants, result.users)
-        members.update(rows)
-        into.update(rows)
+        rows = _rows_from(participants, result.users, seen_at)
+        found.update(rows)
+        listing.add(rows)
         offset += len(participants)
-    return members
+    return len(found)
 
 
 async def _basic_group_members(
-    client: Any, entity: Any, sleep: Sleep, out: Out
-) -> dict[int, UserRow]:
+    client: Any, entity: Any, sleep: Sleep, out: Out, listing: Listing
+) -> None:
+    listing.method = "basic_group"
     full = await call(client, GetFullChatRequest(entity.id), sleep, out)
+    seen_at = listing.now()
     participants = getattr(full.full_chat.participants, "participants", None)
     if participants is None:
         raise RuntimeError("Telegram did not return the member list of this group (no rights?)")
-    return _rows_from(participants, full.users)
+    listing.add(_rows_from(participants, full.users, seen_at))
 
 
 def pair_queries(first: str) -> list[str]:
@@ -243,16 +325,23 @@ def pair_queries(first: str) -> list[str]:
 async def _deep_search(
     client: Any,
     entity: Any,
-    members: dict[int, UserRow],
+    listing: Listing,
     reported: int | None,
     expand_at: int,
     sleep: Sleep,
     out: Out,
 ) -> None:
-    """Search by single characters, then, while still short, by character pairs; merge into `members`."""
+    """Search by single characters, then, while still short, by character pairs; merge into the listing. A failed
+    query stops the search and keeps what was found, and the listing is incomplete from then on."""
+    members = listing.members
+    listing.method = "deep"
 
     def short() -> bool:
         return db.is_incomplete(len(members), reported)
+
+    def stopped(query: str, exc: Exception) -> None:
+        out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
+        listing.failed(f"the deep search query {query!r} failed: {type(exc).__name__}: {exc}")
 
     out(f"  listing is short ({len(members)} of {reported}); searching by single characters")
     returned: dict[str, int] = {}
@@ -261,11 +350,11 @@ async def _deep_search(
             return
         before = len(members)
         try:
-            found = await _search_members(client, entity, query, sleep, out, members)
+            found = await _search_members(client, entity, query, sleep, out, listing)
         except Exception as exc:  # keep what we already have
-            out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
+            stopped(query, exc)
             return
-        returned[query] = len(found)
+        returned[query] = found
         out(f"  deep {query!r}: +{len(members) - before} new, {len(members)} total")
     if not short():
         return
@@ -286,9 +375,9 @@ async def _deep_search(
             if not short():
                 break
             try:
-                await _search_members(client, entity, query, sleep, out, members)
+                await _search_members(client, entity, query, sleep, out, listing)
             except Exception as exc:  # keep what we already have
-                out(f"  deep search stopped at {query!r}: {type(exc).__name__}: {exc}")
+                stopped(query, exc)
                 return
             ran += 1
         out(f"  deep '{first}?': {ran} queries, +{len(members) - before} new, {len(members)} total")
@@ -304,33 +393,37 @@ async def fetch_members(
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
     expand_at: int = DEFAULT_EXPAND_AT,
-    into: dict[int, UserRow] | None = None,
-) -> dict[int, UserRow]:
-    """The members of a chat. With `into`, members are added to that dict as they are found."""
-    members = {} if into is None else into
+    listing: Listing | None = None,
+) -> Listing:
+    """The members of a chat, added to `listing` (a new one by default) as they are found."""
+    listing = Listing() if listing is None else listing
     if not isinstance(chat.entity, types.Channel):
-        members.update(await _basic_group_members(client, chat.entity, sleep, out))
-        return members
+        await _basic_group_members(client, chat.entity, sleep, out, listing)
+        return listing
 
-    await _search_members(client, chat.entity, "", sleep, out, members)
-    if deep and db.is_incomplete(len(members), reported):
-        await _deep_search(client, chat.entity, members, reported, expand_at, sleep, out)
-    return members
+    await _search_members(client, chat.entity, "", sleep, out, listing)
+    if deep and db.is_incomplete(len(listing.members), reported):
+        await _deep_search(client, chat.entity, listing, reported, expand_at, sleep, out)
+    return listing
 
 
-def _keep_partial(
-    conn: sqlite3.Connection, chat: AdminChat, members: dict[int, UserRow], reported: int | None, out: Out
-) -> None:
+def _larger(*counts: int | None) -> int | None:
+    """The count to compare fetched with: the larger of the two reads (as tgaud grades), None without any."""
+    return max((c for c in counts if c is not None), default=None)
+
+
+def _keep_partial(conn: sqlite3.Connection, chat: AdminChat, listing: Listing, out: Out) -> None:
     """After an interrupt: store the members found so far as an incomplete snapshot, if it beats the latest."""
     latest = db.latest_snapshot(conn, chat.id)
-    found = len(members)
+    found = len(listing.members)
     if latest is not None and found <= latest.fetched:
         why = f"{found} members found, not more than the {latest.fetched} in the latest snapshot"
     elif found == 0:
         why = "no members found yet"
     else:
-        snapshot = db.add_snapshot(conn, chat.row, members.values(), reported, complete=False)
-        shown = "?" if reported is None else reported
+        snapshot = db.add_snapshot(conn, chat.row, listing.members.values(), listing.reported_start,
+                                   complete=False, collection=listing.finish(None))
+        shown = "?" if listing.reported_start is None else listing.reported_start
         out(f"{chat.title}: interrupted; saved a partial snapshot, fetched {snapshot.fetched} of {shown} reported, INCOMPLETE")
         return
     out(f"{chat.title}: interrupted; partial result discarded: {why}")
@@ -344,21 +437,34 @@ async def collect_chat(
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
     expand_at: int = DEFAULT_EXPAND_AT,
+    clock: Clock = wall_clock,
 ) -> CollectResult:
     """Collect one chat and store a snapshot. Never raises for a per-chat failure.
 
-    An interrupt (Ctrl-C cancels the task) keeps the members found so far, then propagates.
+    The snapshot records what tgaud's snapshot contract needs: a random id, started_at before the first count
+    read, Telegram's count before and after the listing, the path taken, finished_at, and each member as the first
+    page that listed them saw them. A failed final count keeps the listing, with reported_end NULL and
+    complete false. An interrupt (Ctrl-C cancels the task) keeps the members found so far, then propagates.
     """
     result = CollectResult(chat)
-    members: dict[int, UserRow] = {}
-    reported: int | None = None
+    listing = Listing(clock)
+    listing.start()
     try:
-        reported = await reported_count(client, chat, sleep, out)
-        await fetch_members(client, chat, reported, deep, sleep, out, expand_at, members)
-        snapshot = db.add_snapshot(conn, chat.row, members.values(), reported)
+        listing.reported_start = await reported_count(client, chat, sleep, out)
+        await fetch_members(client, chat, listing.reported_start, deep, sleep, out, expand_at, listing)
+        try:
+            reported_end = await reported_count(client, chat, sleep, out)
+        except Exception as exc:  # the listing stands; without the second count it cannot be complete
+            reported_end = None
+            out(f"  the member count after the listing failed: {type(exc).__name__}: {exc}")
+            listing.failed(f"the final member count failed: {type(exc).__name__}: {exc}")
+        reported = _larger(listing.reported_start, reported_end)
+        snapshot = db.add_snapshot(conn, chat.row, listing.members.values(), reported,
+                                   complete=False if listing.error else None,
+                                   collection=listing.finish(reported_end))
     except asyncio.CancelledError:
         try:
-            _keep_partial(conn, chat, members, reported, out)
+            _keep_partial(conn, chat, listing, out)
         except Exception as exc:  # the interrupt still wins
             out(f"{chat.title}: interrupted; could not store the partial result: {type(exc).__name__}: {exc}")
         raise
@@ -369,7 +475,12 @@ async def collect_chat(
 
     result.fetched, result.reported, result.complete = snapshot.fetched, reported, snapshot.complete
     shown = "?" if reported is None else reported
-    status = "ok" if snapshot.complete else "INCOMPLETE (Telegram returned fewer members than reported)"
+    if snapshot.complete:
+        status = "ok"
+    elif listing.error:
+        status = "INCOMPLETE (a request failed during the collection, see above)"
+    else:
+        status = "INCOMPLETE (Telegram returned fewer members than reported)"
     out(f"{chat.title}: fetched {snapshot.fetched} of {shown} reported, {status}")
     return result
 
@@ -382,6 +493,7 @@ async def collect(
     sleep: Sleep = asyncio.sleep,
     out: Out = print,
     expand_at: int = DEFAULT_EXPAND_AT,
+    clock: Clock = wall_clock,
 ) -> list[CollectResult]:
     """Collect every admin chat, or only the ones named by refs, one chat at a time."""
     admin_chats = await list_admin_chats(client, sleep, out)
@@ -398,5 +510,5 @@ async def collect(
     results = []
     for chat in chosen:
         out(f"collecting {chat.title} ({chat.type}, id {chat.id})")
-        results.append(await collect_chat(client, conn, chat, deep, sleep, out, expand_at))
+        results.append(await collect_chat(client, conn, chat, deep, sleep, out, expand_at, clock))
     return results

@@ -86,6 +86,16 @@ It prints fetched vs reported per chat and marks a snapshot **INCOMPLETE** when 
 reported (more than 2% short). FloodWait errors are slept through (it prints the wait). If one chat fails
 (no rights, private, an RPC error) the error is printed, the run continues, and the exit code is non-zero.
 
+Telegram's member count is read twice, fresh each time (for basic groups too, never the dialog list's copy):
+before the listing and after it. "Reported" is the larger of the two. Every snapshot also records what tgaud
+needs to load it (see "Loading the members a chat already has" below): a random id, when the collection started
+and finished, both counts, how it ran (`basic_group`, `listing` or `deep`), and for every member what the page
+that first listed them said (when that page arrived, the join date, who invited them, a join request,
+a subscription end, bot, deleted, premium, username and name). A member listed again on a later page keeps the
+first page's record. A snapshot is also INCOMPLETE, whatever the counts say, when a search query failed during
+`--deep` or the count after the listing could not be read: what was found is kept. A `tgstats.db` from an older
+version gets the new columns the first time this version opens it; its old snapshots read back as before.
+
 Before each request to Telegram, `collect` and `chats` pause for a random time between 1000 and 5000 ms
 (picked to the millisecond), so requests don't arrive at a fixed rate. Change the range with
 `--min-delay-ms` and `--max-delay-ms`, for example `tgstats collect --min-delay-ms 2000 --max-delay-ms 8000`.
@@ -187,7 +197,7 @@ The tests are offline: they use a fixture database and a fake client, never the 
 of your channels and groups into PostgreSQL 18.6 with full history (one row per stay, with how sure each start and
 end is), and the analytics on top: overlap, unique members, campaign and giveaway joiners, short stays, drift
 against Telegram's member count, `/metrics` for Prometheus. It runs as one container (`tgaud serve`) next to the
-database; `tgstats collect` can seed it with the members from before the bot.
+database; `tgstats collect` and the web UI's Import page seed it with the members from before the bot (below).
 
 Read, in this order:
 
@@ -195,6 +205,39 @@ Read, in this order:
 - `docs/design/design.md`: the rules (history model, snapshot contract, probes, metrics);
 - `docs/deploy-contract.md`: the image, commands, environment and deploy order the Ansible role relies on;
 - `docs/tgaud.md`: how the code is put together, and the tests.
+
+### Loading the members a chat already has
+
+The Bot API cannot list a chat's members, so tgaud only knows the people who joined or left since the bot became an
+admin: right after setup its reports show a handful of known members against Telegram's thousands. Load the rest
+with a member list taken by `tgstats` with your own account:
+
+1. **Collect** with this version of tgstats: `tgstats collect` (or `tgstats collect CHAT ...`; `--deep` when a
+   listing comes back short). Snapshots collected by an older tgstats are not imported (they record only when a
+   collection ended, which can contradict leaves tgaud saw meanwhile), so collect again after upgrading.
+2. **Upload** the `tgstats.db` on the web UI's **Import** page. At most 32 MiB per file; a file that has grown past
+   that can be collected into a fresh one: `tgstats collect --db fresh.db`, then upload `fresh.db`.
+3. **Read the result.** The page lists every chat in the file and what happened to its latest snapshot:
+   - *imported*: its members were written (the count shows how many; people removed with `tgaud forget-user` are
+     left out);
+   - *skipped: not tracked*: tgaud records nothing for that chat (the bot is not an admin there);
+   - *skipped: already imported*: uploading the same file again imports nothing new;
+   - *skipped: not newer*: tgaud already has a snapshot of that chat started at the same time or later
+     (snapshots are applied in start order, so an older one is never put behind a newer one);
+   - *refused*: old format (collect again), bad times or values (a clock far ahead, a damaged file), a migrated
+     group (collect the supergroup), or too large for one import (more than 200 000 members in one snapshot);
+   - *failed* or *unknown*: a database problem; upload the same file again, and chats already imported are skipped.
+
+   A file that is not a tgstats.db at all (another SQLite file, a damaged one, one with extra tables or views) is
+   refused whole, and nothing is written.
+
+The reconciler then applies each imported snapshot, usually within minutes (it waits until the bot has caught up
+with the updates of the collection's time). Every listed member becomes a known stay starting at the time the page
+listed them, with Telegram's join date as a hint; members who joined or left during the collection keep what the
+bot recorded. A complete listing whose count matches Telegram's (good) also lets tgaud doubt the stays it does not
+list and check them with `getChatMember`; an incomplete one only adds members. The overview's **Known** and
+**Coverage** columns and the coverage report (`tgaud coverage`) then show known against Telegram's count. Collect
+and upload again now and then: each newer snapshot confirms the stays and finds leaves the bot missed.
 
 Tests (PostgreSQL 18.6 and podman; never the real Telegram, always the fake Bot API in `tests/tgaud/`):
 
