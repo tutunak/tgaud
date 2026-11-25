@@ -23,8 +23,10 @@ cleanup() {
   local status=$?
   trap - EXIT
   [[ -n $registry_cid ]] && { docker rm -f "$registry_cid" >/dev/null || status=1; }
-  # The images the builds loaded into the local store.
-  [[ -n $port ]] && docker image ls -q --filter "reference=127.0.0.1:$port/*" | sort -u | xargs -r docker rmi -f >/dev/null 2>&1
+  # The images the builds loaded into the local store, removed by repository:tag, never by image ID: Docker
+  # would delete every tag of an ID, including one a developer or another task gave the same build.
+  [[ -n $port ]] && docker image ls --format '{{.Repository}}:{{.Tag}}' --filter "reference=127.0.0.1:$port/*" |
+    sort -u | xargs -r docker rmi >/dev/null 2>&1
   if [[ $builder_made == true ]] && docker buildx inspect "$BUILDER" >/dev/null 2>&1; then
     docker buildx rm "$BUILDER" >/dev/null || status=1
   fi
@@ -120,15 +122,22 @@ release() { bash "$RELEASE_DIR/release.sh" "$REPO" >"$WORK/out" 2>&1; }
 show_out() { sed 's/^/> /' "$WORK/out"; }
 # The commit a remote tag names, peeled.
 remote_tag() { git ls-remote --tags origin "refs/tags/$1" | awk 'END { print $1 }'; }
+# The digest of REF, or an error: two unreadable digests are two empty strings, which compare equal.
+digest_of() { # REF
+  local digest
+  digest=$(image_digest "$1") && [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "can't read the digest of $1" >&2; return 1; }
+  printf '%s\n' "$digest"
+}
 # The release VERSION is commit SHA: the git tag names it, and each image's VERSION tag has the digest
 # of its tree tag (the top-level digest: the retag must not wrap the image in a new index).
 is_release() { # VERSION SHA
-  local tree suffix
+  local tree suffix version_digest tree_digest
   [[ $(remote_tag "$1") == "$2" ]] || { echo "git tag $1 is on '$(remote_tag "$1")', want $2"; return 1; }
   tree=$(tree_tag "$2")
   for suffix in "${SUFFIXES[@]}"; do
-    [[ $(image_digest "$REPO$suffix:$1") == "$(image_digest "$REPO$suffix:$tree")" ]] ||
-      { echo "$REPO$suffix:$1 isn't the image of tree $tree"; return 1; }
+    version_digest=$(digest_of "$REPO$suffix:$1") || return 1
+    tree_digest=$(digest_of "$REPO$suffix:$tree") || return 1
+    [[ $version_digest == "$tree_digest" ]] || { echo "$REPO$suffix:$1 isn't the image of tree $tree"; return 1; }
   done
 }
 no_version() { # VERSION
@@ -161,18 +170,19 @@ EOF
 chmod +x "$WORK/shim/docker"
 
 test_publish_skips_existing() {
-  local sha tree before
+  local sha tree before after
   sha=$(commit publish-1)
   tree=$(tree_tag "$sha")
   # An image under the first image's tree tag that publish would not build: it must survive as it is.
   printf 'FROM scratch\nCOPY state.txt /state.txt\nLABEL image=pushed-earlier\n' >"$WORK/early.Dockerfile"
   docker buildx build -q --push -t "$REPO:$tree" -f "$WORK/early.Dockerfile" . >/dev/null || return 1
-  before=$(image_digest "$REPO:$tree")
+  before=$(digest_of "$REPO:$tree") || return 1
   : >"$WORK/shim.log"
   PATH=$WORK/shim:$PATH SHIM_LOG=$WORK/shim.log publish || { show_out; return 1; }
   grep -q "skip $REPO:$tree" "$WORK/out" || { show_out; echo "the first image wasn't skipped"; return 1; }
   [[ $(grep -c '^docker buildx build ' "$WORK/shim.log") == 1 ]] || { cat "$WORK/shim.log"; echo "want one build, the second image's"; return 1; }
-  [[ $(image_digest "$REPO:$tree") == "$before" ]] || { echo "the existing image was replaced"; return 1; }
+  after=$(digest_of "$REPO:$tree") || return 1
+  [[ $after == "$before" ]] || { echo "the existing image was replaced"; return 1; }
 }
 
 test_publish_builds_gates_and_pushes_missing() {
@@ -196,17 +206,19 @@ test_publish_builds_gates_and_pushes_missing() {
 # An existence check that fails for another reason than "not found" must stop publish, never build
 # over a tag that may be there.
 test_publish_stops_when_registry_unreadable() {
-  local tree suffix before=() i
+  local tree suffix before=() i digest
   tree=$(tree_tag HEAD)
   for suffix in "${SUFFIXES[@]}"; do
-    before+=("$(image_digest "$REPO$suffix:$tree")") || return 1
+    digest=$(digest_of "$REPO$suffix:$tree") || return 1
+    before+=("$digest")
   done
   : >"$WORK/shim.log"
   PATH=$WORK/shim:$PATH FAIL_INSPECT=1 SHIM_LOG=$WORK/shim.log publish && { show_out; echo "publish succeeded blind"; return 1; }
   grep -q "can't tell whether the registry has" "$WORK/out" || { show_out; echo "no reason given"; return 1; }
   ! grep -qE '^docker (buildx build|run|push) ' "$WORK/shim.log" || { cat "$WORK/shim.log"; echo "built while the registry was unreadable"; return 1; }
   for i in "${!SUFFIXES[@]}"; do
-    [[ $(image_digest "$REPO${SUFFIXES[i]}:$tree") == "${before[i]}" ]] || { echo "${SUFFIXES[i]} changed"; return 1; }
+    digest=$(digest_of "$REPO${SUFFIXES[i]}:$tree") || return 1
+    [[ $digest == "${before[i]}" ]] || { echo "${SUFFIXES[i]} changed"; return 1; }
   done
   # Once the registry answers again, every image is skipped.
   : >"$WORK/shim.log"
