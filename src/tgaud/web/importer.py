@@ -34,7 +34,7 @@ import psycopg
 
 from tgaud import history
 from tgaud.web import tgstats_file
-from tgaud.web.app import OutOfTime, WebDb, db_error_line
+from tgaud.web.app import HttpError, OutOfTime, WebDb, db_error_line
 from tgaud.web.tgstats_file import BadValue, Chat, FileError
 
 log = logging.getLogger(__name__)
@@ -91,13 +91,15 @@ def run(database: WebDb, path: str | Path, *, store_names: bool, now: dt.datetim
         outcomes: dict[int, Outcome] = {c.chat_id: Outcome(c.chat_id, c.title, "", "", c.listed,
                                                             started_at=c.started_at, finished_at=c.finished_at,
                                                             snapshots=c.snapshots) for c in checked.chats}
-        known = _known_chats(database, [c.chat_id for c in checked.chats])
+        refused = [c for c in checked.chats if c.refusal is not None]
+        known = _known_chats(database, [c.chat_id for c in refused]) if refused else {}
         for chat in checked.chats:
             out = outcomes[chat.chat_id]
-            title, tracked = known.get(chat.chat_id, (None, False))
-            out.title = title or out.title
             if chat.refusal is not None:
-                # nothing to write: an untracked chat says so first (the owner may never have meant to track it)
+                # nothing to write: an untracked chat says so first (the owner may never have meant to track it);
+                # when tgaud's chat list could not be read, the refusal itself is still true
+                title, tracked = known.get(chat.chat_id, (None, True))
+                out.title = title or out.title
                 if not tracked:
                     out.status, out.reason = SKIPPED, _NOT_TRACKED
                 else:
@@ -120,10 +122,18 @@ def _refusal_text(refusal: str) -> str:
 
 
 def _known_chats(database: WebDb, chat_ids: list[int]) -> dict[int, tuple[str | None, bool]]:
-    with database.read() as conn:
-        rows = conn.execute("SELECT chat_id, title, tracked FROM tg.chat WHERE chat_id = ANY(%s::bigint[])",
-                            (chat_ids,)).fetchall()
-    return {int(r[0]): (r[1], bool(r[2])) for r in rows}
+    """tgaud's title and tracking of the refused chats, for their rows of the result page; empty when it cannot be
+    read now (nothing is written for these chats, so no failure of this read may cost the others their import)."""
+    try:
+        with database.read() as conn:
+            rows = conn.execute("SELECT chat_id, title, tracked FROM tg.chat WHERE chat_id = ANY(%s::bigint[])",
+                                (chat_ids,)).fetchall()
+    except (psycopg.Error, HttpError) as e:
+        log.warning("web import: tgaud's chats could not be read for the result page: %s",
+                    e.message if isinstance(e, HttpError) else db_error_line(e))
+        return {}
+    known = {int(r[0]): (r[1], bool(r[2])) for r in rows}
+    return {c: known.get(c, (None, False)) for c in chat_ids}
 
 
 def _import_chat(database: WebDb, reader: tgstats_file.Reader, chat: Chat, out: Outcome, *, store_names: bool,
@@ -144,6 +154,10 @@ def _import_chat(database: WebDb, reader: tgstats_file.Reader, chat: Chat, out: 
         line = db_error_line(e)
         out.reason = f"failed: database error: {line}; nothing was written for this chat; {AGAIN}"
         log.warning("web import: chat %s: database error: %s", chat.chat_id, line)
+    except HttpError as e:  # the connection busy with another request for too long, or the service stopping
+        out.status, out.written, out.snapshot_id = FAILED, None, None
+        out.reason = f"failed: {e.message}; nothing was written for this chat; {AGAIN}"
+        log.warning("web import: chat %s: %s", chat.chat_id, e.message)
 
 
 def _write(database: WebDb, reader: tgstats_file.Reader, chat: Chat, out: Outcome, *, store_names: bool,
@@ -151,59 +165,55 @@ def _write(database: WebDb, reader: tgstats_file.Reader, chat: Chat, out: Outcom
     s = chat.snapshot
     with database.write_within(seconds) as (conn, clock):
         reader.deadline = clock.end  # reading the file again counts against the same time
+
+        def q(sql: str, args: tuple = ()) -> psycopg.Cursor:
+            clock.arm()  # every statement gets only what is left of the chat's time
+            return conn.execute(sql, args)
+
         clock.arm()
         history.lock_chats(conn, [chat.chat_id])
-        clock.arm()
-        dup = conn.execute("SELECT snapshot_id FROM tg.snapshot WHERE collect_uuid = %s",
-                           (chat.uuid,)).fetchone()
+        dup = q("SELECT snapshot_id FROM tg.snapshot WHERE collect_uuid = %s", (chat.uuid,)).fetchone()
         if dup is not None:
             out.status, out.reason, out.snapshot_id = SKIPPED, f"already imported (snapshot {dup[0]})", int(dup[0])
             return
         # a retired source before tracking: M1 deletes the old chat's row, and the owner should hear why
-        alias = conn.execute("SELECT chat_id FROM tg.chat_alias WHERE old_chat_id = %s", (chat.chat_id,)).fetchone()
+        alias = q("SELECT chat_id FROM tg.chat_alias WHERE old_chat_id = %s", (chat.chat_id,)).fetchone()
         if alias is not None:
             out.status = REFUSED
             out.reason = (f"migrated: this chat became the supergroup {alias[0]}, so its old id takes no new "
                           "snapshots; collect the supergroup and upload that file")
             return
-        row = conn.execute("SELECT tracked FROM tg.chat WHERE chat_id = %s", (chat.chat_id,)).fetchone()
+        row = q("SELECT tracked, title FROM tg.chat WHERE chat_id = %s", (chat.chat_id,)).fetchone()
+        if row is not None and row[1]:
+            out.title = row[1]
         if row is None or not row[0]:
             out.status, out.reason = SKIPPED, _NOT_TRACKED
             return
-        newest = conn.execute("SELECT max(started_at) FROM tg.snapshot WHERE chat_id = %s",
-                              (chat.chat_id,)).fetchone()[0]
+        newest = q("SELECT max(started_at) FROM tg.snapshot WHERE chat_id = %s", (chat.chat_id,)).fetchone()[0]
         if newest is not None and chat.started_at <= newest:
             out.status = SKIPPED
             out.reason = (f"not newer: tgaud already has a snapshot of this chat started "
                           f"{newest.astimezone(UTC):%Y-%m-%d %H:%M:%S}Z, and snapshots are applied in start order")
             return
-        clock.arm()
-        sid = conn.execute("""INSERT INTO tg.snapshot (chat_id, started_at, method, reported_at_start, collect_uuid)
-                              VALUES (%s, %s, %s, %s, %s) RETURNING snapshot_id""",
-                           (chat.chat_id, chat.started_at, s.method, s.reported_start, chat.uuid)).fetchone()[0]
+        sid = q("""INSERT INTO tg.snapshot (chat_id, started_at, method, reported_at_start, collect_uuid)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING snapshot_id""",
+                (chat.chat_id, chat.started_at, s.method, s.reported_start, chat.uuid)).fetchone()[0]
         clock.arm()
         with conn.cursor().copy(COPY_MEMBERS) as copy:
             for m in tgstats_file.members(reader, chat):
                 names = (m.username, m.first_name, m.last_name) if store_names else (None, None, None)
                 copy.write_row((sid, m.user_id, m.seen_at, m.joined_date, m.inviter_id, m.via_request,
                                 m.subscription_until, m.is_bot, m.is_deleted, m.is_premium, *names))
-        clock.arm()
         # anyone forget-user erased stays erased, whenever the page says it saw them (the trigger of 008 keeps a
         # row dated after the erasure: a collector's clock is no proof)
-        conn.execute("""DELETE FROM tg.snapshot_member m WHERE m.snapshot_id = %s
-                        AND EXISTS (SELECT 1 FROM tg.erasure e WHERE e.user_hash = tg.erasure_hash(m.user_id))""",
-                     (sid,))
-        clock.arm()
-        conn.execute("""UPDATE tg.snapshot_member m SET inviter_id = NULL WHERE m.snapshot_id = %s
-                        AND m.inviter_id IS NOT NULL
-                        AND EXISTS (SELECT 1 FROM tg.erasure e WHERE e.user_hash = tg.erasure_hash(m.inviter_id))""",
-                     (sid,))
-        clock.arm()
-        written = conn.execute("SELECT count(*) FROM tg.snapshot_member WHERE snapshot_id = %s", (sid,)).fetchone()[0]
-        clock.arm()
-        conn.execute("""UPDATE tg.snapshot SET finished_at = %s, reported_at_end = %s, fetched = %s, complete = %s
-                        WHERE snapshot_id = %s""",
-                     (chat.finished_at, s.reported_end, written, s.complete, sid))
+        q("""DELETE FROM tg.snapshot_member m WHERE m.snapshot_id = %s
+             AND EXISTS (SELECT 1 FROM tg.erasure e WHERE e.user_hash = tg.erasure_hash(m.user_id))""", (sid,))
+        q("""UPDATE tg.snapshot_member m SET inviter_id = NULL WHERE m.snapshot_id = %s AND m.inviter_id IS NOT NULL
+             AND EXISTS (SELECT 1 FROM tg.erasure e WHERE e.user_hash = tg.erasure_hash(m.inviter_id))""", (sid,))
+        written = q("SELECT count(*) FROM tg.snapshot_member WHERE snapshot_id = %s", (sid,)).fetchone()[0]
+        q("""UPDATE tg.snapshot SET finished_at = %s, reported_at_end = %s, fetched = %s, complete = %s
+             WHERE snapshot_id = %s""", (chat.finished_at, s.reported_end, written, s.complete, sid))
+        clock.arm()  # the commit too
         try:
             _commit(conn)
         except psycopg.Error as e:

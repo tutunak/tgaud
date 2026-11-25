@@ -123,8 +123,15 @@ def test_bad_times_are_refused_and_a_later_valid_collection_still_imports(lab): 
     ("UPDATE snapshots SET method = 'scrape'", "method"),
     ("UPDATE memberships SET user_id = -5", "positive"),
     ("UPDATE memberships SET joined_date = 'yesterday'", "not a time"),
+    ("UPDATE snapshots SET fetched = -1", "negative"),  # review 1: the file's own counts
+    ("UPDATE snapshots SET reported = -1", "negative"),
+    ("UPDATE snapshots SET fetched = fetched + 1", "member rows"),
+    ("DELETE FROM memberships", "member rows"),
+    ("UPDATE snapshots SET started_at = '0001-01-01T00:30:00+01:00'", "out of range"),  # review 1: overflow
+    ("UPDATE memberships SET seen_at = '0001-01-01T00:30:00+05:00'", "out of range"),
 ], ids=["uuid", "uuid-braces", "uuid-nil", "count-start", "count-end", "naive-time", "order", "garbled-time",
-        "method", "user-id", "joined-date"])
+        "method", "user-id", "joined-date", "fetched-negative", "reported-negative", "fetched-vs-rows",
+        "missing-rows", "start-overflow", "seen-overflow"])
 def test_a_value_error_refuses_that_snapshot_only(lab, change, why):  # rule 4
     f = lab.file()
     f.snapshot(A, {1: at(1)}, at(0))
@@ -159,6 +166,11 @@ def _structural(f, kind: str) -> None:
         raw.execute("CREATE TRIGGER t AFTER INSERT ON users BEGIN DELETE FROM users; END")
     elif kind == "missing-table":
         raw.execute("DROP TABLE users")
+    elif kind == "generated-column":  # review 1: table_info would not show it
+        raw.execute("ALTER TABLE chats ADD COLUMN label TEXT GENERATED ALWAYS AS (title) VIRTUAL")
+    elif kind in ("null-is-bot", "null-is-deleted"):  # review 1: NULL would read as false
+        raw.execute(f"UPDATE memberships SET {kind[5:].replace('-', '_')} = NULL WHERE snapshot_id = "
+                    f"(SELECT id FROM snapshots WHERE chat_id = {B})")
     elif kind == "same-uuid":
         raw.execute("DROP INDEX snapshots_by_uuid")
         raw.execute(f"UPDATE snapshots SET uuid = (SELECT uuid FROM snapshots WHERE chat_id = {A}) WHERE chat_id = {B}")
@@ -166,13 +178,70 @@ def _structural(f, kind: str) -> None:
 
 
 @pytest.mark.parametrize("kind", ["text-user-id", "float-count", "blob-name", "extra-column", "extra-table", "view",
-                                  "trigger", "missing-table", "same-uuid"])
+                                  "trigger", "missing-table", "same-uuid", "generated-column", "null-is-bot",
+                                  "null-is-deleted"])
 def test_a_structurally_broken_file_imports_nothing(lab, kind):  # rule 4, rule 5
     f = lab.file()
     f.snapshot(A, {1: at(1)}, at(0))
     f.snapshot(B, {2: at(1)}, at(0))
     _structural(f, kind)
     with pytest.raises(tgstats_file.FileError):
+        lab.run(f.close())
+    assert lab.snapshots() == []
+
+
+@pytest.mark.parametrize("first, second", [("seen", "blob"), ("blob", "seen")], ids=["value-first", "blob-first"])
+def test_a_shape_error_after_a_value_error_in_the_same_snapshot_still_refuses_the_whole_file(lab, first, second):
+    """review 1: a value error must not end the structural check of the snapshot's other rows (both row orders)."""
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    f.snapshot(B, {2: at(1), 3: at(2)}, at(0), finished=at(10))
+    sid = f.raw.execute(f"SELECT id FROM snapshots WHERE chat_id = {B}").fetchone()[0]
+    for user, kind in ((2, first), (3, second)):
+        f.raw.execute("UPDATE memberships SET seen_at = '2026-11-20T08:00:00+00:00' WHERE snapshot_id = ? AND user_id = ?"
+                      if kind == "seen" else
+                      "UPDATE memberships SET first_name = x'00ff' WHERE snapshot_id = ? AND user_id = ?", (sid, user))
+    f.raw.commit()
+    with pytest.raises(tgstats_file.FileError, match="first_name"):
+        lab.run(f.close())
+    assert lab.snapshots() == []
+
+
+@pytest.mark.parametrize("why", ["future", "too-large", "old-reading"])
+def test_a_refused_chats_rows_are_still_checked_for_shape(lab, why, monkeypatch):  # review 1
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    t = now()
+    if why == "future":
+        f.snapshot(B, {2: t}, t - dt.timedelta(minutes=1), finished=t + dt.timedelta(days=1))
+    else:
+        f.snapshot(B, {2: at(1), 3: at(2)}, at(0))
+    if why == "too-large":
+        monkeypatch.setattr(importer, "MAX_MEMBERS", 1)
+    if why == "old-reading":  # an unreadable start time refuses the chat before its rows are read for values
+        f.raw.execute(f"UPDATE snapshots SET started_at = 'garbled' WHERE chat_id = {B}")
+    f.raw.execute(f"UPDATE memberships SET username = x'01' WHERE snapshot_id = (SELECT id FROM snapshots "
+                  f"WHERE chat_id = {B})")
+    f.raw.commit()
+    with pytest.raises(tgstats_file.FileError, match="username"):
+        lab.run(f.close())
+    assert lab.snapshots() == []
+
+
+@pytest.mark.parametrize("where", ["chat-rows", "snapshot-chats"])
+def test_the_chat_limit_holds_while_the_file_is_read(lab, monkeypatch, where):  # review 1, rule 5
+    monkeypatch.setattr(tgstats_file, "MAX_CHATS", 3)
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    f.snapshot(B, {2: at(1)}, at(0))
+    if where == "chat-rows":  # chats without a snapshot still count
+        for n in range(2):
+            f.raw.execute("INSERT INTO chats (id, type, title) VALUES (?, 'channel', 'spare')", (-1008000000000 - n,))
+        f.raw.commit()
+    else:
+        f.snapshot(C, {3: at(1)}, at(0))
+        f.snapshot(U, {4: at(1)}, at(0))
+    with pytest.raises(tgstats_file.FileError, match="more than 3"):
         lab.run(f.close())
     assert lab.snapshots() == []
 
@@ -416,6 +485,95 @@ def test_a_waiting_fence_counts_against_the_same_deadline(lab):  # rule 6
     assert lab.snapshots() == []
 
 
+def test_consecutive_lock_waits_share_one_budget(lab):  # rule 6, review 1
+    """The chat lock is held for 1.2 s, then the chat's row is held FOR UPDATE (the snapshot INSERT's foreign key
+    waits on it): with a 2 s budget the second wait gets only what the first left, so the chat fails near 2 s."""
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    path = f.close()
+    chat_lock, row_lock = psycopg.connect(lab.dsn), psycopg.connect(lab.dsn)
+    try:
+        history.lock_chats(chat_lock, [A])
+        row_lock.execute("SELECT 1 FROM tg.chat WHERE chat_id = %s FOR UPDATE", (A,))
+        release = threading.Timer(1.2, chat_lock.rollback)
+        release.start()
+        started = time.monotonic()
+        report = lab.run(path, seconds=2.0)
+        took = time.monotonic() - started
+        release.join()
+        assert lab.outcomes(report) == {A: ("failed", None)} and "timeout" in report.outcomes[0].reason
+        assert 1.2 < took < 2.8, took
+        assert lab.snapshots() == [] and not lab.database.lock.locked()
+    finally:
+        for c in (chat_lock, row_lock):
+            c.rollback()
+            c.close()
+    assert lab.outcomes(lab.run(path)) == {A: ("imported", 1)}
+
+
+def test_a_busy_connection_fails_only_that_chat_and_keeps_the_others(lab, monkeypatch):  # review 1
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    f.snapshot(B, {2: at(1)}, at(0))
+    path = f.close()
+    real, calls = importer._write, []
+    monkeypatch.setattr(lab.database, "_lock_wait", 0.3)
+
+    def second_finds_the_connection_busy(database, *args, **kw):
+        calls.append(1)
+        if len(calls) != 2:
+            return real(database, *args, **kw)
+        database.lock.acquire()  # another request holds the connection past the lock wait
+        try:
+            return real(database, *args, **kw)
+        finally:
+            database.lock.release()
+
+    monkeypatch.setattr(importer, "_write", second_finds_the_connection_busy)
+    page = lab.upload(path)
+    assert page.status == 200, page.text
+    rows = {r["Outcome"]: r for r in page.table_with("Outcome")}
+    assert set(rows) == {"imported", "failed"}
+    assert "busy" in rows["failed"]["Reason"] and "upload the same file again" in rows["failed"]["Reason"]
+    assert len(lab.snapshots()) == 1
+    monkeypatch.setattr(importer, "_write", real)
+    again = lab.run(path)
+    assert sorted(o.status for o in again.outcomes) == ["imported", "skipped"]
+
+
+def test_a_failed_chat_lookup_for_the_result_page_costs_no_chat_its_import(lab, monkeypatch):  # review 1
+    import contextlib
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    f.legacy(C, [1, 2], at(-60))
+    path = f.close()
+    real_read = lab.database.read
+
+    @contextlib.contextmanager
+    def failing_read():
+        raise psycopg.OperationalError("the connection was lost")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(lab.database, "read", failing_read)
+    report = lab.run(path)
+    monkeypatch.setattr(lab.database, "read", real_read)
+    assert lab.outcomes(report) == {A: ("imported", 1), C: ("refused", None)}
+    assert next(o for o in report.outcomes if o.chat_id == C).reason.startswith("old format")
+
+
+def test_a_takeover_still_stops_serve_and_writes_nothing(lab):  # review 1: the fence is not caught per chat
+    f = lab.file()
+    f.snapshot(A, {1: at(1)}, at(0))
+    path = f.close()
+    stopped = []
+    lab.app.fatal = lambda code, reason: stopped.append(code)
+    with psycopg.connect(lab.dsn) as c:
+        c.execute("UPDATE tg.bot_state SET serve_generation = serve_generation + 1")
+    page = lab.upload(path)
+    assert page.status == 503 and "took over" in page.text and stopped == [1]
+    assert lab.snapshots() == [] and list(lab.spool.iterdir()) == []
+
+
 def test_a_lost_commit_acknowledgement_then_a_migration_then_a_re_upload(lab, monkeypatch):  # rule 7
     f = lab.file()
     u = f.snapshot(A, {1: at(1)}, at(0))
@@ -427,9 +585,12 @@ def test_a_lost_commit_acknowledgement_then_a_migration_then_a_re_upload(lab, mo
         raise psycopg.OperationalError("server closed the connection unexpectedly")
 
     monkeypatch.setattr(importer, "_commit", commit_then_lose_the_reply)
-    report = lab.run(path)
-    assert lab.outcomes(report) == {A: ("unknown", None)}
-    assert report.outcomes[0].reason.startswith("unknown") and "already imported" in report.outcomes[0].reason
+    page = lab.upload(path)  # the result page of a commit that happened but was never acknowledged
+    assert page.status == 200, page.text
+    [row] = page.table_with("Outcome")
+    assert row["Outcome"] == "unknown" and "already imported" in row["Reason"]
+    assert "Nothing was written" not in page.text and "Whether anything was written is not known" in page.text
+    assert [str(x["collect_uuid"]) for x in lab.snapshots(A)] == [u]  # it was written
     monkeypatch.undo()
     new = A - 100
     migrate_chat(lab.dsn, A, new, at(500), new_tracked=True)  # M1: the snapshot is re-keyed to the supergroup

@@ -93,8 +93,9 @@ and finished, both counts, how it ran (`basic_group`, `listing` or `deep`), and 
 that first listed them said (when that page arrived, the join date, who invited them, a join request,
 a subscription end, bot, deleted, premium, username and name). A member listed again on a later page keeps the
 first page's record. A snapshot is also INCOMPLETE, whatever the counts say, when a search query failed during
-`--deep` or the count after the listing could not be read: what was found is kept. A `tgstats.db` from an older
-version gets the new columns the first time this version opens it; its old snapshots read back as before.
+`--deep` or the count after the listing could not be read (or came back without a count): what was found is kept.
+A `tgstats.db` from an older version gets the new columns the first time this version opens it; its old snapshots
+read back as before.
 
 Before each request to Telegram, `collect` and `chats` pause for a random time between 1000 and 5000 ms
 (picked to the millisecond), so requests don't arrive at a fixed rate. Change the range with

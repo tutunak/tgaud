@@ -238,16 +238,19 @@ a reset.
 `mode=ro&immutable=1` with `SQLITE_DBCONFIG_DEFENSIVE`, untrusted schema, triggers and views disabled, `query_only`,
 `temp_store=MEMORY`, value length 64 KiB, an authorizer that allows only reads of the known tables and a progress
 deadline of 30 s. `sqlite_master` must hold exactly the four tgstats tables (and `sqlite_sequence`), with exactly
-the old or the new columns and the tgstats keys, no view, trigger or virtual table. Structural problems (that, or a
-value of the wrong type or shape in a row the import reads) refuse the whole file. Per chat, the latest snapshot by
-`started_at` (an old one by `taken_at`; ties: the new format, then the uuid; never the row id) is checked: uuid
-well-formed, `started_at <= every seen_at <= finished_at <= now + 5 min`, counts non-negative, method known, at most
-`MAX_MEMBERS` members. A value error refuses that chat only. Names lose their control characters. Nothing of the
-member rows is kept in memory; they are read again for the write.
+the old or the new columns (`PRAGMA table_xinfo`: no generated or hidden column) and the tgstats keys, no view,
+trigger or virtual table; at most 2 000 chats, counted while they are read. Structural problems (that, or a value of
+the wrong type or shape in a row the import reads, `is_bot` and `is_deleted` NULL included) refuse the whole file.
+Per chat, the latest snapshot by `started_at` (an old one by `taken_at`; ties: the new format, then the uuid; never
+the row id) is checked: uuid well-formed, `started_at <= every seen_at <= finished_at <= now + 5 min` (a time out of
+range is a value error too), every count non-negative, `fetched` equal to its member rows, method known, at most
+`MAX_MEMBERS` members. A value error refuses that chat only; the shape of every member row of a chat's latest
+snapshot is checked even when the chat is refused. Names lose their control characters. Nothing of the member rows
+is kept in memory; they are read again for the write.
 
 **The write** (`importer.py`). One transaction per chat on the web connection (`WebDb.write_within`), bounded by
 `CHAT_SECONDS` (30 s) in total: `lock_timeout` and `statement_timeout` are set from the time left before the fence
-and before every later statement, so the fence's and the chat lock's waits count too. In order: the generation fence;
+and before every later statement and the commit, so the fence's, the chat lock's and any later lock waits share it. In order: the generation fence;
 `history.lock_chats([chat])` (ingest, the reconciler, migrations and forget-user take it); the uuid anywhere in
 `tg.snapshot` (skipped: already imported); the chat an `old_chat_id` of `tg.chat_alias` (refused: migrated; before
 tracking, as M1 deletes the old chat's row); not tracked (skipped); a snapshot of the chat with `started_at` at or
@@ -255,8 +258,10 @@ after this one's (skipped: not newer). Then `INSERT tg.snapshot` unfinished with
 tg.snapshot_member` (names only with `TGAUD_STORE_NAMES`), delete the rows of anyone in `tg.erasure` whatever their
 `seen_at` (migration 008's trigger keeps a row dated after the erasure; a collector's clock proves nothing) and
 clear erased inviters, and finish the snapshot with `fetched` = the rows left. Failures are per chat: a database
-error fails that chat ("upload the same file again"), the next chat still runs on a new connection; a commit whose
-answer was lost is "unknown", and the re-upload settles it by the uuid.
+error, a connection busy past the 75 s lock wait or the time running out fails that chat ("upload the same file
+again"), the next chat still runs (on a new connection after a loss); a commit whose answer was lost is "unknown",
+and the re-upload settles it by the uuid. A takeover (the generation fence) still stops serve. The result page's
+lookup of tgaud's titles for refused chats is best effort: when it fails, their refusal is shown as it is.
 
 **Size.** One chat's transaction holds the web connection, so other pages wait for it. `MAX_MEMBERS` = 200 000 per
 snapshot; measured on the development machine against the test server's production limits
