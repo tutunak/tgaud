@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% from "_macros.html" import report_header, scope_picker %}
+{% block main %}
+<h1>Overlap</h1>
+<form method="get" action="/overlap" class="controls">
+  {{ scope_picker(chats, chosen) }}
+  <button type="submit">Show</button>
+</form>
+{{ report_header(header) }}
+{% if not generation %}
+<p class="empty">No audience rollup is published yet: the service builds it within an hour of its start.</p>
+{% else %}
+<p class="hint">Each cell: members in both chats, then the share of the row's chat and of the column's chat. The shade is the Jaccard index. Open a cell for its people.</p>
+<div class="scroll matrix-wrap">
+<table class="matrix">
+  <thead>
+    <tr><th class="corner">row \ column</th>{% for b in order %}<th scope="col" title="{{ titles.get(b, b) }}"><span class="idx">{{ loop.index }}</span> {{ titles.get(b, b) }}</th>{% endfor %}</tr>
+  </thead>
+  <tbody>
+  {% for a, line in grid %}
+    <tr>
+      <th scope="row"><span class="idx">{{ loop.index }}</span> {{ titles.get(a, a) }}</th>
+      {% for c in line %}
+      {% if c is none %}
+      <td class="none" title="not in this rollup">–</td>
+      {% else %}
+      <td class="j{{ c.shade }}{% if c.diagonal %} diag{% endif %}{% if not c.shared %} zero{% endif %}"><a href="{{ c.href }}" title="{{ c.tip }}"><b>{{ c.shared }}</b> {% if c.diagonal %}<small>members</small>{% elif c.shared %}<small>{{ c.pct_row }} % · {{ c.pct_col }} %</small>{% endif %}</a></td>
+      {% endif %}
+      {% endfor %}
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Rollup as of {{ generation|when }}. A cell opened after the next hourly refresh asks you to reload this page, so a cell and its list always describe the same people.</p>
+{% endif %}
+{% endblock %}

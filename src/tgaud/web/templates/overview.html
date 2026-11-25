@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block main %}
+<h1>Overview</h1>
+<dl class="facts">
+  <div><dt>As of</dt><dd>{{ as_of|when }}</dd></div>
+  <div><dt>Gap flags since</dt><dd>{{ since|when }}</dd></div>
+  <div><dt>Daily rollup (chat_day)</dt><dd>{% if rollups.get("chat_day") %}{{ rollups["chat_day"][0]|when }}{% else %}not run yet{% endif %}</dd></div>
+  <div><dt>Audience rollup (overlap)</dt><dd>{% if rollups.get("audience") %}{{ rollups["audience"][0]|when }}{% else %}not run yet{% endif %}</dd></div>
+</dl>
+{% if not rows %}
+<p class="empty">No tracked chat yet: add the bot as an admin to a chat.</p>
+{% else %}
+<div class="scroll">
+<table class="data overview cards">
+  <thead>
+    <tr>
+      <th>Chat</th><th>Type</th><th>Bot</th>
+      <th class="num" title="Telegram's member count (getChatMemberCount)">Reported</th>
+      <th class="num" title="open stays we know of">Known</th>
+      <th class="num" title="open stays we doubt">Suspect</th>
+      <th class="num" title="known / reported">Coverage</th>
+      <th class="num" title="reported - known">Mismatch</th>
+      <th class="num" title="sum of the delta residuals of the last 24 h: Telegram's count moved beyond our events">Residual 24 h</th>
+      <th class="num">Open gaps</th><th class="num">Probes</th>
+      <th>Last good snapshot</th><th>Gap flags</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for r in rows %}
+    <tr>
+      <th scope="row"><a href="/reports/growth?{{ qs(chat=r.chat_id) }}">{{ r.title }}</a> <span class="id">{{ r.chat_id }}</span></th>
+      <td data-label="Type">{{ r.chat_type }}</td>
+      <td data-label="Bot"><span>{% if r.bot_status == "administrator" %}admin{% if r.admin_since %} <span class="muted nw">since {{ r.admin_since|day }}</span>{% endif %}{% else %}<span class="flag">{{ r.bot_status or "unknown" }}</span>{% endif %}</span></td>
+      {% if r.reported is none %}
+      <td colspan="5" class="muted" data-label="Members">no count sample yet</td>
+      {% else %}
+      <td class="num" data-label="Reported">{{ r.reported }}</td>
+      <td class="num" data-label="Known">{{ r.known_open }}</td>
+      <td class="num" data-label="Suspect">{{ r.suspect_open }}</td>
+      <td class="num" data-label="Coverage">{% if r.coverage_pct is not none %}<span>{{ r.coverage_pct }} %</span>{% endif %}</td>
+      <td class="num" data-label="Mismatch">{{ r.mismatch }}</td>
+      {% endif %}
+      <td class="num" data-label="Residual 24 h">{{ "" if r.residual_24h is none else r.residual_24h }}</td>
+      <td class="num" data-label="Open gaps">{% if r.open_gaps %}<span class="flag">{{ r.open_gaps }}</span>{% else %}0{% endif %}</td>
+      <td class="num" data-label="Probes pending">{{ r.probes_pending }}</td>
+      <td data-label="Last good snapshot">{{ r.last_good_snapshot|day if r.last_good_snapshot else "none" }}</td>
+      <td data-label="Gap flags"><span>{% if r.flags %}<span class="flag">{{ r.flags }}</span>{% else %}<span class="muted">clean</span>{% endif %}</span></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="hint">Numbers from the latest count sample at or before the as-of time. Hover a column title for its meaning.</p>
+{% endif %}
+{% endblock %}

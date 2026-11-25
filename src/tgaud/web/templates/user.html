@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% from "_macros.html" import data_table %}
+{% block main %}
+<h1>User lookup</h1>
+<form method="post" action="/user" class="controls inline">
+  <label>User id or @username <input type="search" name="q" value="{{ q }}" required autocomplete="off"></label>
+  <button type="submit">Look up</button>
+</form>
+{% if problem %}<p class="problem">{{ problem }}</p>{% endif %}
+{% if found %}
+<dl class="facts">
+  <div><dt>User id</dt><dd>{{ found }}</dd></div>
+  <div><dt>As of</dt><dd>{{ as_of|when }}</dd></div>
+  {% if profile %}
+  <div><dt>Username</dt><dd>{% if profile[1] %}@{{ profile[1] }}{% else %}<span class="muted">none stored</span>{% endif %}</dd></div>
+  <div><dt>Name</dt><dd>{{ [profile[2], profile[3]]|select|join(" ") or "–" }}</dd></div>
+  <div><dt>Account</dt><dd>{% if profile[4] %}bot{% elif profile[5] %}deleted{% else %}person{% endif %}{% if profile[6] %}, premium{% endif %}{% if profile[7] %}, {{ profile[7] }}{% endif %}</dd></div>
+  <div><dt>Seen</dt><dd>{{ profile[8]|when }} .. {{ profile[9]|when }}</dd></div>
+  {% else %}
+  <div><dt>Profile</dt><dd class="muted">not in tg.tg_user</dd></div>
+  {% endif %}
+</dl>
+<h2>In now: {{ now_in|length }} chat{{ "" if now_in|length == 1 else "s" }}</h2>
+{% if now_in %}<ul class="chips">{% for r in now_in %}<li>{{ r.title }}{% if r.suspect_since %} <span class="flag">suspect since {{ r.suspect_since|when }}</span>{% endif %}</li>{% endfor %}</ul>{% endif %}
+<h2>Every stay</h2>
+<p class="hint">start_source and end_source say how sure each end is: event = exact; snapshot, probe, inferred = bounded (left_after .. left_before).</p>
+{{ data_table(stays, "No stay in a tracked chat.") }}
+<h2>Campaigns entered</h2>
+{{ data_table(entered, "Joined in no campaign window.") }}
+<h2>Messages in groups</h2>
+{{ data_table(activity, "No message counted.") }}
+{% endif %}
+{% endblock %}

@@ -8,7 +8,7 @@ This file is how the code is put together and where each part plugs in.
 ## Tests
 
 ```sh
-mise run ci                       # uv run pytest (tgstats and tgaud) + image-test + container-e2e
+mise run ci                       # uv run pytest (tgstats and tgaud) + lint-ci + release-scripts + image-test + container-e2e
 ```
 
 The database tests need PostgreSQL 18.6 and `psql`:
@@ -105,13 +105,14 @@ src/tgaud/
 
 ## Process model (`tgaud serve`)
 
-Three threads, each with its own connection (the contract's budget is 4 with the web UI):
+Three threads, each with its own connection, and the web UI's when it is on (the contract's budget is 4):
 
 | Thread | Runs | Connection |
 |---|---|---|
 | ingest | `tgaud.jobs.ingest.identify(ctx, conn)` and `startup(ctx, conn)` once, then `run(ctx, conn)`: the long poll | holds the service lock; never reopened: losing it ends the process (exit 1) |
 | worker | `Scheduler` over `reconciler`, `prober`, `sampler` | reopened with backoff after a loss |
 | batch | `Scheduler` over `chat_day`, `audience`, `partitions` | same |
+| web | `tgaud.web` (phase 2), only when `TGAUD_WEB_LISTEN` is set: one thread per request (docs/web/README.md) | `tgaud-web`, opened on the first request, reopened after a loss |
 
 A scheduled job module exports `make(ctx: JobContext) -> Job`; a `Job` has `name`, `due(now) -> bool` (cheap,
 no I/O) and `step(conn)`, a bounded piece of work (target under 5 s) that commits and is idempotent (a commit
@@ -160,7 +161,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 | probe-sample | `tgaud/jobs/prober.py`, `tgaud/jobs/sampler.py` (and the metric cache); migration 005 |
 | rollups | `tgaud/jobs/chat_day.py`, `audience.py`, `partitions.py` (R1, R2 in Python, R4); migration 006 |
 | cli | modules in `tgaud/commands/` that call `tgaud.cli.register(name, help, add_arguments, run)`; migration 008 |
-| web | the web listener, started in `tgaud.jobs.serve` where the comment says, after `config.web_proxy_token_or_fail()`; migration 009 |
+| web | `tgaud/web/` (docs/web/README.md), started in `tgaud.jobs.serve` after the metrics listener; the token is checked first (exit 2); blocks 1b, 2c, 2d of queries.sql; no migration |
 | image | Containerfile, GitHub Actions CI and release; adds the container check, `lint-ci` and `release-scripts` to the `ci` task of `mise.toml` |
 
 ## Migrations
@@ -180,7 +181,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   rollback after `migrate` must keep working. `serve` exits 3 when the database lacks one of the image's
   migrations and accepts a newer database with a warning.
 - Numbers: core 002 (every addition more than one task uses), history 003, reconcile 004, probe-sample 005,
-  rollups 006, ingest 007, cli 008, web 009, prober-simplify 010 (`tg.probe.next_attempt_at`, `.spell_from`).
+  rollups 006, ingest 007, cli 008, prober-simplify 010 (009 stays unused: the web UI needs no migration) (`tg.probe.next_attempt_at`, `.spell_from`).
 
 002 (`002_shared.sql`) adds: `tg.bot_state.caught_up_at`, `.link_key_fingerprint`, `.serve_generation`;
 `tg.member_event.actor_is_other` with its BEFORE INSERT trigger (the rebuild and the join route read it, never

@@ -69,6 +69,19 @@ def _run_campaign(args: argparse.Namespace) -> int:
     return {"add": _campaign_add, "list": _campaign_list, "report": _campaign_report}[args.campaign_command](args)
 
 
+def insert_campaign(conn: psycopg.Connection, *, name: str, kind: str, starts: dt.datetime, draw: dt.datetime,
+                    only_new_members: bool, winners: int | None, note: str | None, chat_ids: list[int]) -> int:
+    """An owner campaign (origin annotation) and its chats, in the caller's transaction; returns its id."""
+    campaign_id = conn.execute(
+        "INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at, only_new_members, winner_count, note) "
+        "VALUES (%s, %s, 'annotation', %s, %s, %s, %s, %s) RETURNING campaign_id",
+        (name, kind, starts, draw, only_new_members, winners, note)).fetchone()[0]
+    with conn.cursor() as cur:
+        cur.executemany("INSERT INTO tg.campaign_chat (campaign_id, chat_id) VALUES (%s, %s)",
+                        [(campaign_id, c) for c in chat_ids])
+    return campaign_id
+
+
 def _campaign_add(args: argparse.Namespace) -> int:
     starts = common.parse_time(args.starts, "--starts")
     draw = common.parse_time(args.draw, "--draw")
@@ -84,13 +97,9 @@ def _campaign_add(args: argparse.Namespace) -> int:
             chat = common.resolve_tracked(ref, chats)
             if chat not in picked:
                 picked.append(chat)
-        campaign_id = conn.execute(
-            "INSERT INTO tg.campaign (name, kind, origin, starts_at, draw_at, only_new_members, winner_count, note) "
-            "VALUES (%s, %s, 'annotation', %s, %s, %s, %s, %s) RETURNING campaign_id",
-            (name, args.kind, starts, draw, args.only_new_members, args.winners, args.note)).fetchone()[0]
-        with conn.cursor() as cur:
-            cur.executemany("INSERT INTO tg.campaign_chat (campaign_id, chat_id) VALUES (%s, %s)",
-                            [(campaign_id, c.id) for c in picked])
+        campaign_id = insert_campaign(conn, name=name, kind=args.kind, starts=starts, draw=draw,
+                                      only_new_members=args.only_new_members, winners=args.winners, note=args.note,
+                                      chat_ids=[c.id for c in picked])
         conn.commit()
     print(f"campaign {campaign_id} {name!r}: {common.when(starts)} .. {common.when(draw)}, "
           f"{len(picked)} chat{'s' if len(picked) != 1 else ''}: " + ", ".join(f"{c.title} ({c.id})" for c in picked))
@@ -120,31 +129,42 @@ def _campaign_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def campaign_report(conn: psycopg.Connection, chats: list[common.Chat], campaign_id: int, block: str, *,
+                    as_of: dt.datetime | None, hours: Any = None) -> reports.Report:
+    """Item 4 for one campaign (block 4a per chat, 4b per person, 4c the entrants) with its header: the scope is
+    the campaign's chats, the window [starts, min(draw + H, as_of)]."""
+    row = conn.execute("SELECT name, starts_at, draw_at, only_new_members FROM tg.campaign WHERE campaign_id = %s",
+                       (campaign_id,)).fetchone()
+    if row is None:
+        raise CliError(f"no campaign {campaign_id}")
+    name, starts, draw, only_new = row
+    known = {c.id for c in chats}
+    scope = [r[0] for r in conn.execute("SELECT chat_id FROM tg.campaign_chat WHERE campaign_id = %s ORDER BY chat_id",
+                                        (campaign_id,)) if r[0] in known]
+    h = hours if hours is not None else 48
+    params: dict[str, Any] = {"campaign": campaign_id}
+    if hours is not None:
+        params["hours"] = hours
+
+    def window(as_of: dt.datetime, _since: dt.datetime) -> Window | None:
+        end = min(draw + dt.timedelta(hours=float(h)), as_of)
+        return Window(starts, end) if starts < end else None
+
+    notes = [f"campaign {campaign_id} {name!r}: {common.when(starts)} .. {common.when(draw)}"
+             + (", only new members are eligible" if only_new else "")]
+    return reports.build_report(conn, block, as_of=as_of, scope=scope, params=params, window=window,
+                                notes=tuple(notes), title=f"campaign report, {sql.title(block)}")
+
+
 def _campaign_report(args: argparse.Namespace) -> int:
     with common.session() as (conn, _cfg):
         chats = common.load_chats(conn)
-        row = conn.execute("SELECT name, starts_at, draw_at, only_new_members FROM tg.campaign WHERE campaign_id = %s",
-                           (args.campaign,)).fetchone()
-        if row is None:
-            raise CliError(f"no campaign {args.campaign}")
-        name, starts, draw, only_new = row
-        known = {c.id for c in chats}
-        scope = [r[0] for r in conn.execute("SELECT chat_id FROM tg.campaign_chat WHERE campaign_id = %s ORDER BY chat_id",
-                                            (args.campaign,)) if r[0] in known]
-        hours = args.hours if args.hours is not None else 48
-        params: dict[str, Any] = {"campaign": args.campaign}
-        if args.hours is not None:
-            params["hours"] = args.hours
         block = "4c" if args.entrants else "4b" if args.people else "4a"
-
-        def window(as_of: dt.datetime, _since: dt.datetime) -> Window | None:
-            end = min(draw + dt.timedelta(hours=float(hours)), as_of)
-            return Window(starts, end) if starts < end else None
-
-        notes = [f"campaign {args.campaign} {name!r}: {common.when(starts)} .. {common.when(draw)}"
-                 + (", only new members are eligible" if only_new else "")]
-        reports.run_report(conn, args, block, chats, scope=scope, params=params, window=window,
-                           notes=tuple(notes), title=f"campaign report, {sql.title(block)}")
+        as_of = common.parse_time(args.as_of, "--as-of") if args.as_of else None
+        report = campaign_report(conn, chats, args.campaign, block, as_of=as_of, hours=args.hours)
+        common.print_header(common.header_stream(args), conn, title=report.title, as_of=report.as_of,
+                            scope=report.scope, window=report.window, notes=report.notes, rows=report.coverage)
+        common.emit(report.result, args, common.titles_of(chats))
     return 0
 
 
@@ -159,6 +179,19 @@ def _add_link(p: argparse.ArgumentParser) -> None:
     c.add_argument("--chat", required=True, metavar="CHAT", help="id, @username or title")
     c.add_argument("--name", required=True, help=f"the link's name (1-{NAME_MAX} characters): the campaign label")
     c.add_argument("--campaign", type=int, metavar="ID", help="attribute the joins through this link to the campaign")
+
+
+def insert_link(conn: psycopg.Connection, cfg: Config, chat_id: int, link: str, made: dict[str, Any], *, name: str,
+                campaign_id: int | None, bot_id: int | None) -> int:
+    """Store a bot-made invite link as its HMAC digest and name (never the link), in the caller's transaction;
+    `made` is createChatInviteLink's answer. Returns the invite_link_id."""
+    creator = (made.get("creator") or {}).get("id")
+    return conn.execute(
+        "INSERT INTO tg.invite_link (chat_id, link_digest, creator_id, name, is_primary, creates_join_request, "
+        "campaign_id) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING invite_link_id",
+        (chat_id, cfg.link_digest(link), creator if creator is not None else bot_id, made.get("name") or name,
+         bool(made.get("is_primary", False)), bool(made.get("creates_join_request", False)),
+         campaign_id)).fetchone()[0]
 
 
 @common.command("link")
@@ -196,13 +229,8 @@ def _run_link(args: argparse.Namespace) -> int:
         if not isinstance(link, str) or not link:
             raise CliError("createChatInviteLink returned no invite_link")
         try:
-            creator = (made.get("creator") or {}).get("id")
-            link_id = conn.execute(
-                "INSERT INTO tg.invite_link (chat_id, link_digest, creator_id, name, is_primary, creates_join_request, "
-                "campaign_id) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING invite_link_id",
-                (chat.id, cfg.link_digest(link), creator if creator is not None else (state[0] if state else None),
-                 made.get("name") or name, bool(made.get("is_primary", False)),
-                 bool(made.get("creates_join_request", False)), args.campaign)).fetchone()[0]
+            link_id = insert_link(conn, cfg, chat.id, link, made, name=name, campaign_id=args.campaign,
+                                  bot_id=state[0] if state else None)
             conn.commit()
         except psycopg.Error as e:
             # The link exists at Telegram and cannot be shown again: print it, then fail.

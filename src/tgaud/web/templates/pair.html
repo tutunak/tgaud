@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% from "_macros.html" import user_button %}
+{% block main %}
+<p class="crumbs"><a href="/overlap?{{ qs(chat=[a, b]) }}">Overlap</a> › pair</p>
+<h1>{{ titles.get(a, a) }} <span class="amp">and</span> {{ titles.get(b, b) }}</h1>
+<dl class="facts">
+  <div><dt>Audience rollup</dt><dd>{{ generation|when }}</dd></div>
+  <div><dt>A</dt><dd>{{ titles.get(a, a) }} <span class="id">{{ a }}</span>, {{ cell.size_a }} members</dd></div>
+  <div><dt>B</dt><dd>{{ titles.get(b, b) }} <span class="id">{{ b }}</span>, {{ cell.size_b }} members</dd></div>
+  <div><dt>Jaccard</dt><dd>{{ cell.jaccard if cell.jaccard is not none else "–" }}</dd></div>
+</dl>
+<nav class="tabs">
+{% for key, label in sides.items() %}
+  <a href="/overlap/pair?{{ qs(side=key, **base) }}"{% if key == side %} aria-current="page"{% endif %}>{{ label }} <b>{{ counts[key] }}</b>{% if key == "shared" and a != b %} <small>{{ cell.pct_of_a or 0 }} % of A · {{ cell.pct_of_b or 0 }} % of B</small>{% endif %}</a>
+{% endfor %}
+</nav>
+{% if not people %}
+<p class="empty">Nobody {{ sides[side] }}.</p>
+{% else %}
+<div class="scroll">
+<table class="data cards">
+  <thead><tr><th class="num">User id</th><th>Username</th><th>Name</th><th class="num">Tracked chats</th></tr></thead>
+  <tbody>
+  {% for p in people %}
+    <tr>
+      <td class="num" data-label="User id">{{ user_button(p.user_id) }}</td>
+      <td data-label="Username">{% if p.username %}@{{ p.username }}{% endif %}</td>
+      <td data-label="Name">{{ [p.first_name, p.last_name]|select|join(" ") }}</td>
+      <td class="num" data-label="Tracked chats">{{ p.chat_count }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="count">people {{ start + 1 }}–{{ start + people|length }}</p>
+<p class="pager">{% if prev %}<a href="{{ prev }}">‹ Previous page</a>{% endif %}
+{% if next %}<a href="{{ next }}">Next {{ people|length }} ›</a>{% endif %}</p>
+{% endif %}
+{% endblock %}

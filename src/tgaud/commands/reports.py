@@ -102,20 +102,41 @@ def _scope_ids(text: str) -> list[int]:
     return [int(x) for x in body.split(",")] if body else []
 
 
-def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, chats: list[common.Chat], *,
-               scope: list[int] | None, params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
-               rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
-               header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None,
-               as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None) -> sql.Result:
-    """Header, then the block: both in the caller's transaction, with one as-of time and one scope; `as_of_notes`
-    adds header lines that depend on the frozen as-of time."""
+@dataclass(frozen=True)
+class Report:
+    """What a report shows: its header (title, as-of time, window, scope with coverage and gap flags, notes) and
+    the block's result, all read in one transaction with one frozen as-of time. The CLI prints it, the web UI
+    renders it."""
+
+    title: str
+    block: str
+    as_of: dt.datetime
+    since: dt.datetime
+    scope: list[int]
+    window: Window | None
+    rollup: bool
+    rollup_as_of: dt.datetime | None
+    notes: tuple[str, ...]
+    coverage: list[dict[str, Any]]
+    result: sql.Result
+
+
+def build_report(conn: psycopg.Connection, block: str, *, as_of: dt.datetime | None, scope: list[int] | None,
+                 params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
+                 rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
+                 header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None,
+                 as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None,
+                 page: tuple[int, int] | None = None) -> Report:
+    """Header data, then the block: both in the caller's transaction, with one as-of time and one scope;
+    `as_of_notes` adds header lines that depend on the frozen as-of time; `page` = (offset, limit) reads one
+    page of the block's rows (sql.run_page) instead of all of them."""
     params = dict(params)
-    if getattr(args, "as_of", None):
-        params["as_of"] = common.parse_time(args.as_of, "--as-of").isoformat()
+    if as_of is not None:
+        params["as_of"] = as_of.isoformat()
     if scope is not None:
         params["scope"] = scope
     vals = sql.values(conn, **params)
-    as_of = _ts(conn, vals["as_of_ts"])
+    as_of_ts = _ts(conn, vals["as_of_ts"])
     since = _ts(conn, vals["since_ts"])
     params["as_of"] = vals["as_of_ts"]  # frozen: header and table agree
     in_scope = scope if scope is not None else _scope_ids(vals["scope_ids"])
@@ -123,12 +144,31 @@ def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, c
         in_scope = header_scope(conn, in_scope)
     ra = common.rollup_as_of(conn) if rollup else None
     if as_of_notes is not None:
-        notes = (*notes, *as_of_notes(as_of))
-    common.print_header(common.header_stream(args), conn, title=title or sql.title(block), as_of=as_of, scope=in_scope,
-                        window=window(as_of, since), rollup_as_of=ra, rollup=rollup, notes=notes)
-    result = sql.run(conn, block, **params)
-    common.emit(result, args, common.titles_of(chats))
-    return result
+        notes = (*notes, *as_of_notes(as_of_ts))
+    win = window(as_of_ts, since)
+    coverage = common.coverage_rows(conn, in_scope, as_of_ts, win)
+    if page is None:
+        result = sql.run(conn, block, **params)
+    else:
+        result = sql.run_page(conn, block, offset=page[0], limit=page[1], **params)
+    return Report(title or sql.title(block), block, as_of_ts, since, in_scope, win, rollup, ra, tuple(notes), coverage,
+                  result)
+
+
+def run_report(conn: psycopg.Connection, args: argparse.Namespace, block: str, chats: list[common.Chat], *,
+               scope: list[int] | None, params: dict[str, Any], window: Callable[[dt.datetime, dt.datetime], Window | None],
+               rollup: bool = False, notes: tuple[str, ...] = (), title: str | None = None,
+               header_scope: Callable[[psycopg.Connection, list[int]], list[int]] | None = None,
+               as_of_notes: Callable[[dt.datetime], tuple[str, ...]] | None = None) -> sql.Result:
+    """build_report, printed: the header, then the table (or CSV)."""
+    as_of = common.parse_time(args.as_of, "--as-of") if getattr(args, "as_of", None) else None
+    report = build_report(conn, block, as_of=as_of, scope=scope, params=params, window=window, rollup=rollup,
+                          notes=notes, title=title, header_scope=header_scope, as_of_notes=as_of_notes)
+    common.print_header(common.header_stream(args), conn, title=report.title, as_of=report.as_of, scope=report.scope,
+                        window=report.window, rollup_as_of=report.rollup_as_of, rollup=rollup, notes=report.notes,
+                        rows=report.coverage)
+    common.emit(report.result, args, common.titles_of(chats))
+    return report.result
 
 
 def _supplied(args: argparse.Namespace, names: tuple[str, ...]) -> dict[str, Any]:
@@ -178,6 +218,29 @@ def _with_discussion_groups(conn: psycopg.Connection, scope: list[int]) -> list[
     return sorted(set(scope) | {r[0] for r in groups})
 
 
+def header_parts(spec: Spec, conn: psycopg.Connection, params: dict[str, Any]) -> dict[str, Any]:
+    """The window, extra header chats and as-of notes of a plain report (keyword arguments of build_report)."""
+    header_scope = None
+    as_of_notes = None
+    if spec.block == "9a":  # finished days only (the rows of the day of as_of may hold later data)
+        window = _finished_days_window
+        as_of_notes = _finished_days_notes
+    elif spec.block == "11":  # the table also reads each channel's discussion group and its activity
+        header_scope = _with_discussion_groups
+        days = params.get("active_days", 30)
+        window = lambda as_of, _since: _activity_window(conn, as_of, days)  # noqa: E731
+    elif spec.window == "raid":
+        hours = params.get("raid_hours", 24)
+        window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=hours), as_of)  # noqa: E731
+    elif spec.window == "day":
+        window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=24), as_of)  # noqa: E731
+    elif spec.window == "none":
+        window = lambda as_of, _since: None  # noqa: E731
+    else:
+        window = _since_window
+    return {"window": window, "header_scope": header_scope, "as_of_notes": as_of_notes}
+
+
 def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], Callable[[argparse.Namespace], int]]:
     def add(p: argparse.ArgumentParser) -> None:
         common.add_among(p)
@@ -195,26 +258,8 @@ def _make_plain(spec: Spec) -> tuple[Callable[[argparse.ArgumentParser], None], 
             params = _supplied(args, spec.params)
             if "since" in params:
                 params["since"] = common.parse_time(params["since"], "--since").isoformat()
-            header_scope = None
-            as_of_notes = None
-            if spec.block == "9a":  # finished days only (the rows of the day of as_of may hold later data)
-                window = _finished_days_window
-                as_of_notes = _finished_days_notes
-            elif spec.block == "11":  # the table also reads each channel's discussion group and its activity
-                header_scope = _with_discussion_groups
-                days = params.get("active_days", 30)
-                window = lambda as_of, _since: _activity_window(conn, as_of, days)  # noqa: E731
-            elif spec.window == "raid":
-                hours = params.get("raid_hours", 24)
-                window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=hours), as_of)  # noqa: E731
-            elif spec.window == "day":
-                window = lambda as_of, _since: Window(as_of - dt.timedelta(hours=24), as_of)  # noqa: E731
-            elif spec.window == "none":
-                window = lambda as_of, _since: None  # noqa: E731
-            else:
-                window = _since_window
-            run_report(conn, args, spec.block, chats, scope=scope, params=params, window=window, rollup=spec.rollup,
-                       header_scope=header_scope, as_of_notes=as_of_notes)
+            run_report(conn, args, spec.block, chats, scope=scope, params=params, rollup=spec.rollup,
+                       **header_parts(spec, conn, params))
         return 0
 
     return add, run
@@ -312,6 +357,14 @@ ORDER BY lower(g.period), g.gap_id
 """
 
 
+def coverage_table(conn: psycopg.Connection, as_of: dt.datetime, since: dt.datetime, scope: list[int], *,
+                   gaps: bool = False) -> sql.Result:
+    """`coverage`: per chat, admin since, Telegram's count against ours, suspect spells, open gaps, pending probes and
+    the window's flags; with gaps, the gaps of the window instead."""
+    cur = conn.execute(_GAPS if gaps else _COVERAGE_TABLE, {"as_of": as_of, "since": since, "scope": scope})
+    return sql.Result([d.name for d in cur.description], cur.fetchall())
+
+
 def _add_coverage(p: argparse.ArgumentParser) -> None:
     common.add_among(p)
     common.add_as_of(p)
@@ -339,10 +392,7 @@ def _run_coverage(args: argparse.Namespace) -> int:
             raise CliError("--since is after --as-of")
         common.print_header(common.header_stream(args), conn, title="coverage: when the bot was admin, drift, gaps",
                             as_of=as_of, scope=in_scope, window=Window(since, as_of))
-        cur = conn.execute(_GAPS if args.gaps else _COVERAGE_TABLE,
-                           {"as_of": as_of, "since": since, "scope": in_scope})
-        result = sql.Result([d.name for d in cur.description], cur.fetchall())
-        common.emit(result, args, common.titles_of(chats))
+        common.emit(coverage_table(conn, as_of, since, in_scope, gaps=args.gaps), args, common.titles_of(chats))
     return 0
 
 

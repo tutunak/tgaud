@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% from "_macros.html" import data_table, report_header, scope_picker %}
+{% block main %}
+<p class="crumbs"><a href="/reports">Reports</a> › {{ title }}</p>
+<h1>{{ header.title }}</h1>
+{% if spec %}<p class="hint">{{ spec.help }}</p>{% endif %}
+<form method="get" action="{{ action }}" class="controls">
+  {{ scope_picker(chats, chosen) }}
+  <div class="row">
+    <label>As of <input type="text" name="as_of" value="{{ form.get('as_of', '') }}" placeholder="now"></label>
+    {% for name, help in options.items() %}
+    <label title="{{ help }}">{{ name|replace("_", " ") }} <input type="text" name="{{ name }}" value="{{ form.get(name, '') }}" placeholder="default"></label>
+    {% endfor %}
+    {% if "gaps" in form %}<label class="check"><input type="checkbox" name="gaps" value="1"{% if form.gaps %} checked{% endif %}> list the gaps</label>{% endif %}
+  </div>
+  <button type="submit">Run</button>
+</form>
+{{ report_header(header) }}
+{{ data_table(table) }}
+{% endblock %}

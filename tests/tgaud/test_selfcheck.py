@@ -19,7 +19,8 @@ def test_selfcheck_offline_with_no_environment(monkeypatch):
     line = selfcheck.run(env={})
     assert line.startswith("selfcheck ok: config ok (dummy TGAUD_DATABASE_URL")
     image = db.load_migrations()  # other tasks add migrations: count the image's files
-    assert f"{len(image)} migrations (latest {image[-1].version:03d}), 37 query blocks" in line
+    assert f"{len(image)} migrations (latest {image[-1].version:03d}), 40 query blocks" in line
+    assert line.endswith(" web templates")
 
 
 def test_selfcheck_uses_real_values_when_present():
