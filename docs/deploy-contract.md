@@ -1,4 +1,4 @@
-# tgaud deploy contract v1 (app repo company/tgaud <-> deploy repo Ansible/tgaud)
+# tgaud deploy contract v1 (app repo tutunak/tgaud <-> deploy repo Ansible/tgaud)
 
 Both sides build to this file. A change to it is a change to both repos.
 

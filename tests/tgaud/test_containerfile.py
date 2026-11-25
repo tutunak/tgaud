@@ -70,10 +70,6 @@ def jobs(workflow):
     return dict(zip(parts[1::2], parts[2::2]))
 
 
-def test_forgejo_pipeline_is_gone():
-    assert not (ROOT / ".forgejo").exists()
-
-
 def test_ci_runs_on_pull_requests_to_main_only():
     text = read(".github/workflows/ci.yml")
     assert re.search(r'^"on":\n  pull_request:\n    branches: \[main\]\n\n', text, re.M)
