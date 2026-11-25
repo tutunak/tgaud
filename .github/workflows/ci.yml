@@ -1,0 +1,144 @@
+name: ci
+
+# Pull requests only: they run the tests and push the image, tagged with the tree hash. A push to
+# main runs release.yml alone, which tags that image with the version.
+"on":
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# Every job has a timeout-minutes, far above its usual time (tests: about 10 minutes), so a hung step ends the run
+# instead of holding it for GitHub's 6-hour default.
+#
+# Python 3.13 everywhere: it is the interpreter the image runs (Containerfile), so the tests exercise
+# what ships. .python-version and mise.toml say 3.15, which the local `mise run ci` uses; UV_PYTHON
+# overrides .python-version here, and uv must not download another interpreter.
+env:
+  UV_PYTHON: "3.13"
+  UV_PYTHON_DOWNLOADS: never
+  UV_VERSION: 0.11.16
+
+jobs:
+  # actionlint on the workflows, the version mise.toml pins (the same check as `mise run lint-ci`).
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: actionlint
+        run: docker run --rm -v "$PWD:/repo" -w /repo rhysd/actionlint:1.7.12 -color
+
+  # uv run pytest, the database tests included. The server is started by scripts/ci-postgres.sh with the
+  # image, the memory cap and the settings the local fixture gives it (the timing tests are calibrated to
+  # them), and checked before pytest runs; TGAUD_TEST_ADMIN_URL then points the fixture at it. A GitHub
+  # `services:` container can't take server arguments, so it isn't used. Nothing is skipped: -rs prints
+  # any skip with its reason.
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: pip install --no-cache-dir "uv==$UV_VERSION"
+
+      - name: Start PostgreSQL 18.6
+        run: bash scripts/ci-postgres.sh
+
+      # The fixture runs its psql scripts with the local psql; without one it falls back to podman.
+      - name: Ensure psql
+        run: command -v psql || sudo apt-get install -y -q --no-install-recommends postgresql-client
+
+      - name: Tests
+        run: uv sync --locked && uv run pytest -rs
+
+  # The image run the way the deploy role runs it, with the checks of `mise run image-test` and
+  # `mise run container-e2e` (scripts/image-test.sh, scripts/container-e2e.sh), both with podman. The
+  # end-to-end needs pasta (--map-host-loopback) and rootless containers.
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: pip install --no-cache-dir "uv==$UV_VERSION"
+
+      # The runner image lists Podman (5.x on ubuntu-latest, Ubuntu 26.04) but not passt, which provides
+      # pasta; newuidmap and subuid ranges let rootless containers map more than one uid.
+      - name: Prepare rootless Podman
+        run: |
+          if ! command -v pasta >/dev/null || ! command -v newuidmap >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends passt uidmap
+          fi
+          # Ubuntu 24.04 and later may block unprivileged user namespaces unless an AppArmor profile allows them.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          grep -q "^$USER:" /etc/subuid || sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$USER"
+          podman --version
+          pasta --version | head -n 1
+          [[ $(podman version --format '{{.Client.Version}}' | cut -d. -f1) -ge 5 ]] || { echo "podman is older than 5" >&2; exit 1; }
+          podman info --format 'rootless={{.Host.Security.Rootless}} network={{.Host.NetworkBackend}} cgroups={{.Host.CgroupsVersion}}'
+
+      - name: Start PostgreSQL 18.6
+        run: bash scripts/ci-postgres.sh
+
+      - name: Sync the environment
+        run: uv sync --locked
+
+      - name: Image check
+        run: bash scripts/image-test.sh
+
+      - name: Container end-to-end
+        run: bash scripts/container-e2e.sh
+
+  # The release scripts against a throwaway registry and git repository (Docker).
+  release-scripts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Release script tests
+        run: bash scripts/release/test-release.sh
+
+  # The image of this tree, tagged with its full tree hash, pushed only after every test job passed.
+  # On pull_request the checkout is GitHub's merge ref: the tree main gets if the PR is merged as it
+  # is, so release.yml finds this image on main by the same hash. An image whose tag the registry
+  # already has isn't built again. The build is gated before the push: it is loaded, run with
+  # --selfcheck (offline, read-only root), and only that image is pushed. A PR from a fork gets a
+  # read-only token, so this job fails there (README, "CI and releases").
+  publishing:
+    needs: [lint, tests, container, release-scripts]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # The image is listed in scripts/release/images.txt.
+      - name: Build, gate and push the image
+        run: bash scripts/release/publish-images.sh ghcr.io/${{ github.repository }}

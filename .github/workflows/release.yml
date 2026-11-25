@@ -1,0 +1,40 @@
+name: release
+
+# Every push to main is a release, and runs no tests and builds nothing: the pull request run built
+# and pushed the image of this exact tree, tagged with the tree hash, after its tests passed. This
+# adds the next X.Y.Z to that image and then pushes the git tag X.Y.Z (scripts/release/release.sh).
+"on":
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# One release at a time, so two quick merges never read the same highest tag. queue: max keeps up to
+# 100 pending runs, started in the order they began waiting (not guaranteed to be push order); a
+# plain group would keep one and cancel the older pending run. Runs beyond 100 are cancelled: re-run
+# them, which is safe (see README.md, "CI and releases"). cancel-in-progress must stay unset.
+concurrency:
+  group: release
+  queue: max
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Reads the version tags from the remote now, retags at the manifest level with the runner's
+      # default buildx (no pull, same digest), and pushes the git tag only after the retag.
+      - name: Release
+        run: bash scripts/release/release.sh ghcr.io/${{ github.repository }}

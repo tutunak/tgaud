@@ -20,8 +20,9 @@ Fixtures:
                        back)
 psql runs from the local binary if there is one, else from the postgres image with podman (--network=host).
 
-TGAUD_TEST_NO_DATABASE=1 skips every test that needs the server (the Forgejo CI test job: its runner's job network
-is the host's, so a service is not reachable by name). The local `mise run ci` runs them all.
+TGAUD_TEST_NO_DATABASE=1 skips every test that needs the server (for a machine with no container runtime). CI never
+sets it: the GitHub Actions jobs start the server with scripts/ci-postgres.sh (the image, memory cap and
+SERVER_SETTINGS below, checked) and point TGAUD_TEST_ADMIN_URL at it, and the local `mise run ci` runs them all.
 """
 
 from __future__ import annotations

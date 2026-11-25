@@ -4,9 +4,9 @@ Both sides build to this file. A change to it is a change to both repos.
 
 ## Image
 
-- `git.firr.co/company/tgaud`, tags `<full git sha>` and `latest`, built and pushed by Forgejo Actions on a push
-  to `main` only (the pattern of `~/projects/helpers/sui/.forgejo/workflows/ci.yml`: buildah, vfs, chroot, secret
-  `REGISTRY_TOKEN`, variable `REGISTRY_USER`).
+- `ghcr.io/tutunak/tgaud`, tags `<40-hex git tree hash>` (every pull request that passed its checks, pushed by GitHub
+  Actions after `--selfcheck` passed on that very build) and `X.Y.Z` (every release: a push to `main` adds the next
+  version to the image of its tree, same digest). No `latest` and no commit sha tag.
 - No `USER` line: rootless Podman maps uid 0 in the container to the host's `tgaud` account. The root file
   system is read-only; the process writes only to `/tmp`. No volume: all state is in PostgreSQL.
 - `ENTRYPOINT ["tgaud"]`, `CMD ["serve"]`.

@@ -1,0 +1,4 @@
+# The images CI publishes, one per line: suffix|context|dockerfile|
+# suffix is appended to the repository (ghcr.io/tutunak/tgaud); paths are relative to the repo root.
+# RELEASE_IMAGES_FILE replaces this list (the script tests use their own).
+|.|Containerfile|

@@ -1,0 +1,6 @@
+# actionlint 1.7.12, the latest release, doesn't know concurrency's `queue` key yet (GitHub, May 2026).
+# Ignore exactly that error, in the one workflow that uses it; drop this once actionlint accepts it.
+paths:
+  .github/workflows/release.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section\. expected one of "cancel-in-progress", "group"'
