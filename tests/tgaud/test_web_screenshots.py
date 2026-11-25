@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import uuid
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -26,6 +27,7 @@ from test_web import PROXY_TOKEN, make_config
 
 from tgaud.jobs import audience
 from tgaud.web import WebServer
+from tgstats import db as tgdb
 
 OUT = Path(__file__).resolve().parents[2] / "docs" / "web" / "screenshots"
 SIZES = {"laptop": (1366, 768), "phone": (390, 844)}
@@ -35,7 +37,35 @@ pytestmark = pytest.mark.skipif(not os.environ.get("TGAUD_WEB_SCREENSHOTS"),
                                 reason="writes docs/web/screenshots: set TGAUD_WEB_SCREENSHOTS=1")
 
 
-def test_screenshots_of_every_page(pg, fresh_db):
+def import_file(tmp_path: Path, size: str) -> Path:
+    """A tgstats.db (synthetic, written by tgstats' own writer) with one chat per outcome: Alpha chat newer than the
+    fixture's snapshot (imported), Alpha news older (not newer), Gamma group collected by an old tgstats, Delta
+    finishing in the future, and a chat tgaud does not track. Each size gets its own collection of Alpha chat."""
+    path = tmp_path / f"tgstats-{size}.db"
+    conn = tgdb.connect(path)
+    hour = 9 if size == "laptop" else 10
+    real_now = dt.datetime.now(dt.timezone.utc)
+
+    def snap(chat, title, users, started, finished):
+        members = [tgdb.Member(tgdb.UserRow(u, f"user{u}", f"Name{u}", None),
+                               (started + dt.timedelta(seconds=i + 1)).isoformat()) for i, u in enumerate(users)]
+        tgdb.add_snapshot(conn, tgdb.ChatRow(chat, "supergroup", title, None), members, len(users),
+                          collection=tgdb.Collection(str(uuid.uuid4()), started.isoformat(), finished.isoformat(),
+                                                     "listing", len(users), len(users)))
+
+    t = dt.datetime(2026, 11, 22, hour, tzinfo=dt.timezone.utc)
+    snap(B, "Alpha chat", range(1001, 1013), t, t + dt.timedelta(minutes=5))
+    snap(A, "Alpha news", range(1001, 1009), t - dt.timedelta(days=7), t - dt.timedelta(days=7, minutes=-5))
+    tgdb.add_snapshot(conn, tgdb.ChatRow(-1001000000003, "supergroup", "Gamma group", None),
+                      [tgdb.UserRow(u, None, None, None) for u in range(1001, 1006)], 5,
+                      taken_at="2026-11-14T10:00:00+00:00")  # as tgstats before the snapshot contract wrote it
+    snap(-1001000000004, "Delta", range(1001, 1004), real_now, real_now + dt.timedelta(days=1))
+    snap(-1009876543210, "Someone else's channel", range(1, 40), t, t + dt.timedelta(minutes=2))
+    conn.close()
+    return path
+
+
+def test_screenshots_of_every_page(pg, fresh_db, tmp_path):
     from playwright.sync_api import sync_playwright
 
     cfg = make_config(pg, fresh_db)
@@ -68,6 +98,8 @@ def test_screenshots_of_every_page(pg, fresh_db):
         ("asof-matrix", "/reports/asof?" + urlencode([("mode", "matrix"), ("date", "2026-11-07"), ("as_of", NOW_ARG),
                                                        *(("among", c) for c in AD)])),
         ("stale", None),  # a pair after a newer R2 publish
+        ("import", "/import"),
+        ("import-result", None),  # the form's response to a synthetic tgstats.db
     ]
     with psycopg.connect(fresh_db) as c:
         entrant = c.execute("SELECT x.user_id FROM tg.campaign_entrant(1, 48, %s) x GROUP BY x.user_id "
@@ -95,6 +127,10 @@ def test_screenshots_of_every_page(pg, fresh_db):
                         page.goto(base + "/campaigns/1")
                         page.fill("input[name=name]", "dec-promo")
                         page.click("form[action$='/link'] button")
+                    elif name == "import-result":
+                        page.goto(base + "/import")
+                        page.set_input_files("input[name=file]", str(import_file(tmp_path, size)))
+                        page.click("form[action='/import'] button")
                     elif name == "stale":
                         with psycopg.connect(fresh_db) as c:
                             audience.refresh(c, NOW + dt.timedelta(hours=1 if size == "laptop" else 2))

@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block main %}
+<p class="crumbs"><a href="/import">Import</a> › result</p>
+<h1>Import result</h1>
+<dl class="facts">
+  <div><dt>Chats in the file</dt><dd>{{ report.outcomes|length }}</dd></div>
+  <div><dt>Imported</dt><dd>{{ report.count("imported") }}</dd></div>
+  <div><dt>Skipped</dt><dd>{{ report.count("skipped") }}</dd></div>
+  <div><dt>Refused</dt><dd>{{ report.count("refused") }}</dd></div>
+  {% if report.count("failed") or report.count("unknown") %}<div><dt>Failed or unknown</dt><dd>{{ report.count("failed") + report.count("unknown") }}</dd></div>{% endif %}
+</dl>
+{% if not report.current %}<p class="note">This file was written by an older tgstats: none of its snapshots can be imported. Collect again with this version (<code>tgstats collect</code>) and upload the new file.</p>{% endif %}
+<div class="scroll">
+<table class="data cards imports">
+  <thead><tr><th>Chat</th><th>Outcome</th><th>Reason</th><th class="num">Members in the file</th><th class="num">Written</th><th>Collected</th></tr></thead>
+  <tbody>
+  {% for o in report.outcomes %}
+    <tr>
+      <th scope="row" data-label="Chat">{{ o.title or "?" }} <span class="id">{{ o.chat_id }}</span></th>
+      <td data-label="Outcome"><span class="outcome {{ o.status }}">{{ o.status }}</span></td>
+      <td data-label="Reason">{{ o.reason }}{% if o.snapshots > 1 %} <span class="muted">(the latest of {{ o.snapshots }} snapshots in the file)</span>{% endif %}</td>
+      <td class="num" data-label="Members in the file">{{ o.listed }}</td>
+      <td class="num" data-label="Written">{% if o.written is not none %}{{ o.written }}{% endif %}</td>
+      <td data-label="Collected">{% if o.started_at %}<span><span class="nw">{{ o.started_at|when }}</span> .. <span class="nw">{{ o.finished_at|when }}</span></span>{% endif %}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if report.count("imported") %}
+<p>The reconciler applies the imported snapshots within minutes: their members become known stays, and a complete,
+good listing lets tgaud doubt and probe stays it did not list. See the <a href="/">overview</a> and the
+<a href="/reports/coverage">coverage report</a> for known against Telegram's count.</p>
+{% else %}
+<p>Nothing was written. The <a href="/">overview</a> and the <a href="/reports/coverage">coverage report</a> show
+the current state.</p>
+{% endif %}
+{% if report.count("failed") or report.count("unknown") %}<p class="note">Some chats failed or have an unknown outcome: upload the same file again. Chats already imported are skipped, the others are tried again.</p>{% endif %}
+<p><a href="/import">Import another file</a></p>
+{% endblock %}

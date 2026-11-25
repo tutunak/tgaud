@@ -232,3 +232,14 @@ button.linkish {
   text-decoration: underline; cursor: pointer; border-radius: 0;
 }
 form.download { display: inline-block; margin: 1rem 0.5rem 0.5rem 0; }
+
+/* import */
+input[type="file"] { font: inherit; color: var(--ink); max-width: 100%; }
+ul.steps { padding-left: 1.2rem; max-width: 760px; }
+ul.steps li { margin: 0.3rem 0; }
+.outcome { display: inline-block; padding: 0 0.45rem; border-radius: 4px; font-size: 0.85em; font-weight: 600; white-space: nowrap; }
+.outcome.imported { background: var(--ok-bg); }
+.outcome.skipped { background: var(--bg); color: var(--muted); border: 1px solid var(--line); }
+.outcome.refused, .outcome.unknown { background: var(--warn-bg); color: var(--warn-ink); }
+.outcome.failed { background: var(--bad-bg); color: var(--bad-ink); }
+.imports td { overflow-wrap: anywhere; }

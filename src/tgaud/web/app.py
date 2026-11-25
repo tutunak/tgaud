@@ -12,6 +12,7 @@ import contextlib
 import hmac
 import logging
 import threading
+import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,8 +36,10 @@ SECURITY_HEADERS = [
                                 "frame-ancestors 'none'; base-uri 'none'"),
 ]
 REASONS = {200: "OK", 303: "See Other", 400: "Bad Request", 403: "Forbidden", 404: "Not Found",
-           405: "Method Not Allowed", 409: "Conflict", 413: "Payload Too Large", 500: "Internal Server Error",
-           502: "Bad Gateway", 503: "Service Unavailable"}
+           405: "Method Not Allowed", 408: "Request Timeout", 409: "Conflict", 411: "Length Required",
+           413: "Payload Too Large", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable"}
+UPLOAD_PATH = "/import"  # the one route whose POST body is a multipart upload, streamed by the route itself
+MIN_STATEMENT_MS = 50  # a bounded write starts no statement with less time left than this
 
 
 class HttpError(Exception):
@@ -61,7 +64,8 @@ class Request:
         method = environ.get("REQUEST_METHOD", "GET").upper()
         query = parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
         form: dict[str, list[str]] = {}
-        if method == "POST":
+        path = environ.get("PATH_INFO", "/") or "/"
+        if method == "POST" and path != UPLOAD_PATH:  # an upload's body is left to its route, unread
             try:
                 length = int(environ.get("CONTENT_LENGTH") or 0)
             except ValueError:
@@ -73,7 +77,7 @@ class Request:
             if ctype not in ("application/x-www-form-urlencoded", ""):
                 raise HttpError(400, "forms must be sent as application/x-www-form-urlencoded")
             form = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
-        return cls(method, environ.get("PATH_INFO", "/") or "/", query, form, environ)
+        return cls(method, path, query, form, environ)
 
     def header(self, name: str) -> str | None:
         key = "HTTP_" + name.upper().replace("-", "_")
@@ -159,6 +163,30 @@ def same_origin(req: Request) -> bool:
     return _origin(parts.scheme, parts.netloc) == own
 
 
+class OutOfTime(Exception):
+    """A bounded write had too little time left to start its next statement."""
+
+
+class Deadline:
+    """The time left of one bounded transaction, applied to each statement as its lock and statement timeout
+    (`arm()` before every statement), so waits for locks count against the same total as the work."""
+
+    def __init__(self, conn: psycopg.Connection, seconds: float) -> None:
+        self.conn = conn
+        self.seconds = seconds
+        self.end = time.monotonic() + seconds
+
+    def left(self) -> float:
+        return self.end - time.monotonic()
+
+    def arm(self) -> None:
+        ms = int(self.left() * 1000)
+        if ms < MIN_STATEMENT_MS:
+            raise OutOfTime(f"the transaction used up its {self.seconds:g} s")
+        self.conn.execute("SELECT set_config('statement_timeout', %s, true), set_config('lock_timeout', %s, true)",
+                          (f"{ms}ms", f"{ms}ms"))
+
+
 class WebDb:
     """The web UI's one database connection (deploy contract: serve holds at most 4), opened on first use and
     reopened after a loss. Requests take turns: one statement at a time, guarded by a lock."""
@@ -222,15 +250,30 @@ class WebDb:
     def write(self) -> Iterator[psycopg.Connection]:
         """A READ COMMITTED transaction that writes, opened with the serve generation fence (as every job
         transaction); committed when the block ends without an exception."""
+        with self._writing(None) as (conn, _):
+            yield conn
+
+    @contextlib.contextmanager
+    def write_within(self, seconds: float) -> Iterator[tuple[psycopg.Connection, Deadline]]:
+        """write() bounded in total: lock_timeout and statement_timeout are set from the time left before the fence,
+        and the block calls `deadline.arm()` before each of its statements (OutOfTime when too little is left)."""
+        with self._writing(seconds) as pair:
+            yield pair
+
+    @contextlib.contextmanager
+    def _writing(self, seconds: float | None) -> Iterator[tuple[psycopg.Connection, Deadline | None]]:
         with self._turn():
             conn = self._ensure()
             conn.read_only = False
             conn.isolation_level = IsolationLevel.READ_COMMITTED
+            deadline = Deadline(conn, seconds) if seconds is not None else None
             ok = False
             try:
+                if deadline is not None:
+                    deadline.arm()
                 if self._fence is not None:
                     self._fence(conn)
-                yield conn
+                yield conn, deadline
                 ok = True
             finally:
                 self._end(conn, commit=ok)

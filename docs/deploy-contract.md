@@ -56,6 +56,10 @@ The selfcheck runs with dummy secret values only if the real ones are absent; it
   every web request: `200 ok activation=<TGAUD_ACTIVATION_ID>` when the web app answers and its database
   connection runs `select 1`; `503` with the reason otherwise; `403` without the token. The HMAC key is provisioned once: changing it re-keys every bot invite
   link and breaks campaign attribution, so the role refuses a change on a deployed host.
+- The web UI's Import page (`POST /import`) takes one upload of at most 32 MiB (plus 16 KiB of multipart overhead)
+  at a time, within 2 minutes, streamed into one spool file in `/tmp` and deleted when the request ends. The reverse
+  proxy must not cap request bodies below that (the role's Caddy site sets no limit). Every other request body is at
+  most 64 KiB.
 - Identity guards in the app: on its first start `tgaud serve` records the bot id (`getMe`) and a fingerprint of
   `TGAUD_LINK_HMAC_KEY` (HMAC of a fixed label, never the key) in the database; afterwards it exits 2 with a clear
   message when the token belongs to another bot or the key differs. Nothing is written before both checks pass.

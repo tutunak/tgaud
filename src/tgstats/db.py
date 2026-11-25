@@ -1,4 +1,11 @@
-"""SQLite storage: chats, users and snapshots with their memberships."""
+"""SQLite storage: chats, users and snapshots with their memberships.
+
+A snapshot written by this version also carries what tgaud's snapshot contract needs (docs/design/design.md 5):
+the collection's random id, when it started and finished, Telegram's count before and after the listing, how it
+ran, and for every member the observation of the page that first listed them. Files written by older versions get
+those columns on open (all NULL for their snapshots) and read back as before; tgaud refuses to import such
+snapshots, so they stay for the analysis commands only.
+"""
 
 from __future__ import annotations
 
@@ -39,6 +46,32 @@ CREATE TABLE IF NOT EXISTS memberships (
 CREATE INDEX IF NOT EXISTS snapshots_by_chat ON snapshots(chat_id, id);
 """
 
+# Added on open to files of every version (nullable: old snapshots read back with NULLs). The snapshot contract's
+# fields: the collection's id, its times and counts, and how it ran.
+SNAPSHOT_COLUMNS = {
+    "uuid": "TEXT",            # random id made when the collection started; tgaud's duplicate key
+    "started_at": "TEXT",      # before the first count read
+    "finished_at": "TEXT",     # after the last count read (or the interrupt); taken_at is the same moment
+    "method": "TEXT",          # basic_group | listing | deep: the path the run took
+    "reported_start": "INTEGER",  # Telegram's member count before the listing
+    "reported_end": "INTEGER",    # and after it; NULL when that read failed or was interrupted
+}
+# Per member, the observation of the page that first listed them (the users table keeps the latest profile).
+MEMBERSHIP_COLUMNS = {
+    "seen_at": "TEXT",          # when that page arrived
+    "joined_date": "TEXT",      # participant.date; NULL for creators
+    "inviter_id": "INTEGER",
+    "via_request": "INTEGER",
+    "subscription_until": "TEXT",
+    "is_bot": "INTEGER",
+    "is_deleted": "INTEGER",
+    "is_premium": "INTEGER",
+    "username": "TEXT",
+    "first_name": "TEXT",
+    "last_name": "TEXT",
+}
+METHODS = ("basic_group", "listing", "deep")
+
 # A snapshot is incomplete when fetched falls short of what Telegram reported by
 # more than this share: member counts drift a little while a listing runs.
 INCOMPLETE_TOLERANCE = 0.02
@@ -64,6 +97,12 @@ class SnapshotRow:
     fetched: int
     reported: int | None
     complete: bool
+    uuid: str | None = None  # None: written by an older version (no snapshot contract fields)
+    started_at: str | None = None
+    finished_at: str | None = None
+    method: str | None = None
+    reported_start: int | None = None
+    reported_end: int | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +117,35 @@ class UserRow:
     @property
     def name(self) -> str:
         return " ".join(p for p in (self.first_name, self.last_name) if p)
+
+
+@dataclass(frozen=True)
+class Member:
+    """One member as one page listed them: the profile then, and the participant's fields where its type has them."""
+
+    user: UserRow
+    seen_at: str
+    joined_date: str | None = None
+    inviter_id: int | None = None
+    via_request: bool | None = None
+    subscription_until: str | None = None
+    is_premium: bool | None = None
+
+    @property
+    def id(self) -> int:
+        return self.user.id
+
+
+@dataclass(frozen=True)
+class Collection:
+    """What the snapshot contract needs about one collection of a chat."""
+
+    uuid: str
+    started_at: str
+    finished_at: str
+    method: str
+    reported_start: int | None
+    reported_end: int | None
 
 
 def is_incomplete(fetched: int, reported: int | None) -> bool:
@@ -99,7 +167,38 @@ def connect(path: str | Path, create: bool = True) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    try:
+        migrate(conn)
+    except sqlite3.OperationalError:
+        if create:
+            raise
+        # a read-only old file: the analysis commands read only the original columns
     return conn
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def migrate(conn: sqlite3.Connection) -> list[str]:
+    """Add the snapshot contract's columns a file lacks, in one transaction; returns the columns added."""
+    added: list[str] = []
+    missing = []
+    for table, columns in (("snapshots", SNAPSHOT_COLUMNS), ("memberships", MEMBERSHIP_COLUMNS)):
+        have = _columns(conn, table)
+        missing += [(table, column, kind) for column, kind in columns.items() if column not in have]
+    if missing or not _has_uuid_index(conn):
+        with conn:
+            for table, column, kind in missing:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+                added.append(f"{table}.{column}")
+            conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS snapshots_by_uuid ON snapshots(uuid)")
+    return added
+
+
+def _has_uuid_index(conn: sqlite3.Connection) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'snapshots_by_uuid'"
+                        ).fetchone() is not None
 
 
 def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> None:
@@ -111,47 +210,77 @@ def upsert_chat(conn: sqlite3.Connection, chat: ChatRow) -> None:
     )
 
 
+def _flag(value: bool | None) -> int | None:
+    return None if value is None else int(value)
+
+
 def add_snapshot(
     conn: sqlite3.Connection,
     chat: ChatRow,
-    users: Iterable[UserRow],
+    users: Iterable[UserRow | Member],
     reported: int | None,
     taken_at: str | None = None,
     complete: bool | None = None,
+    collection: Collection | None = None,
 ) -> SnapshotRow:
     """Store one full snapshot of a chat atomically and return it.
 
-    `complete` overrides the verdict from the counts (an interrupted run is always incomplete).
+    `users` are plain profiles or, from a collection, the members as first observed (one per user: the first one
+    wins, as tgaud's ON CONFLICT DO NOTHING). `complete` overrides the verdict from the counts (an interrupted run
+    is always incomplete). With `collection`, taken_at is its finished_at.
     """
-    users = list(users)
-    fetched = len({u.id for u in users})
+    members: dict[int, UserRow | Member] = {}
+    for u in users:
+        members.setdefault(u.id, u)
+    fetched = len(members)
     if complete is None:
         complete = not is_incomplete(fetched, reported)
-    taken_at = taken_at or utcnow()
+    taken_at = collection.finished_at if collection is not None else taken_at or utcnow()
+    c = collection
     with conn:
         upsert_chat(conn, chat)
+        profiles = [m.user if isinstance(m, Member) else m for m in members.values()]
         conn.executemany(
             "INSERT INTO users (id, username, first_name, last_name, is_bot, is_deleted) "
             "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
             "username=excluded.username, first_name=excluded.first_name, "
             "last_name=excluded.last_name, is_bot=excluded.is_bot, is_deleted=excluded.is_deleted",
-            [(u.id, u.username, u.first_name, u.last_name, int(u.is_bot), int(u.is_deleted)) for u in users],
+            [(u.id, u.username, u.first_name, u.last_name, int(u.is_bot), int(u.is_deleted)) for u in profiles],
         )
         cur = conn.execute(
-            "INSERT INTO snapshots (chat_id, taken_at, fetched, reported, complete) VALUES (?, ?, ?, ?, ?)",
-            (chat.id, taken_at, fetched, reported, int(complete)),
+            "INSERT INTO snapshots (chat_id, taken_at, fetched, reported, complete, uuid, started_at, finished_at, "
+            "method, reported_start, reported_end) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (chat.id, taken_at, fetched, reported, int(complete), *(
+                (c.uuid, c.started_at, c.finished_at, c.method, c.reported_start, c.reported_end) if c
+                else (None,) * 6)),
         )
         snapshot_id = cur.lastrowid
+        rows = []
+        for m in members.values():
+            if isinstance(m, Member):
+                u = m.user
+                rows.append((snapshot_id, u.id, m.seen_at, m.joined_date, m.inviter_id, _flag(m.via_request),
+                             m.subscription_until, int(u.is_bot), int(u.is_deleted), _flag(m.is_premium),
+                             u.username, u.first_name, u.last_name))
+            else:
+                rows.append((snapshot_id, m.id) + (None,) * 11)
         conn.executemany(
-            "INSERT OR IGNORE INTO memberships (snapshot_id, user_id) VALUES (?, ?)",
-            [(snapshot_id, u.id) for u in users],
+            "INSERT OR IGNORE INTO memberships (snapshot_id, user_id, seen_at, joined_date, inviter_id, via_request, "
+            "subscription_until, is_bot, is_deleted, is_premium, username, first_name, last_name) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rows,
         )
-    return SnapshotRow(snapshot_id, chat.id, taken_at, fetched, reported, complete)
+    if c is None:
+        return SnapshotRow(snapshot_id, chat.id, taken_at, fetched, reported, complete)
+    return SnapshotRow(snapshot_id, chat.id, taken_at, fetched, reported, complete, c.uuid, c.started_at,
+                       c.finished_at, c.method, c.reported_start, c.reported_end)
 
 
 def _snapshot(row: sqlite3.Row) -> SnapshotRow:
+    keys = row.keys()
+    extra = [row[k] if k in keys else None for k in SNAPSHOT_COLUMNS]
     return SnapshotRow(
-        row["id"], row["chat_id"], row["taken_at"], row["fetched"], row["reported"], bool(row["complete"])
+        row["id"], row["chat_id"], row["taken_at"], row["fetched"], row["reported"], bool(row["complete"]), *extra
     )
 
 
@@ -189,3 +318,15 @@ def snapshot_members(
         )
         for r in conn.execute(sql, (snapshot_id,))
     }
+
+
+def observations(conn: sqlite3.Connection, snapshot_id: int) -> dict[int, Member]:
+    """The members of a snapshot as their first page observed them (written by this version; NULLs for older)."""
+    out: dict[int, Member] = {}
+    for r in conn.execute("SELECT * FROM memberships WHERE snapshot_id = ? ORDER BY user_id", (snapshot_id,)):
+        user = UserRow(r["user_id"], r["username"], r["first_name"], r["last_name"], bool(r["is_bot"]),
+                       bool(r["is_deleted"]))
+        out[r["user_id"]] = Member(user, r["seen_at"], r["joined_date"], r["inviter_id"],
+                                   None if r["via_request"] is None else bool(r["via_request"]),
+                                   r["subscription_until"], None if r["is_premium"] is None else bool(r["is_premium"]))
+    return out

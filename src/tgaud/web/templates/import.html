@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block main %}
+<h1>Import members from tgstats</h1>
+<p>The Bot API cannot list the members a chat already has, so tgaud learns people only from joins and leaves since the
+bot became an admin. <code>tgstats collect</code> lists them with your own Telegram account; upload the
+<code>tgstats.db</code> it wrote, and tgaud reconciles those members with what it recorded.</p>
+{% if problem %}<p class="problem">{{ problem }}</p>{% endif %}
+<form method="post" action="/import" enctype="multipart/form-data" class="stack">
+  <label>tgstats.db <input type="file" name="file" accept=".db,application/vnd.sqlite3,application/x-sqlite3" required></label>
+  <p class="hint">At most {{ max_mib }} MiB. A file that has grown larger: collect into a fresh one with
+  <code>tgstats collect --db fresh.db</code> and upload that.</p>
+  <button type="submit">Upload and import</button>
+</form>
+<h2>What is imported</h2>
+<ul class="steps">
+  <li>The <b>latest snapshot of each chat</b> in the file, for chats tgaud tracks. Earlier snapshots in the file
+  are left alone, and so are tracked chats the file does not have.</li>
+  <li>Only snapshots of <b>this tgstats version</b>: an older one recorded only when its collection ended, which
+  can contradict leaves tgaud saw meanwhile. Collect again with <code>tgstats collect</code>.</li>
+  <li>A snapshot that is not newer than one tgaud already has for the chat, or one already imported, is skipped:
+  uploading the same file twice imports nothing new.</li>
+  <li>People removed with <code>tgaud forget-user</code> are never brought back.
+  {% if not names %}Names and usernames are not stored (<code>TGAUD_STORE_NAMES</code> is off).{% endif %}</li>
+  <li>A chat with more than {{ ceiling }} members in one snapshot is refused: one chat's import is one database
+  transaction, kept under {{ seconds|int }} s.</li>
+</ul>
+<h2>What happens next</h2>
+<p>The result page lists every chat of the file with what happened to it. The reconciler then applies each imported
+snapshot, usually within minutes: members it lists become known stays, a complete listing lets tgaud doubt (and
+probe) stays it does not list, and the <a href="/reports/coverage">coverage report</a> shows known against
+Telegram's count.</p>
+{% endblock %}
