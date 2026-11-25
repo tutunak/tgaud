@@ -8,7 +8,7 @@ This file is how the code is put together and where each part plugs in.
 ## Tests
 
 ```sh
-mise run ci                       # uv run pytest (tgstats and tgaud) + image-test + container-e2e
+mise run ci                       # uv run pytest (tgstats and tgaud) + lint-ci + release-scripts + image-test + container-e2e
 ```
 
 The database tests need PostgreSQL 18.6 and `psql`:
@@ -181,7 +181,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   rollback after `migrate` must keep working. `serve` exits 3 when the database lacks one of the image's
   migrations and accepts a newer database with a warning.
 - Numbers: core 002 (every addition more than one task uses), history 003, reconcile 004, probe-sample 005,
-  rollups 006, ingest 007, cli 008, web 009, prober-simplify 010 (`tg.probe.next_attempt_at`, `.spell_from`).
+  rollups 006, ingest 007, cli 008, prober-simplify 010 (009 stays unused: the web UI needs no migration) (`tg.probe.next_attempt_at`, `.spell_from`).
 
 002 (`002_shared.sql`) adds: `tg.bot_state.caught_up_at`, `.link_key_fingerprint`, `.serve_generation`;
 `tg.member_event.actor_is_other` with its BEFORE INSERT trigger (the rebuild and the join route read it, never
