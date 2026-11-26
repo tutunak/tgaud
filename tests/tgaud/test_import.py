@@ -16,6 +16,7 @@ import pytest
 from import_lab import A, B, C, U, Lab, at, legacy_file, migrate_chat
 
 from tgaud import history
+from tgaud.jobs import reconciler, sampler
 from tgaud.web import importer, tgstats_file
 from tgstats import db as tgdb
 
@@ -792,3 +793,459 @@ def test_the_file_layout_is_the_one_tgstats_writes():
     raw.executescript(tgdb.SCHEMA)
     for table, cols in tgstats_file.BASE.items():
         assert tuple(r[1] for r in raw.execute(f"PRAGMA table_info({table})")) == cols
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# A later version of an imported collection (reimport task): a partial version (about 10 % of the members, the
+# file of a collection still running) and the finished one (same uuid and started_at, later finished_at, the
+# partial's members with the same observations plus the rest). The finished one grades partial on its own, as the
+# owner's 2004 of 2135 did. It is written as a delta: only the members no stored version listed.
+# ---------------------------------------------------------------------------------------------------------------
+
+ALL = list(range(1, 61))  # the finished version's members
+SHARED = list(range(1, 7))  # the partial version's
+MISSING = [u for u in ALL if u not in SHARED]
+REPORTED = 90  # Telegram's count: 60 of 90 listed grades partial
+LATER_REASON = "imported: a later version of the collection in snapshot"
+
+
+def seen(u: int) -> dt.datetime:
+    return at(u / 4)  # every version saw user u on the same page
+
+
+def version(lab, users, finished: dt.datetime, *, uuid: str | None = None, chat: int = A,
+            started: dt.datetime | None = None):
+    """(path, uuid) of a file with one version of a collection of `chat`."""
+    f = lab.file()
+    u = f.snapshot(chat, {x: {"seen_at": seen(x), "joined_date": at(-5000 - x)} for x in users}, started or at(0),
+                   finished=finished, reported=REPORTED, uuid=uuid)
+    return f.close(), u
+
+
+def partial_then(lab, *, chat: int = A):
+    """The partial version imported: (its snapshot_id, its file, the finished version's file)."""
+    path, u = version(lab, SHARED, at(2), chat=chat)
+    report = lab.run(path)
+    assert lab.outcomes(report) == {chat: ("imported", len(SHARED))}
+    full, _ = version(lab, ALL, at(20), uuid=u, chat=chat)
+    return report.outcomes[0].snapshot_id, path, full
+
+
+@pytest.fixture
+def full_only(pg, tmp_path):
+    """A fresh database that imports only the finished version."""
+    (tmp_path / "full-only").mkdir()
+    lab = Lab(pg, pg.make_db(), tmp_path / "full-only")
+    yield lab
+    lab.close()
+
+
+def import_full_only(full_only, users=ALL, finished: dt.datetime | None = None) -> None:
+    path, _ = version(full_only, users, finished or at(20))
+    assert full_only.outcomes(full_only.run(path)) == {A: ("imported", len(users))}
+    full_only.reconcile()
+
+
+def history_of(lab, chat: int = A) -> dict:
+    """What the replay and the reconciler made of the chat, with nothing that names a snapshot id."""
+    from history_world import COLS
+    return {
+        "spells": lab.q(f"SELECT {COLS} FROM tg.membership WHERE chat_id = %s ORDER BY user_id, known_from", chat),
+        "cases": lab.q("SELECT user_id, rule, at FROM tg.contradiction_case WHERE chat_id = %s ORDER BY 1, 2, 3", chat),
+        "gaps": lab.q("SELECT chat_id, period, reason FROM tg.gap ORDER BY 1, 2, 3"),
+        "probes": lab.q("SELECT chat_id, user_id, reason, outcome FROM tg.probe ORDER BY 1, 2, 3, 4"),
+        "users": lab.q("SELECT user_id, is_bot, is_deleted, username, first_name, first_seen_at, last_seen_at "
+                       "FROM tg.tg_user ORDER BY user_id"),
+        # what reports and /metrics read of a chat's snapshots: only good ones (a delta never is) and open spells
+        "status": lab.q("SELECT * FROM stats.v_chat_status WHERE chat_id = %s", chat),
+        "last good": lab.q(sampler._Q_SNAPSHOT.replace("%(chats)s", "ARRAY[%s]"), chat),
+        "known open": lab.q("SELECT count(*) FROM tg.membership WHERE chat_id = %s AND end_source IS NULL", chat),
+    }
+
+
+def one_run_each(lab, users, chat: int = A) -> None:
+    runs = lab.q("SELECT user_id, count(*), sum(times_seen) FROM tg.sighting WHERE chat_id = %s "
+                 "GROUP BY user_id ORDER BY user_id", chat)
+    assert runs == [(u, 1, 1) for u in users]
+    assert lab.q("SELECT count(*) FROM tg.tg_user WHERE user_id = ANY(%s)", list(users)) == [(len(users),)]
+
+
+def grade_and_apply(lab, snapshot_id: int, size: int = 10_000) -> None:
+    """The reconciler's grade, then one apply chunk of `size` users, each committed (no prune)."""
+    with psycopg.connect(lab.dsn) as c:
+        reconciler.grade(c, snapshot_id)
+    with psycopg.connect(lab.dsn) as c:
+        reconciler.apply_chunk(c, snapshot_id, A, size)
+
+
+def bring(lab, snapshot_id: int, state: str, monkeypatch) -> None:
+    """The stored version in one reconcile state."""
+    if state == "unapplied":
+        pass
+    elif state == "half applied":
+        grade_and_apply(lab, snapshot_id, 3)
+        [s] = [x for x in lab.snapshots(A) if x["snapshot_id"] == snapshot_id]
+        assert s["applied_through_user_id"] == SHARED[2] and s["reconciled_at"] is None
+    elif state == "applied":
+        grade_and_apply(lab, snapshot_id)
+    elif state == "mid-prune":
+        grade_and_apply(lab, snapshot_id)
+        monkeypatch.setattr(reconciler, "DELETE_BATCH", 2)
+        with psycopg.connect(lab.dsn) as c:
+            assert not reconciler.prune_batch(c, snapshot_id)
+        monkeypatch.setattr(reconciler, "DELETE_BATCH", 20_000)
+        [s] = [x for x in lab.snapshots(A) if x["snapshot_id"] == snapshot_id]
+        assert s["prune_started_at"] is not None and s["members_pruned_at"] is None
+        assert sorted(lab.members(snapshot_id)) == SHARED[2:]
+    else:
+        assert state == "pruned"
+        lab.reconcile()
+        [s] = [x for x in lab.snapshots(A) if x["snapshot_id"] == snapshot_id]
+        assert s["members_pruned_at"] is not None and lab.members(snapshot_id) == {}
+
+
+def delta_of(lab, report, first: int) -> dict:
+    """The delta row of a later version's import, checked against its result row."""
+    [o] = report.outcomes
+    assert (o.status, o.written) == ("imported", len(MISSING)), o.reason
+    assert o.reason == f"{LATER_REASON} {first}: {len(MISSING)} members it lacked written ({len(ALL)} in the file)"
+    [d] = [s for s in lab.snapshots(A) if s["snapshot_id"] == o.snapshot_id]
+    return d
+
+
+@pytest.mark.parametrize("state", ["unapplied", "half applied", "applied", "mid-prune", "pruned"])
+def test_a_later_version_adds_only_the_members_it_lacked(lab, full_only, monkeypatch, state):
+    first, _, full = partial_then(lab)
+    bring(lab, first, state, monkeypatch)
+    report = lab.run(full)
+    d = delta_of(lab, report, first)
+    assert sorted(lab.members(d["snapshot_id"])) == MISSING
+    assert (d["complete"], d["fetched"], d["collect_uuid"], d["started_at"], d["finished_at"]) == (
+        False, len(MISSING), None, at(0), at(20))
+    assert d["version_of"] == lab.snapshots(A)[0]["collect_uuid"]
+    assert (d["reported_at_start"], d["reported_at_end"]) == (REPORTED, REPORTED)
+    assert report.later_versions == 1
+    lab.reconcile()
+    assert [s["quality"] for s in lab.snapshots(A)] == ["partial", "partial"]
+    one_run_each(lab, ALL)
+    import_full_only(full_only)
+    assert history_of(lab) == history_of(full_only)
+
+
+def test_a_third_version_after_the_second_was_pruned_adds_only_members_neither_listed(lab, full_only):
+    first, _, full = partial_then(lab)
+    lab.reconcile()
+    second = lab.run(full).outcomes[0].snapshot_id
+    lab.reconcile()
+    assert lab.members(second) == {}  # pruned: only its sightings say whom it listed
+    uuid = str(lab.snapshots(A)[0]["collect_uuid"])
+    third, _ = version(lab, range(1, 71), at(30), uuid=uuid)
+    report = lab.run(third)
+    [o] = report.outcomes
+    assert (o.status, o.written) == ("imported", 10)
+    assert o.reason == f"{LATER_REASON} {first}: 10 members it lacked written (70 in the file)"
+    assert sorted(lab.members(o.snapshot_id)) == list(range(61, 71))
+    lab.reconcile()
+    one_run_each(lab, range(1, 71))
+    import_full_only(full_only, range(1, 71), at(30))
+    assert history_of(lab) == history_of(full_only)
+
+
+def test_a_prune_batch_committed_after_the_version_lookup_hides_no_one(lab, monkeypatch):
+    first, _, full = partial_then(lab)
+    grade_and_apply(lab, first)
+    real = importer._versions
+
+    def lookup_then_prune(q, uuid):
+        found = real(q, uuid)
+        with psycopg.connect(lab.dsn) as c:  # commits before the importer reads the listed members
+            assert reconciler.prune_batch(c, first)
+        return found
+
+    monkeypatch.setattr(importer, "_versions", lookup_then_prune)
+    report = lab.run(full)
+    d = delta_of(lab, report, first)
+    assert lab.members(first) == {} and sorted(lab.members(d["snapshot_id"])) == MISSING
+    monkeypatch.undo()
+    lab.reconcile()
+    one_run_each(lab, ALL)
+
+
+def test_replaying_the_shared_users_twice_would_have_raised_a_contradiction_gap(lab, full_only):
+    """Each shared user left 5 minutes before the page that lists them: a stale listing (S3) per listing. Six cases
+    stay under the threshold (more than 10 within 60 minutes); listing them again in the later version would have
+    made twelve. An unrelated open spell would then have been doubted by the gap."""
+    for w in (lab, full_only):
+        w.event(A, 900, at(-100), "left", "member")
+        for u in SHARED:
+            w.event(A, u, seen(u) - dt.timedelta(minutes=5), "member", "left")
+    first, _, full = partial_then(lab)
+    lab.reconcile()
+    delta_of(lab, lab.run(full), first)
+    lab.reconcile()
+    import_full_only(full_only)
+    mine = history_of(lab)
+    assert lab.q("SELECT count(*) FROM tg.contradiction_case WHERE chat_id = %s AND rule = 'S3'", A) == [(6,)]
+    assert mine["gaps"] == [] and not any(p[2] == "outage" for p in mine["probes"])
+    assert lab.spells(A, 900) == full_only.spells(A, 900) and lab.spells(A, 900)[0].suspect_since is None
+    assert mine == history_of(full_only)
+    one_run_each(lab, ALL)
+
+
+def test_a_join_event_between_the_imports_keeps_one_run(lab, full_only):
+    first, _, full = partial_then(lab)
+    lab.reconcile()
+    lab.event(A, 2, at(30), "left", "member")  # a shared user joins again: the listed stay ended before (E4)
+    delta_of(lab, lab.run(full), first)
+    lab.reconcile()
+    import_full_only(full_only)
+    full_only.event(A, 2, at(30), "left", "member")
+    one_run_each(lab, ALL)
+    spells = lab.spells(A, 2)
+    assert [(s.start_source, s.end_source) for s in spells] == [("snapshot", "inferred"), ("event", None)]
+    assert spells == full_only.spells(A, 2) and history_of(lab) == history_of(full_only)
+
+
+def test_versions_that_are_not_later_or_add_nobody_are_skipped(lab):
+    first, partial, full = partial_then(lab)
+    again = lab.run(partial)
+    assert again.outcomes[0].reason == f"already imported (snapshot {first})"
+    same_members, _ = version(lab, SHARED, at(10), uuid=str(lab.snapshots(A)[0]["collect_uuid"]))
+    nobody = lab.run(same_members)
+    assert lab.outcomes(nobody) == {A: ("skipped", None)}
+    assert nobody.outcomes[0].reason == f"already imported (snapshot {first}): the file adds no member"
+    assert len(lab.snapshots(A)) == 1
+    delta = lab.run(full).outcomes[0].snapshot_id
+    twice = lab.run(full)
+    assert lab.outcomes(twice) == {A: ("skipped", None)}
+    assert twice.outcomes[0].reason == f"already imported (snapshot {delta})"
+    older = lab.run(same_members)  # finished before the newest version
+    assert older.outcomes[0].reason == f"older version: tgaud has a later version of this collection (snapshot {delta})"
+    assert lab.run(partial).outcomes[0].reason == f"already imported (snapshot {first})"
+    assert len(lab.snapshots(A)) == 2 and lab.q("SELECT count(*) FROM tg.snapshot_member") == [(len(ALL),)]
+
+
+def test_the_finished_version_first_then_the_partial_one_is_older(lab):
+    full, u = version(lab, ALL, at(20))
+    sid = lab.run(full).outcomes[0].snapshot_id
+    partial, _ = version(lab, SHARED, at(2), uuid=u)
+    report = lab.run(partial)
+    assert lab.outcomes(report) == {A: ("skipped", None)}
+    assert report.outcomes[0].reason == f"older version: tgaud has a later version of this collection (snapshot {sid})"
+    assert lab.run(full).outcomes[0].reason == f"already imported (snapshot {sid})"
+    assert len(lab.snapshots()) == 1
+
+
+def test_a_later_version_drops_erased_members_as_a_first_import_does(lab):
+    _, _, full = partial_then(lab)
+    _forget(lab, 40)
+    [o] = lab.run(full).outcomes
+    assert (o.status, o.written) == ("imported", len(MISSING) - 1)
+    assert sorted(lab.members(o.snapshot_id)) == [u for u in MISSING if u != 40]
+
+
+def test_a_later_version_behind_a_later_snapshot_of_the_chat_is_not_newer(lab):
+    _, _, full = partial_then(lab)
+    f = lab.file()
+    f.snapshot(A, {1: at(31), 70: at(32)}, at(30))  # another collection, started later
+    assert lab.outcomes(lab.run(f.close())) == {A: ("imported", 2)}
+    report = lab.run(full)
+    assert lab.outcomes(report) == {A: ("skipped", None)} and report.outcomes[0].reason.startswith("not newer")
+    assert len(lab.snapshots(A)) == 2 and lab.q("SELECT count(*) FROM tg.snapshot_member") == [(8,)]
+
+
+def test_a_different_start_with_the_same_uuid_is_already_imported(lab):
+    first, _, _ = partial_then(lab)
+    moved, _ = version(lab, ALL, at(20), uuid=str(lab.snapshots(A)[0]["collect_uuid"]), started=at(-1))
+    report = lab.run(moved)
+    assert report.outcomes[0].reason == f"already imported (snapshot {first})" and len(lab.snapshots()) == 1
+
+
+def test_after_m1_the_collection_stays_claimed_by_its_chat_and_source(lab):
+    first, partial, _ = partial_then(lab)
+    lab.reconcile()
+    new = A - 100
+    migrate_chat(lab.dsn, A, new, at(500), new_tracked=True)
+    uuid = str(lab.snapshots(new)[0]["collect_uuid"])
+    for chat in (new, A):  # the new id's source differs; the old id is no longer the claim's chat
+        path, _ = version(lab, ALL, at(20), uuid=uuid, chat=chat)
+        report = lab.run(path)
+        assert report.outcomes[0].reason == f"already imported (snapshot {first})", report.outcomes[0].reason
+    retry = lab.run(partial)
+    assert lab.outcomes(retry) == {A: ("skipped", None)}
+    assert retry.outcomes[0].reason == f"already imported (snapshot {first})"
+    assert len(lab.snapshots()) == 1 and lab.q("SELECT count(*) FROM tg.snapshot_member") == [(0,)]
+
+
+def test_racing_uploads_of_the_finished_version_write_one_delta(lab, monkeypatch):
+    _, _, full = partial_then(lab)
+    gate = Gate(monkeypatch, {1})
+    other = importer.WebDb(lab.connect, fence=lab.ctx.fence)
+    try:
+        t1, r1 = _in_thread(lambda: importer.run(lab.database, full, store_names=True))
+        assert gate.locked.wait(30)
+        t2, r2 = _in_thread(lambda: importer.run(other, full, store_names=True))
+        _waiting_on_a_lock(lab.dsn)
+        gate.go.set()
+        t1.join(30)
+        t2.join(30)
+    finally:
+        other.close()
+    assert lab.outcomes(r1["result"]) == {A: ("imported", len(MISSING))}
+    delta = r1["result"].outcomes[0].snapshot_id
+    assert r2["result"].outcomes[0].reason == f"already imported (snapshot {delta})"
+    assert len(lab.snapshots(A)) == 2
+
+
+def test_racing_first_imports_of_one_uuid_for_two_chats_keep_the_first(lab, monkeypatch):
+    path_a, u = version(lab, SHARED, at(2), chat=A)
+    path_b, _ = version(lab, ALL, at(20), chat=B, uuid=u)  # another version, another chat
+    real = importer._versions
+    paused, go = threading.Event(), threading.Event()
+    calls = []
+
+    def pause_the_first(q, uuid):
+        found = real(q, uuid)
+        calls.append(uuid)
+        if len(calls) == 1:
+            paused.set()
+            assert go.wait(30)
+        return found
+
+    monkeypatch.setattr(importer, "_versions", pause_the_first)
+    other = importer.WebDb(lab.connect, fence=lab.ctx.fence)
+    try:
+        ta, ra = _in_thread(lambda: importer.run(lab.database, path_a, store_names=True))
+        assert paused.wait(30)  # A holds the collection after its lookup found nothing
+        tb, rb = _in_thread(lambda: importer.run(other, path_b, store_names=True))
+        _waiting_on_a_lock(lab.dsn)  # B waits for the collection's lock, not for A's chat
+        go.set()
+        ta.join(30)
+        tb.join(30)
+    finally:
+        other.close()
+    assert lab.outcomes(ra["result"]) == {A: ("imported", len(SHARED))}
+    first = ra["result"].outcomes[0].snapshot_id
+    assert lab.outcomes(rb["result"]) == {B: ("skipped", None)}
+    assert rb["result"].outcomes[0].reason == f"already imported (snapshot {first})"
+    assert lab.snapshots(B) == [] and [s["snapshot_id"] for s in lab.snapshots()] == [first]
+    assert lab.q("SELECT count(*) FROM tg.snapshot_member") == [(len(SHARED),)]
+
+
+def test_a_lost_commit_acknowledgement_of_a_later_version_then_a_re_upload(lab, monkeypatch):
+    _, _, full = partial_then(lab)
+
+    def commit_then_lose_the_reply(conn):
+        conn.commit()
+        conn.close()
+        raise psycopg.OperationalError("server closed the connection unexpectedly")
+
+    monkeypatch.setattr(importer, "_commit", commit_then_lose_the_reply)
+    assert lab.outcomes(lab.run(full)) == {A: ("unknown", None)}
+    monkeypatch.undo()
+    [_, d] = lab.snapshots(A)
+    again = lab.run(full)
+    assert lab.outcomes(again) == {A: ("skipped", None)}
+    assert again.outcomes[0].reason == f"already imported (snapshot {d['snapshot_id']})"
+    assert len(lab.snapshots(A)) == 2
+
+
+# the first import exactly as the released image wrote it (importer.py at 91e03f7): its lookup, INSERT and finish
+RELEASED_LOOKUP = "SELECT snapshot_id FROM tg.snapshot WHERE collect_uuid = %s"
+RELEASED_INSERT = """INSERT INTO tg.snapshot (chat_id, started_at, method, reported_at_start, collect_uuid)
+                   VALUES (%s, %s, %s, %s, %s) RETURNING snapshot_id"""
+RELEASED_FINISH = """UPDATE tg.snapshot SET finished_at = %s, reported_at_end = %s, fetched = %s, complete = %s
+             WHERE snapshot_id = %s"""
+
+
+def released_import(dsn: str, path) -> tuple[str, int]:
+    """One chat's import through the released image's statements: ("imported" | "skipped", snapshot_id)."""
+    with tgstats_file.Reader(path) as reader:
+        [chat] = tgstats_file.check(reader, now=now(), ceiling=importer.MAX_MEMBERS).chats
+        s = chat.snapshot
+        with psycopg.connect(dsn) as conn:
+            history.lock_chats(conn, [chat.chat_id])
+            dup = conn.execute(RELEASED_LOOKUP, (chat.uuid,)).fetchone()
+            if dup is not None:
+                return "skipped", dup[0]
+            sid = conn.execute(RELEASED_INSERT, (chat.chat_id, chat.started_at, s.method, s.reported_start,
+                                                 chat.uuid)).fetchone()[0]
+            with conn.cursor().copy(importer.COPY_MEMBERS) as copy:
+                for m in tgstats_file.members(reader, chat):
+                    copy.write_row((sid, m.user_id, m.seen_at, m.joined_date, m.inviter_id, m.via_request,
+                                    m.subscription_until, m.is_bot, m.is_deleted, m.is_premium, m.username,
+                                    m.first_name, m.last_name))
+            written = conn.execute("SELECT count(*) FROM tg.snapshot_member WHERE snapshot_id = %s",
+                                   (sid,)).fetchone()[0]
+            conn.execute(RELEASED_FINISH, (chat.finished_at, s.reported_end, written, s.complete, sid))
+    return "imported", sid
+
+
+def test_the_owners_path_across_the_upgrade_to_012(pg, tmp_path):
+    from tgaud import db
+    dsn = pg.make_db(migrated=False)
+    with psycopg.connect(dsn) as c:
+        db.migrate(c, [m for m in db.load_migrations() if m.version <= 11])
+    lab = Lab(pg, dsn, tmp_path)
+    try:
+        # before the upgrade: the partial version through the released image, reconciled and pruned
+        partial, u = version(lab, SHARED, at(2))
+        status, first = released_import(dsn, partial)
+        assert status == "imported"
+        lab.reconcile()
+        assert lab.snapshots(A)[0]["members_pruned_at"] is not None
+        with psycopg.connect(dsn) as c:
+            assert db.migrate(c).applied
+        retry = lab.run(partial)
+        assert retry.outcomes[0].reason == f"already imported (snapshot {first})"
+        full, _ = version(lab, ALL, at(20), uuid=u)
+        report = lab.run(full)
+        delta_of(lab, report, first)
+        assert released_import(dsn, full) == ("skipped", first)  # a rolled-back image: already imported
+        # after the upgrade, the released image's first import still works and is recognised
+        partial_b, ub = version(lab, SHARED, at(2), chat=B)
+        status, first_b = released_import(dsn, partial_b)
+        assert status == "imported"
+        assert lab.run(partial_b).outcomes[0].reason == f"already imported (snapshot {first_b})"
+        full_b, _ = version(lab, ALL, at(20), uuid=ub, chat=B)
+        [o] = lab.run(full_b).outcomes
+        assert (o.status, o.written) == ("imported", len(MISSING))
+        assert sorted(lab.members(o.snapshot_id)) == MISSING
+        lab.reconcile()
+        one_run_each(lab, ALL)
+        one_run_each(lab, ALL, chat=B)
+    finally:
+        lab.close()
+
+
+def test_a_later_version_through_the_real_server(pg, migrated_dsn, tmp_path):
+    import dataclasses
+
+    from test_import_listener import send
+
+    from tgaud import config
+    from tgaud import web as web_pkg
+    lab = Lab(pg, migrated_dsn, tmp_path)
+    cfg = dataclasses.replace(lab.cfg, web_listen=config.Listen("127.0.0.1", 0))
+    server = web_pkg.WebServer(cfg, cfg.web_proxy_token, lab.connect, fence=lab.ctx.fence)
+    server.app.spool_dir = str(lab.spool)
+    server.start()
+    lab.port = server.port
+    try:
+        partial, u = version(lab, SHARED, at(2))
+        status, text = send(lab, partial.read_bytes())
+        assert status == 200 and f"imported: {len(SHARED)} members written" in text
+        lab.reconcile()
+        full, _ = version(lab, ALL, at(20), uuid=u)
+        status, text = send(lab, full.read_bytes())
+        first = lab.snapshots(A)[0]["snapshot_id"]
+        assert status == 200
+        assert f"{LATER_REASON} {first}: {len(MISSING)} members it lacked written ({len(ALL)} in the file)" in text
+        assert "A later version adds only the members tgaud lacked" in text
+        lab.reconcile()
+        assert {u: [(s.start_source, s.end_source, s.known_from) for s in lab.spells(A, u)] for u in ALL} == {
+            u: [("snapshot", None, seen(u))] for u in ALL}
+        one_run_each(lab, ALL)
+    finally:
+        server.close()
+        lab.close()

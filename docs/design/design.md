@@ -159,7 +159,11 @@ exactly this. Ids: chat id from `utils.get_peer_id` (Bot API marked form), user 
 **Implemented writer.** The web UI's Import page is this contract's writer (docs/tgaud.md, "The Import page"): the
 owner runs `tgstats collect`, which records these fields in its `tgstats.db`, and uploads the file; for each tracked
 chat the latest snapshot is written by steps 2-4 in one transaction (with `collect_uuid`, migration 011, against
-duplicates), refused when older than one tgaud has or taken by a tgstats without these fields.
+duplicates), refused when older than one tgaud has or taken by a tgstats without these fields. A later version of a
+collection already imported (the same uuid and start, finished later: a file uploaded while the collection was still
+running, then the finished one) is written as a new snapshot right after it that lists only the members no stored
+version listed, with `version_of` instead of `collect_uuid` (migration 012) and `complete = false`, so every
+observation is stored once and the delta gives no absences.
 
 The reconciler takes finished, unreconciled snapshots per chat in `started_at` order once ingest has caught up past
 `finished_at` (a `getUpdates` that returned fewer than 100 updates after `finished_at`; never "a later event in that

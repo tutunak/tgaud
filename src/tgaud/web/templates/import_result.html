@@ -30,15 +30,17 @@
 {% if report.count("imported") %}
 <p>The reconciler applies the imported snapshots within minutes: their members become known stays, and a complete,
 good listing lets tgaud doubt and probe stays it did not list. See the <a href="/">overview</a> and the
-<a href="/reports/coverage">coverage report</a> for known against Telegram's count.</p>
+<a href="/reports/coverage">coverage report</a> for known against Telegram's count.{% if report.later_versions %} A later version adds only the members tgaud lacked and is never a complete listing: it doubts no one.{% endif %}</p>
 {% elif report.count("unknown") %}
-<p>Whether anything was written is not known: a commit's answer was lost. Upload the same file again: a chat that
-was imported is then skipped as already imported, the others are imported. The <a href="/">overview</a> and the
-<a href="/reports/coverage">coverage report</a> show the current state.</p>
+<p>Whether anything was written is not known: a commit's answer was lost. Upload the same file again. A chat whose
+import committed is then skipped as <i>already imported</i>, naming its snapshot. Every other chat is checked again
+as on a first upload, so it may now be skipped (for example as <i>not newer</i>, when tgaud got a later snapshot of
+the chat meanwhile). The <a href="/">overview</a> and the <a href="/reports/coverage">coverage report</a> show the
+current state.</p>
 {% else %}
 <p>Nothing was written. The <a href="/">overview</a> and the <a href="/reports/coverage">coverage report</a> show
 the current state.</p>
 {% endif %}
-{% if report.count("failed") or report.count("unknown") %}<p class="note">Some chats failed or have an unknown outcome: upload the same file again. Chats already imported are skipped, the others are tried again.</p>{% endif %}
+{% if report.count("failed") or report.count("unknown") %}<p class="note">Some chats failed or have an unknown outcome: upload the same file again. A chat already imported is skipped as <i>already imported</i>; the others are checked again and imported if they still can be.</p>{% endif %}
 <p><a href="/import">Import another file</a></p>
 {% endblock %}

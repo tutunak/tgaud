@@ -2,7 +2,9 @@
 
 Advisory lock key spaces (one database per tenant, so these are the only users):
   - single bigint keys `pg_advisory_xact_lock(chat_id)`: reserved for chat ids (tgaud.history.lock_chats);
-  - two int4 keys `(TGAUD_LOCK_CLASS, n)`: tgaud's own locks, MIGRATE_LOCK = n 1, SERVE_LOCK = n 2.
+  - two int4 keys `(TGAUD_LOCK_CLASS, n)`: tgaud's own locks, MIGRATE_LOCK = n 1, SERVE_LOCK = n 2;
+  - two int4 keys `(0x74676163 "tgac", first 32 bits of a uuid)`: tg.lock_collection (migration 012), the Import
+    page's lock on one tgstats collection.
 PostgreSQL keeps the two forms apart (different lock tags), so a chat id never collides with a tgaud lock.
 
 The service: `tgaud serve` holds SERVE_LOCK exclusively on its ingest connection for its lifetime, then

@@ -36,6 +36,18 @@ UI. No database access from the owner's machine, no change to the Ansible role.
   acknowledgement is settled by the next upload even after a migration re-keyed the chat. A retired source (an
   `old_chat_id` of `tg.chat_alias`) is refused. All of these checks run inside the chat's transaction, after the
   generation fence and `history.lock_chats`.
+- **Later versions of one collection** (reimport task, migration 012; the owner's decision). A file uploaded while
+  `tgstats collect` was still running was imported with a fraction of the members; the finished file has the same
+  uuid. It is imported as a new snapshot of the chat right after the stored version, listing only the members no
+  stored version listed (`version_of` = the uuid, `collect_uuid` NULL, `complete = false`), when the uuid's claim
+  (the `collect_uuid` row's chat and source) is the uploaded chat, `started_at` is equal, `finished_at` is later
+  than every stored version's and the newest version is the chat's newest snapshot. The same `finished_at` is
+  already imported, an earlier one an older version, a claim elsewhere or another start already imported (nothing
+  written); a later snapshot of the chat makes it not newer. `tg.lock_collection(uuid)`, taken after the chat lock,
+  serializes every import of one uuid, so two racing first imports for different chats end with one claim. Nothing
+  is deleted or undone, and the reconciler, history and prune rule are unchanged: deleting and recreating the
+  partial snapshot cannot be undone once it is pruned, and listing everyone again would replay shared observations
+  (S3 cases per snapshot). Details: docs/tgaud.md, "The Import page".
 - **Whole-file versus per-snapshot errors.** Not SQLite, missing or extra tables or columns (generated ones
   included), a view, trigger or virtual table, a wrong type or shape in a member row of any chat's latest snapshot
   (even a refused chat's), a NULL bot or deleted flag: the whole file is refused, nothing written. Bad times

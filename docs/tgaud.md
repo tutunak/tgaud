@@ -43,6 +43,8 @@ the day and the few things shortened for the test (job intervals; count samples 
 The Import page's tests (`tests/tgaud/test_import*.py`) write synthetic `tgstats.db` files with the tgstats code
 itself and drive the page through the WSGI app, the real listener and the reconciler's scheduler loop
 (`tests/tgaud/import_lab.py`); `TGAUD_IMPORT_SCALE_MIB=32` repeats the size measurement with a 32 MiB file.
+`tests/tgaud/test_web_import_versions.py` uploads a partial and then the finished version of a collection through
+the form in headless Chromium; like the screenshots it runs only with `TGAUD_WEB_SCREENSHOTS=1` and Playwright.
 
 `tests/tgaud/serve_runner.py` runs `tgaud serve` through the real CLI with job modules from
 `tests/tgaud/serve_fakes.py` put into `sys.modules` under the real names; that is how a test replaces a job.
@@ -170,6 +172,7 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
 | cli | modules in `tgaud/commands/` that call `tgaud.cli.register(name, help, add_arguments, run)`; migration 008 |
 | web | `tgaud/web/` (docs/web/README.md), started in `tgaud.jobs.serve` after the metrics listener; the token is checked first (exit 2); blocks 1b, 2c, 2d of queries.sql; no migration |
 | snapshot-import | the Import page (`tgaud/web/upload.py`, `tgstats_file.py`, `importer.py`), the listener's upload path in `tgaud/web/__init__.py`, the M2 cutoff in `tgaud/history.py`; `tgstats` collect's new file format; migration 011 |
+| reimport | a later version of an imported collection written as the members it lacked (`importer.py`), the Import page copy; migration 012 |
 | image | Containerfile, GitHub Actions CI and release; adds the container check, `lint-ci` and `release-scripts` to the `ci` task of `mise.toml` |
 
 ## Migrations
@@ -190,7 +193,9 @@ Long polls use `timeout=8`. Correctness never depends on a graceful stop: every 
   migrations and accepts a newer database with a warning.
 - Numbers: core 002 (every addition more than one task uses), history 003, reconcile 004, probe-sample 005,
   rollups 006, ingest 007, cli 008, prober-simplify 010 (009 stays unused: the web UI needs no migration) (`tg.probe.next_attempt_at`, `.spell_from`),
-  snapshot-import 011 (`tg.snapshot.collect_uuid` with a unique index).
+  snapshot-import 011 (`tg.snapshot.collect_uuid` with a unique index), reimport 012 (`tg.snapshot.version_of`
+  with an index and the CHECK `snapshot_one_collection_column`, `tg.lock_collection(uuid)`: a later version of an
+  imported collection, "The Import page").
 
 002 (`002_shared.sql`) adds: `tg.bot_state.caught_up_at`, `.link_key_fingerprint`, `.serve_generation`;
 `tg.member_event.actor_is_other` with its BEFORE INSERT trigger (the rebuild and the join route read it, never
@@ -208,6 +213,9 @@ ordered either way).
   order. Every writer of evidence or spells takes it before reading what it rebuilds from, and keeps that
   transaction short. The single-bigint key space of `pg_advisory_xact_lock` is reserved for chat ids.
 - tgaud's own locks use the two-int4 form with class `0x74676175`: `MIGRATE_LOCK` (…, 1), `SERVE_LOCK` (…, 2).
+- `tg.lock_collection(uuid)` (migration 012): the two-int4 form with class `0x74676163` ("tgac") and the uuid's
+  first 32 bits, transaction-scoped; the Import page takes it after the chat lock, so imports of one tgstats
+  collection serialize whichever chat they name.
 
 ## The Import page (snapshot import)
 
@@ -252,8 +260,8 @@ is kept in memory; they are read again for the write.
 **The write** (`importer.py`). One transaction per chat on the web connection (`WebDb.write_within`), bounded by
 `CHAT_SECONDS` (30 s) in total: `lock_timeout` and `statement_timeout` are set from the time left before the fence
 and before every later statement and the commit, so the fence's, the chat lock's and any later lock waits share it. In order: the generation fence;
-`history.lock_chats([chat])` (ingest, the reconciler, migrations and forget-user take it); the uuid anywhere in
-`tg.snapshot` (skipped: already imported); the chat an `old_chat_id` of `tg.chat_alias` (refused: migrated; before
+`history.lock_chats([chat])` (ingest, the reconciler, migrations and forget-user take it);
+`tg.lock_collection(uuid)` and the collection's stored versions (below); the chat an `old_chat_id` of `tg.chat_alias` (refused: migrated; before
 tracking, as M1 deletes the old chat's row); not tracked (skipped); a snapshot of the chat with `started_at` at or
 after this one's (skipped: not newer). Then `INSERT tg.snapshot` unfinished with `collect_uuid`, `COPY
 tg.snapshot_member` (names only with `TGAUD_STORE_NAMES`), delete the rows of anyone in `tg.erasure` whatever their
@@ -263,6 +271,44 @@ error, a connection busy past the 75 s lock wait or the time running out fails t
 again"), the next chat still runs (on a new connection after a loss); a commit whose answer was lost is "unknown",
 and the re-upload settles it by the uuid. A takeover (the generation fence) still stops serve. The result page's
 lookup of tgaud's titles for refused chats is best effort: when it fails, their refusal is shown as it is.
+
+**Versions of one collection** (migration 012). A file uploaded while `tgstats collect` was still running holds a
+partial version of the collection; the finished file is a later version of the same uuid (same `started_at`, later
+`finished_at`). The first import of a uuid claims it: `collect_uuid` (011, unique) on its row, with that row's
+`chat_id` and `coalesce(source_chat_id, chat_id)`, which M1 keeps current; every uuid in `collect_uuid` counts, so
+the released image's imports and those from before 012 need no backfill. A later version is written as a new
+snapshot of the chat holding only the members no stored version listed (the delta), with `version_of` = the uuid
+and `collect_uuid` NULL (011's index still holds one row per uuid; the released image's lookup still finds the
+claim and skips every version as already imported), the claim's `started_at` (it sorts right after the newest
+version), the file's `finished_at` and counts, `fetched` = the rows written and always `complete = false`: it is
+not a whole listing, so it grades partial and gives no absences. Every observation is stored once: the reconciler,
+the history rules and the prune rule are unchanged, and listing the shared members again would have replayed them
+(S3 cases are kept per snapshot and could cross the contradiction-gap threshold; an inferred exit bound could split
+a sighting run). Under the chat lock the importer takes `tg.lock_collection(uuid)` (a claim in flight from any
+chat commits first, then the read sees it), reads the versions (`collect_uuid` or `version_of`) and decides, first
+match wins: a version with the same `finished_at` -> *already imported (snapshot V)*, also after M1 or an unknown
+outcome; a claim on another chat or source, or another `started_at` -> *already imported (snapshot C)*; finished
+before the newest version -> *older version: tgaud has a later version of this collection (snapshot N)*; else
+the usual migrated and tracked checks, and the newest version must be the chat's newest snapshot by
+`(started_at, snapshot_id)` (else *not newer*). The file's rows are copied (ceiling, names and erasure as for a
+first import), then one DELETE drops those whose user a stored version listed: their member rows, or a
+`tg.sighting` run of the chat that begins or ends at a version. That covers every reconcile state of a version
+(unapplied and half applied: member rows; applied: both; mid-prune and pruned: the runs, written before pruning
+can start), and the reconciler writes a run for every row it applies, bots and deleted accounts included; the only
+listed users with neither are erased ones, whom the erasure rule drops anyway. The newest version is the chat's
+newest snapshot and a delta never lists anyone again, so a run through a version ends at a version. One statement
+is one READ COMMITTED snapshot: a prune batch, which commits without the chat lock, cannot hide anyone. A file that
+adds no member -> *already imported (snapshot N): the file adds no member*, nothing written. The result row reads
+*imported: a later version of the collection in snapshot C: K members it lacked written (N in the file)*.
+Measured: a later version at the ceiling over a pruned 10 % took 6.2 s (`test_import_scale.py`). After a delta,
+the next collection starts new sighting runs for the members the delta did not list, as after any partial
+snapshot: an open stay is only confirmed again.
+
+**Known limit: the direct snapshot writer.** A snapshot inserted through the contract of design.md 5 directly (not
+by the Import page) can commit between the importer's read of the chat's newest snapshot and its commit, so a first
+import or a later version can land behind it. This deployment doesn't use that writer, and the reconciler's late
+rule takes a snapshot that lands behind one already reconciled (no absences, one-point runs). There is no chat-row
+lock for it.
 
 **Size.** One chat's transaction holds the web connection, so other pages wait for it. `MAX_MEMBERS` = 200 000 per
 snapshot; measured on the development machine against the test server's production limits
