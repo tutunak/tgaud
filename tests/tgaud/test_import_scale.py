@@ -24,6 +24,7 @@ import socket
 import threading
 import time
 
+import psycopg
 import pytest
 from import_lab import A, B, Lab, multipart
 from test_import_listener import head, response
@@ -148,6 +149,41 @@ def test_a_chat_over_the_ceiling_is_refused_with_the_reason_and_nothing_written(
     assert out[A].reason.startswith(f"too large: {importer.MAX_MEMBERS + 1} members") and \
         str(importer.MAX_MEMBERS) in out[A].reason
     assert lab.snapshots(A) == [] and [x["fetched"] for x in lab.snapshots(B)] == [10]
+
+
+def test_a_later_version_at_the_ceiling_after_a_pruned_tenth(lab, monkeypatch, capsys):
+    """A later version (reimport task) of a collection whose first 10 % tgaud imported, reconciled and pruned: the
+    file's rows at the ceiling are written, then the members the stored version listed (here only its sighting
+    runs say who) are dropped in one statement. Same transaction budget as a first import."""
+    n = importer.MAX_MEMBERS
+    tenth, whole = lab.tmp / "tenth.db", lab.tmp / "whole.db"
+    build(tenth, {A: n // 10})  # same uuid, start and pages: the collection when a tenth of it was listed
+    build(whole, {A: n})
+    first = lab.run(tenth).outcomes[0]
+    assert (first.status, first.written) == ("imported", n // 10)
+    with psycopg.connect(lab.dsn) as c:  # Telegram counted the whole chat: the tenth grades partial and is pruned
+        c.execute("UPDATE tg.snapshot SET reported_at_start = %s, reported_at_end = %s", (n, n))
+    lab.reconcile(limit=5_000)
+    [s] = lab.snapshots(A)
+    assert s["members_pruned_at"] is not None
+    took: dict[str, float] = {}
+    real = importer._write
+
+    def timed(*args, **kw):
+        started = time.monotonic()
+        try:
+            return real(*args, **kw)
+        finally:
+            took["transaction"] = time.monotonic() - started
+
+    monkeypatch.setattr(importer, "_write", timed)
+    [o] = lab.run(whole).outcomes
+    assert (o.status, o.written) == ("imported", n - n // 10), o.reason
+    assert o.reason.startswith(f"imported: a later version of the collection in snapshot {s['snapshot_id']}")
+    with capsys.disabled():
+        print(f"\nimport scale: a later version of {n} members over a pruned {n // 10}: chat transaction "
+              f"{took['transaction']:.1f} s")
+    assert took["transaction"] < importer.CHAT_SECONDS
 
 
 def test_the_largest_chat_a_file_of_the_limit_holds(lab, monkeypatch, capsys):

@@ -222,12 +222,19 @@ with a member list taken by `tgstats` with your own account:
    - *imported*: its members were written (the count shows how many; people removed with `tgaud forget-user` are
      left out);
    - *skipped: not tracked*: tgaud records nothing for that chat (the bot is not an admin there);
-   - *skipped: already imported*: uploading the same file again imports nothing new;
+   - *skipped: already imported*: uploading the same file again imports nothing new (tgaud knows a collection by
+     its id);
+   - *imported: a later version of the collection*: you uploaded a file while `tgstats collect` was still
+     running, and now the finished file of that collection. tgaud adds only the members the earlier upload lacked,
+     as a new snapshot right after it, as long as it has no later snapshot of the chat; such a snapshot never
+     counts as a complete listing, so it makes tgaud doubt no one. An earlier version of an imported collection is
+     *skipped: older version*, and one that adds nobody *skipped: already imported ...: the file adds no member*;
    - *skipped: not newer*: tgaud already has a snapshot of that chat started at the same time or later
      (snapshots are applied in start order, so an older one is never put behind a newer one);
    - *refused*: old format (collect again), bad times or values (a clock far ahead, a damaged file), a migrated
      group (collect the supergroup), or too large for one import (more than 200 000 members in one snapshot);
-   - *failed* or *unknown*: a database problem; upload the same file again, and chats already imported are skipped.
+   - *failed* or *unknown*: a database problem; upload the same file again: chats already imported are skipped,
+     the others are checked again as on a first upload.
 
    A file that is not a tgstats.db at all (another SQLite file, a damaged one, one with extra tables or views) is
    refused whole, and nothing is written.

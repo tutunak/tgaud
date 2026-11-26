@@ -17,8 +17,13 @@ bot became an admin. <code>tgstats collect</code> lists them with your own Teleg
   are left alone, and so are tracked chats the file does not have.</li>
   <li>Only snapshots of <b>this tgstats version</b>: an older one recorded only when its collection ended, which
   can contradict leaves tgaud saw meanwhile. Collect again with <code>tgstats collect</code>.</li>
-  <li>A snapshot that is not newer than one tgaud already has for the chat, or one already imported, is skipped:
-  uploading the same file twice imports nothing new.</li>
+  <li>A snapshot that is not newer than one tgaud already has for the chat is skipped.</li>
+  <li>tgaud recognises a collection by its id: uploading a file it has already imported imports nothing new, and the
+  result says <i>already imported</i>. A <b>later version of a collection tgaud imported</b> is the same collection,
+  finished later: for example the finished file of a <code>tgstats collect</code> that was still running when you
+  first uploaded it. It is imported as a new snapshot of that chat holding <b>only the members the earlier version
+  lacked</b>, as long as tgaud has no later snapshot of the chat. Such a snapshot never counts as a complete listing,
+  so it makes tgaud doubt no one. An earlier version of an imported collection is skipped.</li>
   <li>People removed with <code>tgaud forget-user</code> are never brought back.
   {% if not names %}Names and usernames are not stored (<code>TGAUD_STORE_NAMES</code> is off).{% endif %}</li>
   <li>A chat with more than {{ ceiling }} members in one snapshot is refused: one chat's import is one database
