@@ -395,6 +395,8 @@ def _check_snapshot(chat: Chat, now: dt.datetime) -> None:
                     (s.reported, "the reported count"), (s.fetched, "the fetched count")):
         if n is not None and not 0 <= n <= 2**31 - 1:
             raise BadValue(f"{what} is negative or too large")
+    if s.complete and s.reported_end is None:  # tgstats marks a listing without its final count incomplete
+        raise BadValue("the snapshot is marked complete but has no member count after the listing")
     if s.fetched != chat.listed:  # tgstats writes one member row per user it counts
         raise BadValue(f"the snapshot says it fetched {s.fetched} members, but the file has {chat.listed} member "
                        "rows for it")
