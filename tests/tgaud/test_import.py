@@ -129,9 +129,10 @@ def test_bad_times_are_refused_and_a_later_valid_collection_still_imports(lab): 
     ("DELETE FROM memberships", "member rows"),
     ("UPDATE snapshots SET started_at = '0001-01-01T00:30:00+01:00'", "out of range"),  # review 1: overflow
     ("UPDATE memberships SET seen_at = '0001-01-01T00:30:00+05:00'", "out of range"),
+    ("UPDATE snapshots SET reported_end = NULL, complete = 1", "complete but has no member count"),  # review 2
 ], ids=["uuid", "uuid-braces", "uuid-nil", "count-start", "count-end", "naive-time", "order", "garbled-time",
         "method", "user-id", "joined-date", "fetched-negative", "reported-negative", "fetched-vs-rows",
-        "missing-rows", "start-overflow", "seen-overflow"])
+        "missing-rows", "start-overflow", "seen-overflow", "complete-without-end-count"])
 def test_a_value_error_refuses_that_snapshot_only(lab, change, why):  # rule 4
     f = lab.file()
     f.snapshot(A, {1: at(1)}, at(0))

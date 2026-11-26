@@ -40,7 +40,8 @@ UI. No database access from the owner's machine, no change to the Ansible role.
   included), a view, trigger or virtual table, a wrong type or shape in a member row of any chat's latest snapshot
   (even a refused chat's), a NULL bot or deleted flag: the whole file is refused, nothing written. Bad times
   (`started_at <= seen_at <= finished_at <= now + 5 min`, or out of range), negative counts, a `fetched` that is not
-  the number of member rows, or a malformed uuid refuse that snapshot only.
+  the number of member rows, a snapshot marked complete without its final count, or a malformed uuid refuse that
+  snapshot only.
 - **Erasure.** Nobody erased by `tg.forget_user` is imported, whatever their `seen_at` says (the collector's clock
   proves nothing); erased inviters are cleared; `fetched` counts the rows that survived.
 - **Names follow `TGAUD_STORE_NAMES`**: off, no name or username is written anywhere.

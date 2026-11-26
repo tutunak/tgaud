@@ -243,7 +243,8 @@ trigger or virtual table; at most 2 000 chats, counted while they are read. Stru
 the wrong type or shape in a row the import reads, `is_bot` and `is_deleted` NULL included) refuse the whole file.
 Per chat, the latest snapshot by `started_at` (an old one by `taken_at`; ties: the new format, then the uuid; never
 the row id) is checked: uuid well-formed, `started_at <= every seen_at <= finished_at <= now + 5 min` (a time out of
-range is a value error too), every count non-negative, `fetched` equal to its member rows, method known, at most
+range is a value error too), every count non-negative, `fetched` equal to its member rows, a snapshot marked
+complete only with its count after the listing (an incomplete one may lack it), method known, at most
 `MAX_MEMBERS` members. A value error refuses that chat only; the shape of every member row of a chat's latest
 snapshot is checked even when the chat is refused. Names lose their control characters. Nothing of the member rows
 is kept in memory; they are read again for the write.
